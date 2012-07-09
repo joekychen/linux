@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › s390 › block › dasd_eer.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>dasd_eer.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> *  Character device driver for extended error reporting.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Copyright (C) 2005 IBM Corporation</span>
+<span class="cm"> *  extended error reporting for DASD ECKD devices</span>
+<span class="cm"> *  Author(s): Stefan Weinhuber &lt;wein@de.ibm.com&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define KMSG_COMPONENT &quot;dasd-eckd&quot;</span>
+
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/miscdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/moduleparam.h&gt;</span>
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/poll.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/err.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="cp">#include &lt;asm/uaccess.h&gt;</span>
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+<span class="cp">#include &lt;asm/ebcdic.h&gt;</span>
+
+<span class="cp">#include &quot;dasd_int.h&quot;</span>
+<span class="cp">#include &quot;dasd_eckd.h&quot;</span>
+
+<span class="cp">#ifdef PRINTK_HEADER</span>
+<span class="cp">#undef PRINTK_HEADER</span>
+<span class="cp">#endif				</span><span class="cm">/* PRINTK_HEADER */</span><span class="cp"></span>
+<span class="cp">#define PRINTK_HEADER &quot;dasd(eer):&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * SECTION: the internal buffer</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The internal buffer is meant to store obaque blobs of data, so it does</span>
+<span class="cm"> * not know of higher level concepts like triggers.</span>
+<span class="cm"> * It consists of a number of pages that are used as a ringbuffer. Each data</span>
+<span class="cm"> * blob is stored in a simple record that consists of an integer, which</span>
+<span class="cm"> * contains the size of the following data, and the data bytes themselfes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * To allow for multiple independent readers we create one internal buffer</span>
+<span class="cm"> * each time the device is opened and destroy the buffer when the file is</span>
+<span class="cm"> * closed again. The number of pages used for this buffer is determined by</span>
+<span class="cm"> * the module parmeter eer_pages.</span>
+<span class="cm"> *</span>
+<span class="cm"> * One record can be written to a buffer by using the functions</span>
+<span class="cm"> * - dasd_eer_start_record (one time per record to write the size to the</span>
+<span class="cm"> *                          buffer and reserve the space for the data)</span>
+<span class="cm"> * - dasd_eer_write_buffer (one or more times per record to write the data)</span>
+<span class="cm"> * The data can be written in several steps but you will have to compute</span>
+<span class="cm"> * the total size up front for the invocation of dasd_eer_start_record.</span>
+<span class="cm"> * If the ringbuffer is full, dasd_eer_start_record will remove the required</span>
+<span class="cm"> * number of old records.</span>
+<span class="cm"> *</span>
+<span class="cm"> * A record is typically read in two steps, first read the integer that</span>
+<span class="cm"> * specifies the size of the following data, then read the data.</span>
+<span class="cm"> * Both can be done by</span>
+<span class="cm"> * - dasd_eer_read_buffer</span>
+<span class="cm"> *</span>
+<span class="cm"> * For all mentioned functions you need to get the bufferlock first and keep</span>
+<span class="cm"> * it until a complete record is written or read.</span>
+<span class="cm"> *</span>
+<span class="cm"> * All information necessary to keep track of an internal buffer is kept in</span>
+<span class="cm"> * a struct eerbuffer. The buffer specific to a file pointer is strored in</span>
+<span class="cm"> * the private_data field of that file. To be able to write data to all</span>
+<span class="cm"> * existing buffers, each buffer is also added to the bufferlist.</span>
+<span class="cm"> * If the user does not want to read a complete record in one go, we have to</span>
+<span class="cm"> * keep track of the rest of the record. residual stores the number of bytes</span>
+<span class="cm"> * that are still to deliver. If the rest of the record is invalidated between</span>
+<span class="cm"> * two reads then residual will be set to -1 so that the next read will fail.</span>
+<span class="cm"> * All entries in the eerbuffer structure are protected with the bufferlock.</span>
+<span class="cm"> * To avoid races between writing to a buffer on the one side and creating</span>
+<span class="cm"> * and destroying buffers on the other side, the bufferlock must also be used</span>
+<span class="cm"> * to protect the bufferlist.</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">eer_pages</span> <span class="o">=</span> <span class="mi">5</span><span class="p">;</span>
+<span class="n">module_param</span><span class="p">(</span><span class="n">eer_pages</span><span class="p">,</span> <span class="kt">int</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="o">|</span><span class="n">S_IWUSR</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">**</span><span class="n">buffer</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">buffersize</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">buffer_page_count</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">head</span><span class="p">;</span>
+        <span class="kt">int</span> <span class="n">tail</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">residual</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">bufferlist</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">bufferlock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">dasd_eer_read_wait_queue</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * How many free bytes are available on the buffer.</span>
+<span class="cm"> * Needs to be called with bufferlock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_get_free_bytes</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">&lt;</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span> <span class="o">-</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">+</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * How many bytes of buffer space are used.</span>
+<span class="cm"> * Needs to be called with bufferlock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_get_filled_bytes</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">&gt;=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">-</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span> <span class="o">-</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">+</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The dasd_eer_write_buffer function just copies count bytes of data</span>
+<span class="cm"> * to the buffer. Make sure to call dasd_eer_start_record first, to</span>
+<span class="cm"> * make sure that enough free space is available.</span>
+<span class="cm"> * Needs to be called with bufferlock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dasd_eer_write_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">,</span>
+				  <span class="kt">char</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">int</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">headindex</span><span class="p">,</span><span class="n">localhead</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">rest</span><span class="p">,</span> <span class="n">len</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">nextdata</span><span class="p">;</span>
+
+	<span class="n">nextdata</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">rest</span> <span class="o">=</span> <span class="n">count</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">rest</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+ 		<span class="n">headindex</span> <span class="o">=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+ 		<span class="n">localhead</span> <span class="o">=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">rest</span><span class="p">,</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">localhead</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">[</span><span class="n">headindex</span><span class="p">]</span><span class="o">+</span><span class="n">localhead</span><span class="p">,</span> <span class="n">nextdata</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">nextdata</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">rest</span> <span class="o">-=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">)</span>
+			<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* wrap around */</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">&gt;</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Needs to be called with bufferlock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_read_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">int</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tailindex</span><span class="p">,</span><span class="n">localtail</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">rest</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">finalcount</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">nextdata</span><span class="p">;</span>
+
+	<span class="n">finalcount</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">count</span><span class="p">,</span> <span class="n">dasd_eer_get_filled_bytes</span><span class="p">(</span><span class="n">eerb</span><span class="p">));</span>
+	<span class="n">nextdata</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">rest</span> <span class="o">=</span> <span class="n">finalcount</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">rest</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+ 		<span class="n">tailindex</span> <span class="o">=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+ 		<span class="n">localtail</span> <span class="o">=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">rest</span><span class="p">,</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">localtail</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">nextdata</span><span class="p">,</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">[</span><span class="n">tailindex</span><span class="p">]</span> <span class="o">+</span> <span class="n">localtail</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">nextdata</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">rest</span> <span class="o">-=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">==</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">)</span>
+			<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* wrap around */</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">&gt;</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">finalcount</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Whenever you want to write a blob of data to the internal buffer you</span>
+<span class="cm"> * have to start by using this function first. It will write the number</span>
+<span class="cm"> * of bytes that will be written to the buffer. If necessary it will remove</span>
+<span class="cm"> * old records to make room for the new one.</span>
+<span class="cm"> * Needs to be called with bufferlock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_start_record</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">,</span> <span class="kt">int</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">tailcount</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">count</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">dasd_eer_get_free_bytes</span><span class="p">(</span><span class="n">eerb</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">count</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">+=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">&gt;=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">)</span>
+				<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">;</span>
+			<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dasd_eer_read_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="o">&amp;</span><span class="n">tailcount</span><span class="p">,</span>
+				     <span class="k">sizeof</span><span class="p">(</span><span class="n">tailcount</span><span class="p">));</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">+=</span> <span class="n">tailcount</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">&gt;=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">)</span>
+			<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span> <span class="o">&amp;</span><span class="n">count</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">count</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Release pages that are not used anymore.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dasd_eer_free_buffer_pages</span><span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="n">buf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">no_pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">no_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">buf</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate a new set of memory pages.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_allocate_buffer_pages</span><span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="n">buf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">no_pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">no_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">buf</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">buf</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+			<span class="n">dasd_eer_free_buffer_pages</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * SECTION: The extended error reporting functionality</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When a DASD device driver wants to report an error, it calls the</span>
+<span class="cm"> * function dasd_eer_write and gives the respective trigger ID as</span>
+<span class="cm"> * parameter. Currently there are four kinds of triggers:</span>
+<span class="cm"> *</span>
+<span class="cm"> * DASD_EER_FATALERROR:  all kinds of unrecoverable I/O problems</span>
+<span class="cm"> * DASD_EER_PPRCSUSPEND: PPRC was suspended</span>
+<span class="cm"> * DASD_EER_NOPATH:      There is no path to the device left.</span>
+<span class="cm"> * DASD_EER_STATECHANGE: The state of the device has changed.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For the first three triggers all required information can be supplied by</span>
+<span class="cm"> * the caller. For these triggers a record is written by the function</span>
+<span class="cm"> * dasd_eer_write_standard_trigger.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The DASD_EER_STATECHANGE trigger is special since a sense subsystem</span>
+<span class="cm"> * status ccw need to be executed to gather the necessary sense data first.</span>
+<span class="cm"> * The dasd_eer_snss function will queue the SNSS request and the request</span>
+<span class="cm"> * callback will then call dasd_eer_write with the DASD_EER_STATCHANGE</span>
+<span class="cm"> * trigger.</span>
+<span class="cm"> *</span>
+<span class="cm"> * To avoid memory allocations at runtime, the necessary memory is allocated</span>
+<span class="cm"> * when the extended error reporting is enabled for a device (by</span>
+<span class="cm"> * dasd_eer_probe). There is one sense subsystem status request for each</span>
+<span class="cm"> * eer enabled DASD device. The presence of the cqr in device-&gt;eer_cqr</span>
+<span class="cm"> * indicates that eer is enable for the device. The use of the snss request</span>
+<span class="cm"> * is protected by the DASD_FLAG_EER_IN_USE bit. When this flag indicates</span>
+<span class="cm"> * that the cqr is currently in use, dasd_eer_snss cannot start a second</span>
+<span class="cm"> * request but sets the DASD_FLAG_EER_SNSS flag instead. The callback of</span>
+<span class="cm"> * the SNSS request will check the bit and call dasd_eer_snss again.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define SNSS_DATA_SIZE 44</span>
+
+<span class="cp">#define DASD_EER_BUSID_SIZE 10</span>
+<span class="k">struct</span> <span class="n">dasd_eer_header</span> <span class="p">{</span>
+	<span class="n">__u32</span> <span class="n">total_size</span><span class="p">;</span>
+	<span class="n">__u32</span> <span class="n">trigger</span><span class="p">;</span>
+	<span class="n">__u64</span> <span class="n">tv_sec</span><span class="p">;</span>
+	<span class="n">__u64</span> <span class="n">tv_usec</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">busid</span><span class="p">[</span><span class="n">DASD_EER_BUSID_SIZE</span><span class="p">];</span>
+<span class="p">}</span> <span class="n">__attribute__</span> <span class="p">((</span><span class="n">packed</span><span class="p">));</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The following function can be used for those triggers that have</span>
+<span class="cm"> * all necessary data available when the function is called.</span>
+<span class="cm"> * If the parameter cqr is not NULL, the chain of requests will be searched</span>
+<span class="cm"> * for valid sense data, and all valid sense data sets will be added to</span>
+<span class="cm"> * the triggers data.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dasd_eer_write_standard_trigger</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">,</span>
+					    <span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">,</span>
+					    <span class="kt">int</span> <span class="n">trigger</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">temp_cqr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">data_size</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timeval</span> <span class="n">tv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dasd_eer_header</span> <span class="n">header</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">sense</span><span class="p">;</span>
+
+	<span class="cm">/* go through cqr chain and count the valid sense data sets */</span>
+	<span class="n">data_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">temp_cqr</span> <span class="o">=</span> <span class="n">cqr</span><span class="p">;</span> <span class="n">temp_cqr</span><span class="p">;</span> <span class="n">temp_cqr</span> <span class="o">=</span> <span class="n">temp_cqr</span><span class="o">-&gt;</span><span class="n">refers</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dasd_get_sense</span><span class="p">(</span><span class="o">&amp;</span><span class="n">temp_cqr</span><span class="o">-&gt;</span><span class="n">irb</span><span class="p">))</span>
+			<span class="n">data_size</span> <span class="o">+=</span> <span class="mi">32</span><span class="p">;</span>
+
+	<span class="n">header</span><span class="p">.</span><span class="n">total_size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">header</span><span class="p">)</span> <span class="o">+</span> <span class="n">data_size</span> <span class="o">+</span> <span class="mi">4</span><span class="p">;</span> <span class="cm">/* &quot;EOR&quot; */</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">trigger</span> <span class="o">=</span> <span class="n">trigger</span><span class="p">;</span>
+	<span class="n">do_gettimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tv</span><span class="p">);</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">tv_sec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">tv_usec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_usec</span><span class="p">;</span>
+	<span class="n">strncpy</span><span class="p">(</span><span class="n">header</span><span class="p">.</span><span class="n">busid</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">),</span>
+		<span class="n">DASD_EER_BUSID_SIZE</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bufferlist</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dasd_eer_start_record</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="n">header</span><span class="p">.</span><span class="n">total_size</span><span class="p">);</span>
+		<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="o">&amp;</span><span class="n">header</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">header</span><span class="p">));</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">temp_cqr</span> <span class="o">=</span> <span class="n">cqr</span><span class="p">;</span> <span class="n">temp_cqr</span><span class="p">;</span> <span class="n">temp_cqr</span> <span class="o">=</span> <span class="n">temp_cqr</span><span class="o">-&gt;</span><span class="n">refers</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">sense</span> <span class="o">=</span> <span class="n">dasd_get_sense</span><span class="p">(</span><span class="o">&amp;</span><span class="n">temp_cqr</span><span class="o">-&gt;</span><span class="n">irb</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">sense</span><span class="p">)</span>
+				<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="n">sense</span><span class="p">,</span> <span class="mi">32</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="s">&quot;EOR&quot;</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dasd_eer_read_wait_queue</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This function writes a DASD_EER_STATECHANGE trigger.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dasd_eer_write_snss_trigger</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">,</span>
+					<span class="kt">int</span> <span class="n">trigger</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">data_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">snss_rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timeval</span> <span class="n">tv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dasd_eer_header</span> <span class="n">header</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+
+	<span class="n">snss_rc</span> <span class="o">=</span> <span class="p">(</span><span class="n">cqr</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">==</span> <span class="n">DASD_CQR_DONE</span><span class="p">)</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">snss_rc</span><span class="p">)</span>
+		<span class="n">data_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">data_size</span> <span class="o">=</span> <span class="n">SNSS_DATA_SIZE</span><span class="p">;</span>
+
+	<span class="n">header</span><span class="p">.</span><span class="n">total_size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">header</span><span class="p">)</span> <span class="o">+</span> <span class="n">data_size</span> <span class="o">+</span> <span class="mi">4</span><span class="p">;</span> <span class="cm">/* &quot;EOR&quot; */</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">trigger</span> <span class="o">=</span> <span class="n">DASD_EER_STATECHANGE</span><span class="p">;</span>
+	<span class="n">do_gettimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tv</span><span class="p">);</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">tv_sec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+	<span class="n">header</span><span class="p">.</span><span class="n">tv_usec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_usec</span><span class="p">;</span>
+	<span class="n">strncpy</span><span class="p">(</span><span class="n">header</span><span class="p">.</span><span class="n">busid</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">),</span>
+		<span class="n">DASD_EER_BUSID_SIZE</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bufferlist</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dasd_eer_start_record</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="n">header</span><span class="p">.</span><span class="n">total_size</span><span class="p">);</span>
+		<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="o">&amp;</span><span class="n">header</span> <span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">header</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">snss_rc</span><span class="p">)</span>
+			<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="n">cqr</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">SNSS_DATA_SIZE</span><span class="p">);</span>
+		<span class="n">dasd_eer_write_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="s">&quot;EOR&quot;</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dasd_eer_read_wait_queue</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This function is called for all triggers. It calls the appropriate</span>
+<span class="cm"> * function that writes the actual trigger records.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dasd_eer_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">,</span>
+		    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">id</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">DASD_EER_FATALERROR</span>:
+	<span class="k">case</span> <span class="n">DASD_EER_PPRCSUSPEND</span>:
+		<span class="n">dasd_eer_write_standard_trigger</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">cqr</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">DASD_EER_NOPATH</span>:
+		<span class="n">dasd_eer_write_standard_trigger</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">DASD_EER_STATECHANGE</span>:
+		<span class="n">dasd_eer_write_snss_trigger</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">cqr</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span> <span class="cm">/* unknown trigger, so we write it without any sense data */</span>
+		<span class="n">dasd_eer_write_standard_trigger</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dasd_eer_write</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Start a sense subsystem status request.</span>
+<span class="cm"> * Needs to be called with the device held.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dasd_eer_snss</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">;</span>
+
+	<span class="n">cqr</span> <span class="o">=</span> <span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cqr</span><span class="p">)</span>	<span class="cm">/* Device not eer enabled. */</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_IN_USE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Sense subsystem status request in use. */</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_SNSS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* cdev is already locked, can&#39;t use dasd_add_request_head */</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_SNSS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">DASD_CQR_QUEUED</span><span class="p">;</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cqr</span><span class="o">-&gt;</span><span class="n">devlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">ccw_queue</span><span class="p">);</span>
+	<span class="n">dasd_schedule_device_bh</span><span class="p">(</span><span class="n">device</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Callback function for use with sense subsystem status request.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dasd_eer_snss_cb</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span> <span class="o">=</span> <span class="n">cqr</span><span class="o">-&gt;</span><span class="n">startdev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">dasd_eer_write</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">cqr</span><span class="p">,</span> <span class="n">DASD_EER_STATECHANGE</span><span class="p">);</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span> <span class="o">==</span> <span class="n">cqr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_IN_USE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_SNSS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+			<span class="cm">/* Another SNSS has been requested in the meantime. */</span>
+			<span class="n">dasd_eer_snss</span><span class="p">(</span><span class="n">device</span><span class="p">);</span>
+		<span class="n">cqr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cqr</span><span class="p">)</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Extended error recovery has been switched off while</span>
+<span class="cm">		 * the SNSS request was running. It could even have</span>
+<span class="cm">		 * been switched off and on again in which case there</span>
+<span class="cm">		 * is a new ccw in device-&gt;eer_cqr. Free the &quot;old&quot;</span>
+<span class="cm">		 * snss request now.</span>
+<span class="cm">		 */</span>
+		<span class="n">dasd_kfree_request</span><span class="p">(</span><span class="n">cqr</span><span class="p">,</span> <span class="n">device</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Enable error reporting on a given device.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">dasd_eer_enable</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ccw1</span> <span class="o">*</span><span class="n">ccw</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">discipline</span> <span class="o">||</span> <span class="n">strcmp</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">discipline</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="s">&quot;ECKD&quot;</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EPERM</span><span class="p">;</span>	<span class="cm">/* FIXME: -EMEDIUMTYPE ? */</span>
+
+	<span class="n">cqr</span> <span class="o">=</span> <span class="n">dasd_kmalloc_request</span><span class="p">(</span><span class="n">DASD_ECKD_MAGIC</span><span class="p">,</span> <span class="mi">1</span> <span class="cm">/* SNSS */</span><span class="p">,</span>
+				   <span class="n">SNSS_DATA_SIZE</span><span class="p">,</span> <span class="n">device</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">cqr</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">startdev</span> <span class="o">=</span> <span class="n">device</span><span class="p">;</span>
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">retries</span> <span class="o">=</span> <span class="mi">255</span><span class="p">;</span>
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">expires</span> <span class="o">=</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">DASD_CQR_FLAGS_USE_ERP</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cqr</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">DASD_CQR_ALLOW_SLOCK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cqr</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">ccw</span> <span class="o">=</span> <span class="n">cqr</span><span class="o">-&gt;</span><span class="n">cpaddr</span><span class="p">;</span>
+	<span class="n">ccw</span><span class="o">-&gt;</span><span class="n">cmd_code</span> <span class="o">=</span> <span class="n">DASD_ECKD_CCW_SNSS</span><span class="p">;</span>
+	<span class="n">ccw</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">SNSS_DATA_SIZE</span><span class="p">;</span>
+	<span class="n">ccw</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">ccw</span><span class="o">-&gt;</span><span class="n">cda</span> <span class="o">=</span> <span class="p">(</span><span class="n">__u32</span><span class="p">)(</span><span class="n">addr_t</span><span class="p">)</span> <span class="n">cqr</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">buildclk</span> <span class="o">=</span> <span class="n">get_clock</span><span class="p">();</span>
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">DASD_CQR_FILLED</span><span class="p">;</span>
+	<span class="n">cqr</span><span class="o">-&gt;</span><span class="n">callback</span> <span class="o">=</span> <span class="n">dasd_eer_snss_cb</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span> <span class="o">=</span> <span class="n">cqr</span><span class="p">;</span>
+		<span class="n">cqr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cqr</span><span class="p">)</span>
+		<span class="n">dasd_kfree_request</span><span class="p">(</span><span class="n">cqr</span><span class="p">,</span> <span class="n">device</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Disable error reporting on a given device.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dasd_eer_disable</span><span class="p">(</span><span class="k">struct</span> <span class="n">dasd_device</span> <span class="o">*</span><span class="n">device</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dasd_ccw_req</span> <span class="o">*</span><span class="n">cqr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">in_use</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">cqr</span> <span class="o">=</span> <span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span><span class="p">;</span>
+	<span class="n">device</span><span class="o">-&gt;</span><span class="n">eer_cqr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_SNSS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">in_use</span> <span class="o">=</span> <span class="n">test_and_clear_bit</span><span class="p">(</span><span class="n">DASD_FLAG_EER_IN_USE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="n">get_ccwdev_lock</span><span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">),</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cqr</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">in_use</span><span class="p">)</span>
+		<span class="n">dasd_kfree_request</span><span class="p">(</span><span class="n">cqr</span><span class="p">,</span> <span class="n">device</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * SECTION: the device operations</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * On the one side we need a lock to access our internal buffer, on the</span>
+<span class="cm"> * other side a copy_to_user can sleep. So we need to copy the data we have</span>
+<span class="cm"> * to transfer in a readbuffer, which is protected by the readbuffer_mutex.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">char</span> <span class="n">readbuffer</span><span class="p">[</span><span class="n">PAGE_SIZE</span><span class="p">];</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">readbuffer_mutex</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">eerb</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">eerb</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span> <span class="o">=</span> <span class="n">eer_pages</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="o">||</span>
+	    <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span> <span class="o">&gt;</span> <span class="n">INT_MAX</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="p">);</span>
+		<span class="n">DBF_EVENT</span><span class="p">(</span><span class="n">DBF_WARNING</span><span class="p">,</span> <span class="s">&quot;can&#39;t open device since module &quot;</span>
+			<span class="s">&quot;parameter eer_pages is smaller than 1 or&quot;</span>
+			<span class="s">&quot; bigger than %d&quot;</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)(</span><span class="n">INT_MAX</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">));</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffersize</span> <span class="o">=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">),</span>
+			       <span class="n">GFP_KERNEL</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="p">);</span>
+                <span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dasd_eer_allocate_buffer_pages</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span>
+					   <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">eerb</span><span class="p">;</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bufferlist</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">nonseekable_open</span><span class="p">(</span><span class="n">inp</span><span class="p">,</span><span class="n">filp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dasd_eer_close</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">eerb</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="p">)</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">dasd_eer_free_buffer_pages</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer_page_count</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">eerb</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">dasd_eer_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+			     <span class="kt">size_t</span> <span class="n">count</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">tc</span><span class="p">,</span><span class="n">rc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">tailcount</span><span class="p">,</span><span class="n">effective_count</span><span class="p">;</span>
+        <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+
+	<span class="n">eerb</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="p">)</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mutex_lock_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ERESTARTSYS</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* the remainder of this record */</span>
+		                  <span class="cm">/* has been deleted             */</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* OK we still have a second half of a record to deliver */</span>
+		<span class="n">effective_count</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span> <span class="n">count</span><span class="p">);</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">-=</span> <span class="n">effective_count</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">tc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">tc</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">tc</span> <span class="o">=</span> <span class="n">dasd_eer_read_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="o">&amp;</span><span class="n">tailcount</span><span class="p">,</span>
+						  <span class="k">sizeof</span><span class="p">(</span><span class="n">tailcount</span><span class="p">));</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tc</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/* no data available */</span>
+				<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+				<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">);</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_NONBLOCK</span><span class="p">)</span>
+					<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+				<span class="n">rc</span> <span class="o">=</span> <span class="n">wait_event_interruptible</span><span class="p">(</span>
+					<span class="n">dasd_eer_read_wait_queue</span><span class="p">,</span>
+					<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">!=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">);</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+					<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">mutex_lock_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">))</span>
+					<span class="k">return</span> <span class="o">-</span><span class="n">ERESTARTSYS</span><span class="p">;</span>
+				<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tc</span> <span class="o">!=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">tailcount</span><span class="p">));</span>
+		<span class="n">effective_count</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">tailcount</span><span class="p">,(</span><span class="kt">int</span><span class="p">)</span><span class="n">count</span><span class="p">);</span>
+		<span class="n">eerb</span><span class="o">-&gt;</span><span class="n">residual</span> <span class="o">=</span> <span class="n">tailcount</span> <span class="o">-</span> <span class="n">effective_count</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">tc</span> <span class="o">=</span> <span class="n">dasd_eer_read_buffer</span><span class="p">(</span><span class="n">eerb</span><span class="p">,</span> <span class="n">readbuffer</span><span class="p">,</span> <span class="n">effective_count</span><span class="p">);</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tc</span> <span class="o">!=</span> <span class="n">effective_count</span><span class="p">);</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">readbuffer</span><span class="p">,</span> <span class="n">effective_count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">readbuffer_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">effective_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">dasd_eer_poll</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="n">poll_table</span> <span class="o">*</span><span class="n">ptable</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="n">eerb</span><span class="p">;</span>
+
+	<span class="n">eerb</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">eerbuffer</span> <span class="o">*</span><span class="p">)</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="n">poll_wait</span><span class="p">(</span><span class="n">filp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dasd_eer_read_wait_queue</span><span class="p">,</span> <span class="n">ptable</span><span class="p">);</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">eerb</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">!=</span> <span class="n">eerb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="n">mask</span> <span class="o">=</span> <span class="n">POLLIN</span> <span class="o">|</span> <span class="n">POLLRDNORM</span> <span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">mask</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bufferlock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mask</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">dasd_eer_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">open</span>		<span class="o">=</span> <span class="o">&amp;</span><span class="n">dasd_eer_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">dasd_eer_close</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span>		<span class="o">=</span> <span class="o">&amp;</span><span class="n">dasd_eer_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">poll</span>		<span class="o">=</span> <span class="o">&amp;</span><span class="n">dasd_eer_poll</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span>		<span class="o">=</span> <span class="n">noop_llseek</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">miscdevice</span> <span class="o">*</span><span class="n">dasd_eer_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="nf">dasd_eer_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">dasd_eer_dev</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">dasd_eer_dev</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dasd_eer_dev</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">dasd_eer_dev</span><span class="o">-&gt;</span><span class="n">minor</span> <span class="o">=</span> <span class="n">MISC_DYNAMIC_MINOR</span><span class="p">;</span>
+	<span class="n">dasd_eer_dev</span><span class="o">-&gt;</span><span class="n">name</span>  <span class="o">=</span> <span class="s">&quot;dasd_eer&quot;</span><span class="p">;</span>
+	<span class="n">dasd_eer_dev</span><span class="o">-&gt;</span><span class="n">fops</span>  <span class="o">=</span> <span class="o">&amp;</span><span class="n">dasd_eer_fops</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">misc_register</span><span class="p">(</span><span class="n">dasd_eer_dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">dasd_eer_dev</span><span class="p">);</span>
+		<span class="n">dasd_eer_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">DBF_EVENT</span><span class="p">(</span><span class="n">DBF_ERR</span><span class="p">,</span> <span class="s">&quot;%s&quot;</span><span class="p">,</span> <span class="s">&quot;dasd_eer_init could not &quot;</span>
+		       <span class="s">&quot;register misc device&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">dasd_eer_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dasd_eer_dev</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">misc_deregister</span><span class="p">(</span><span class="n">dasd_eer_dev</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">dasd_eer_dev</span><span class="p">);</span>
+		<span class="n">dasd_eer_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › fuse › cuse.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>cuse.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * CUSE: Character device in Userspace</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2008-2009  SUSE Linux Products GmbH</span>
+<span class="cm"> * Copyright (C) 2008-2009  Tejun Heo &lt;tj@kernel.org&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPLv2.</span>
+<span class="cm"> *</span>
+<span class="cm"> * CUSE enables character devices to be implemented from userland much</span>
+<span class="cm"> * like FUSE allows filesystems.  On initialization /dev/cuse is</span>
+<span class="cm"> * created.  By opening the file and replying to the CUSE_INIT request</span>
+<span class="cm"> * userland CUSE server can create a character device.  After that the</span>
+<span class="cm"> * operation is very similar to FUSE.</span>
+<span class="cm"> *</span>
+<span class="cm"> * A CUSE instance involves the following objects.</span>
+<span class="cm"> *</span>
+<span class="cm"> * cuse_conn	: contains fuse_conn and serves as bonding structure</span>
+<span class="cm"> * channel	: file handle connected to the userland CUSE server</span>
+<span class="cm"> * cdev		: the implemented character device</span>
+<span class="cm"> * dev		: generic device for cdev</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that &#39;channel&#39; is what &#39;dev&#39; is in FUSE.  As CUSE deals with</span>
+<span class="cm"> * devices, it&#39;s called &#39;channel&#39; to reduce confusion.</span>
+<span class="cm"> *</span>
+<span class="cm"> * channel determines when the character device dies.  When channel is</span>
+<span class="cm"> * closed, everything begins to destruct.  The cuse_conn is taken off</span>
+<span class="cm"> * the lookup table preventing further access from cdev, cdev and</span>
+<span class="cm"> * generic device are removed and the base reference of cuse_conn is</span>
+<span class="cm"> * put.</span>
+<span class="cm"> *</span>
+<span class="cm"> * On each open, the matching cuse_conn is looked up and if found an</span>
+<span class="cm"> * additional reference is taken which is released when the file is</span>
+<span class="cm"> * closed.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/fuse.h&gt;</span>
+<span class="cp">#include &lt;linux/cdev.h&gt;</span>
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/file.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/kdev_t.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/magic.h&gt;</span>
+<span class="cp">#include &lt;linux/miscdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/stat.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+
+<span class="cp">#include &quot;fuse_i.h&quot;</span>
+
+<span class="cp">#define CUSE_CONNTBL_LEN	64</span>
+
+<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>	<span class="cm">/* linked on cuse_conntbl */</span>
+	<span class="k">struct</span> <span class="n">fuse_conn</span>	<span class="n">fc</span><span class="p">;</span>	<span class="cm">/* fuse connection */</span>
+	<span class="k">struct</span> <span class="n">cdev</span>		<span class="o">*</span><span class="n">cdev</span><span class="p">;</span>	<span class="cm">/* associated character device */</span>
+	<span class="k">struct</span> <span class="n">device</span>		<span class="o">*</span><span class="n">dev</span><span class="p">;</span>	<span class="cm">/* device representing @cdev */</span>
+
+	<span class="cm">/* init parameters, set once during initialization */</span>
+	<span class="n">bool</span>			<span class="n">unrestricted_ioctl</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">cuse_lock</span><span class="p">);</span>		<span class="cm">/* protects cuse_conntbl */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="n">cuse_conntbl</span><span class="p">[</span><span class="n">CUSE_CONNTBL_LEN</span><span class="p">];</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">class</span> <span class="o">*</span><span class="n">cuse_class</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="nf">fc_to_cc</span><span class="p">(</span><span class="k">struct</span> <span class="n">fuse_conn</span> <span class="o">*</span><span class="n">fc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">container_of</span><span class="p">(</span><span class="n">fc</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cuse_conn</span><span class="p">,</span> <span class="n">fc</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="nf">cuse_conntbl_head</span><span class="p">(</span><span class="n">dev_t</span> <span class="n">devt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">cuse_conntbl</span><span class="p">[(</span><span class="n">MAJOR</span><span class="p">(</span><span class="n">devt</span><span class="p">)</span> <span class="o">+</span> <span class="n">MINOR</span><span class="p">(</span><span class="n">devt</span><span class="p">))</span> <span class="o">%</span> <span class="n">CUSE_CONNTBL_LEN</span><span class="p">];</span>
+<span class="p">}</span>
+
+
+<span class="cm">/**************************************************************************</span>
+<span class="cm"> * CUSE frontend operations</span>
+<span class="cm"> *</span>
+<span class="cm"> * These are file operations for the character device.</span>
+<span class="cm"> *</span>
+<span class="cm"> * On open, CUSE opens a file from the FUSE mnt and stores it to</span>
+<span class="cm"> * private_data of the open file.  All other ops call FUSE ops on the</span>
+<span class="cm"> * FUSE file.</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">cuse_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">,</span>
+			 <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">loff_t</span> <span class="n">pos</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">fuse_direct_io</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">count</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pos</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">cuse_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+			  <span class="kt">size_t</span> <span class="n">count</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">loff_t</span> <span class="n">pos</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * No locking or generic_write_checks(), the server is</span>
+<span class="cm">	 * responsible for locking and sanity checks.</span>
+<span class="cm">	 */</span>
+	<span class="k">return</span> <span class="n">fuse_direct_io</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">count</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pos</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dev_t</span> <span class="n">devt</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_cdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* look up and get the connection */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="n">cuse_conntbl_head</span><span class="p">(</span><span class="n">devt</span><span class="p">),</span> <span class="n">list</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pos</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">devt</span> <span class="o">==</span> <span class="n">devt</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">fuse_conn_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pos</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+			<span class="n">cc</span> <span class="o">=</span> <span class="n">pos</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+
+	<span class="cm">/* dead? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Generic permission check is already done against the chrdev</span>
+<span class="cm">	 * file, proceed to open.</span>
+<span class="cm">	 */</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">fuse_do_open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fuse_conn_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fuse_file</span> <span class="o">*</span><span class="n">ff</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">fuse_conn</span> <span class="o">*</span><span class="n">fc</span> <span class="o">=</span> <span class="n">ff</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">;</span>
+
+	<span class="n">fuse_sync_release</span><span class="p">(</span><span class="n">ff</span><span class="p">,</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span><span class="p">);</span>
+	<span class="n">fuse_conn_put</span><span class="p">(</span><span class="n">fc</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">cuse_file_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cmd</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fuse_file</span> <span class="o">*</span><span class="n">ff</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">fc_to_cc</span><span class="p">(</span><span class="n">ff</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">unrestricted_ioctl</span><span class="p">)</span>
+		<span class="n">flags</span> <span class="o">|=</span> <span class="n">FUSE_IOCTL_UNRESTRICTED</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">fuse_do_ioctl</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">arg</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">cuse_file_compat_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cmd</span><span class="p">,</span>
+				   <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fuse_file</span> <span class="o">*</span><span class="n">ff</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">fc_to_cc</span><span class="p">(</span><span class="n">ff</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">flags</span> <span class="o">=</span> <span class="n">FUSE_IOCTL_COMPAT</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">unrestricted_ioctl</span><span class="p">)</span>
+		<span class="n">flags</span> <span class="o">|=</span> <span class="n">FUSE_IOCTL_UNRESTRICTED</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">fuse_do_ioctl</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">arg</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">cuse_frontend_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span>			<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span>			<span class="o">=</span> <span class="n">cuse_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write</span>			<span class="o">=</span> <span class="n">cuse_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span>			<span class="o">=</span> <span class="n">cuse_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span>		<span class="o">=</span> <span class="n">cuse_release</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span>		<span class="o">=</span> <span class="n">cuse_file_ioctl</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">compat_ioctl</span>		<span class="o">=</span> <span class="n">cuse_file_compat_ioctl</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">poll</span>			<span class="o">=</span> <span class="n">fuse_file_poll</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span>		<span class="o">=</span> <span class="n">noop_llseek</span><span class="p">,</span>
+<span class="p">};</span>
+
+
+<span class="cm">/**************************************************************************</span>
+<span class="cm"> * CUSE channel initialization and destruction</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">cuse_devinfo</span> <span class="p">{</span>
+	<span class="k">const</span> <span class="kt">char</span>		<span class="o">*</span><span class="n">name</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * cuse_parse_one - parse one key=value pair</span>
+<span class="cm"> * @pp: i/o parameter for the current position</span>
+<span class="cm"> * @end: points to one past the end of the packed string</span>
+<span class="cm"> * @keyp: out parameter for key</span>
+<span class="cm"> * @valp: out parameter for value</span>
+<span class="cm"> *</span>
+<span class="cm"> * *@pp points to packed strings - &quot;key0=val0\0key1=val1\0&quot; which ends</span>
+<span class="cm"> * at @end - 1.  This function parses one pair and set *@keyp to the</span>
+<span class="cm"> * start of the key and *@valp to the start of the value.  Note that</span>
+<span class="cm"> * the original string is modified such that the key string is</span>
+<span class="cm"> * terminated with &#39;\0&#39;.  *@pp is updated to point to the next string.</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * 1 on successful parse, 0 on EOF, -errno on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_parse_one</span><span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="n">pp</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">end</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">keyp</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">valp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">*</span><span class="n">pp</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">key</span><span class="p">,</span> <span class="o">*</span><span class="n">val</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">p</span> <span class="o">&lt;</span> <span class="n">end</span> <span class="o">&amp;&amp;</span> <span class="o">*</span><span class="n">p</span> <span class="o">==</span> <span class="sc">&#39;\0&#39;</span><span class="p">)</span>
+		<span class="n">p</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="n">end</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">end</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="sc">&#39;\0&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;CUSE: info not properly terminated</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">key</span> <span class="o">=</span> <span class="n">val</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+	<span class="n">p</span> <span class="o">+=</span> <span class="n">strlen</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">valp</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">strsep</span><span class="p">(</span><span class="o">&amp;</span><span class="n">val</span><span class="p">,</span> <span class="s">&quot;=&quot;</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">val</span><span class="p">)</span>
+			<span class="n">val</span> <span class="o">=</span> <span class="n">key</span> <span class="o">+</span> <span class="n">strlen</span><span class="p">(</span><span class="n">key</span><span class="p">);</span>
+		<span class="n">key</span> <span class="o">=</span> <span class="n">strstrip</span><span class="p">(</span><span class="n">key</span><span class="p">);</span>
+		<span class="n">val</span> <span class="o">=</span> <span class="n">strstrip</span><span class="p">(</span><span class="n">val</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">key</span> <span class="o">=</span> <span class="n">strstrip</span><span class="p">(</span><span class="n">key</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strlen</span><span class="p">(</span><span class="n">key</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;CUSE: zero length info key specified</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">pp</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">keyp</span> <span class="o">=</span> <span class="n">key</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">valp</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">valp</span> <span class="o">=</span> <span class="n">val</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * cuse_parse_dev_info - parse device info</span>
+<span class="cm"> * @p: device info string</span>
+<span class="cm"> * @len: length of device info string</span>
+<span class="cm"> * @devinfo: out parameter for parsed device info</span>
+<span class="cm"> *</span>
+<span class="cm"> * Parse @p to extract device info and store it into @devinfo.  String</span>
+<span class="cm"> * pointed to by @p is modified by parsing and @devinfo points into</span>
+<span class="cm"> * them, so @p shouldn&#39;t be freed while @devinfo is in use.</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * 0 on success, -errno on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_parse_devinfo</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">len</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cuse_devinfo</span> <span class="o">*</span><span class="n">devinfo</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">end</span> <span class="o">=</span> <span class="n">p</span> <span class="o">+</span> <span class="n">len</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">key</span><span class="p">,</span> <span class="o">*</span><span class="n">val</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="nb">true</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">cuse_parse_one</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">,</span> <span class="n">end</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">val</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rc</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="s">&quot;DEVNAME&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">devinfo</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">=</span> <span class="n">val</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;CUSE: unknown device info </span><span class="se">\&quot;</span><span class="s">%s</span><span class="se">\&quot;\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">key</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">devinfo</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">||</span> <span class="o">!</span><span class="n">strlen</span><span class="p">(</span><span class="n">devinfo</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;CUSE: DEVNAME unspecified</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">cuse_gendev_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * cuse_process_init_reply - finish initializing CUSE channel</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function creates the character device and sets up all the</span>
+<span class="cm"> * required data structures for it.  Please read the comment at the</span>
+<span class="cm"> * top of this file for high level overview.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">cuse_process_init_reply</span><span class="p">(</span><span class="k">struct</span> <span class="n">fuse_conn</span> <span class="o">*</span><span class="n">fc</span><span class="p">,</span> <span class="k">struct</span> <span class="n">fuse_req</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">fc_to_cc</span><span class="p">(</span><span class="n">fc</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">cuse_init_out</span> <span class="o">*</span><span class="n">arg</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">value</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">cuse_devinfo</span> <span class="n">devinfo</span> <span class="o">=</span> <span class="p">{</span> <span class="p">};</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cdev</span> <span class="o">*</span><span class="n">cdev</span><span class="p">;</span>
+	<span class="n">dev_t</span> <span class="n">devt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">h</span><span class="p">.</span><span class="n">error</span> <span class="o">||</span>
+	    <span class="n">arg</span><span class="o">-&gt;</span><span class="n">major</span> <span class="o">!=</span> <span class="n">FUSE_KERNEL_VERSION</span> <span class="o">||</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">minor</span> <span class="o">&lt;</span> <span class="mi">11</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">fc</span><span class="o">-&gt;</span><span class="n">minor</span> <span class="o">=</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">minor</span><span class="p">;</span>
+	<span class="n">fc</span><span class="o">-&gt;</span><span class="n">max_read</span> <span class="o">=</span> <span class="n">max_t</span><span class="p">(</span><span class="kt">unsigned</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">max_read</span><span class="p">,</span> <span class="mi">4096</span><span class="p">);</span>
+	<span class="n">fc</span><span class="o">-&gt;</span><span class="n">max_write</span> <span class="o">=</span> <span class="n">max_t</span><span class="p">(</span><span class="kt">unsigned</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">max_write</span><span class="p">,</span> <span class="mi">4096</span><span class="p">);</span>
+
+	<span class="cm">/* parse init reply */</span>
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">unrestricted_ioctl</span> <span class="o">=</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">CUSE_UNRESTRICTED_IOCTL</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">cuse_parse_devinfo</span><span class="p">(</span><span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">),</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">size</span><span class="p">,</span>
+				<span class="o">&amp;</span><span class="n">devinfo</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="cm">/* determine and reserve devt */</span>
+	<span class="n">devt</span> <span class="o">=</span> <span class="n">MKDEV</span><span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">dev_major</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">dev_minor</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">MAJOR</span><span class="p">(</span><span class="n">devt</span><span class="p">))</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">alloc_chrdev_region</span><span class="p">(</span><span class="o">&amp;</span><span class="n">devt</span><span class="p">,</span> <span class="n">MINOR</span><span class="p">(</span><span class="n">devt</span><span class="p">),</span> <span class="mi">1</span><span class="p">,</span> <span class="n">devinfo</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">register_chrdev_region</span><span class="p">(</span><span class="n">devt</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">devinfo</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;CUSE: failed to register chrdev region</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* devt determined, create device */</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">dev</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">dev</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_region</span><span class="p">;</span>
+
+	<span class="n">device_initialize</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">dev_set_uevent_suppress</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">class</span> <span class="o">=</span> <span class="n">cuse_class</span><span class="p">;</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">devt</span> <span class="o">=</span> <span class="n">devt</span><span class="p">;</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">release</span> <span class="o">=</span> <span class="n">cuse_gendev_release</span><span class="p">;</span>
+	<span class="n">dev_set_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">cc</span><span class="p">);</span>
+	<span class="n">dev_set_name</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s&quot;</span><span class="p">,</span> <span class="n">devinfo</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">device_add</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_device</span><span class="p">;</span>
+
+	<span class="cm">/* register cdev */</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">cdev</span> <span class="o">=</span> <span class="n">cdev_alloc</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cdev</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_device</span><span class="p">;</span>
+
+	<span class="n">cdev</span><span class="o">-&gt;</span><span class="n">owner</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">;</span>
+	<span class="n">cdev</span><span class="o">-&gt;</span><span class="n">ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cuse_frontend_fops</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">cdev_add</span><span class="p">(</span><span class="n">cdev</span><span class="p">,</span> <span class="n">devt</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_cdev</span><span class="p">;</span>
+
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">cdev</span> <span class="o">=</span> <span class="n">cdev</span><span class="p">;</span>
+
+	<span class="cm">/* make the device available */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">cuse_conntbl_head</span><span class="p">(</span><span class="n">devt</span><span class="p">));</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+
+	<span class="cm">/* announce device availability */</span>
+	<span class="n">dev_set_uevent_suppress</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">kobject_uevent</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="n">KOBJ_ADD</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">arg</span><span class="p">);</span>
+	<span class="n">__free_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+
+<span class="nl">err_cdev:</span>
+	<span class="n">cdev_del</span><span class="p">(</span><span class="n">cdev</span><span class="p">);</span>
+<span class="nl">err_device:</span>
+	<span class="n">put_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+<span class="nl">err_region:</span>
+	<span class="n">unregister_chrdev_region</span><span class="p">(</span><span class="n">devt</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="nl">err:</span>
+	<span class="n">fc</span><span class="o">-&gt;</span><span class="n">conn_error</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_send_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">fuse_req</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">fuse_conn</span> <span class="o">*</span><span class="n">fc</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cuse_init_in</span> <span class="o">*</span><span class="n">arg</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">outarg</span><span class="p">;</span>
+
+	<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">CUSE_INIT_INFO_MAX</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+
+	<span class="n">req</span> <span class="o">=</span> <span class="n">fuse_get_req</span><span class="p">(</span><span class="n">fc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span> <span class="o">|</span> <span class="n">__GFP_ZERO</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_put_req</span><span class="p">;</span>
+
+	<span class="n">outarg</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">cuse_init_out</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">outarg</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_free_page</span><span class="p">;</span>
+
+	<span class="n">arg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">misc</span><span class="p">.</span><span class="n">cuse_init_in</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">major</span> <span class="o">=</span> <span class="n">FUSE_KERNEL_VERSION</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">minor</span> <span class="o">=</span> <span class="n">FUSE_KERNEL_MINOR_VERSION</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">CUSE_UNRESTRICTED_IOCTL</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">.</span><span class="n">h</span><span class="p">.</span><span class="n">opcode</span> <span class="o">=</span> <span class="n">CUSE_INIT</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">.</span><span class="n">numargs</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">cuse_init_in</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">value</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">numargs</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">cuse_init_out</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">value</span> <span class="o">=</span> <span class="n">outarg</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">args</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">size</span> <span class="o">=</span> <span class="n">CUSE_INIT_INFO_MAX</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">argvar</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">.</span><span class="n">argpages</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">num_pages</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">=</span> <span class="n">cuse_process_init_reply</span><span class="p">;</span>
+	<span class="n">fuse_request_send_background</span><span class="p">(</span><span class="n">fc</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">err_free_page:</span>
+	<span class="n">__free_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+<span class="nl">err_put_req:</span>
+	<span class="n">fuse_put_request</span><span class="p">(</span><span class="n">fc</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+<span class="nl">err:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">cuse_fc_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">fuse_conn</span> <span class="o">*</span><span class="n">fc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">fc_to_cc</span><span class="p">(</span><span class="n">fc</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">cc</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * cuse_channel_open - open method for /dev/cuse</span>
+<span class="cm"> * @inode: inode for /dev/cuse</span>
+<span class="cm"> * @file: file struct being opened</span>
+<span class="cm"> *</span>
+<span class="cm"> * Userland CUSE server can create a CUSE device by opening /dev/cuse</span>
+<span class="cm"> * and replying to the initialization request kernel sends.  This</span>
+<span class="cm"> * function is responsible for handling CUSE device initialization.</span>
+<span class="cm"> * Because the fd opened by this function is used during</span>
+<span class="cm"> * initialization, this function only creates cuse_conn and sends</span>
+<span class="cm"> * init.  The rest is delegated to a kthread.</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * 0 on success, -errno on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_channel_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* set up cuse_conn */</span>
+	<span class="n">cc</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">cc</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">fuse_conn_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">.</span><span class="n">release</span> <span class="o">=</span> <span class="n">cuse_fc_release</span><span class="p">;</span>
+
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">.</span><span class="n">connected</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">.</span><span class="n">blocked</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">cuse_send_init</span><span class="p">(</span><span class="n">cc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">fuse_conn_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">;</span>	<span class="cm">/* channel owns base reference to cc */</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * cuse_channel_release - release method for /dev/cuse</span>
+<span class="cm"> * @inode: inode for /dev/cuse</span>
+<span class="cm"> * @file: file struct being closed</span>
+<span class="cm"> *</span>
+<span class="cm"> * Disconnect the channel, deregister CUSE device and initiate</span>
+<span class="cm"> * destruction by putting the default reference.</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * 0 on success, -errno on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">cuse_channel_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">fc_to_cc</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* remove from the conntbl, no more access from this point on */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_lock</span><span class="p">);</span>
+
+	<span class="cm">/* remove device */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+		<span class="n">device_unregister</span><span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">unregister_chrdev_region</span><span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">cdev_del</span><span class="p">(</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">cdev</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* kill connection and shutdown channel */</span>
+	<span class="n">fuse_conn_kill</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">fuse_dev_release</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>	<span class="cm">/* puts the base reference */</span>
+
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">cuse_channel_fops</span><span class="p">;</span> <span class="cm">/* initialized during init */</span>
+
+
+<span class="cm">/**************************************************************************</span>
+<span class="cm"> * Misc stuff and module initializatiion</span>
+<span class="cm"> *</span>
+<span class="cm"> * CUSE exports the same set of attributes to sysfs as fusectl.</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">cuse_class_waiting_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">.</span><span class="n">num_waiting</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">cuse_class_abort_store</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+				      <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+				      <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cuse_conn</span> <span class="o">*</span><span class="n">cc</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">fuse_abort_conn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cc</span><span class="o">-&gt;</span><span class="n">fc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="n">cuse_class_dev_attrs</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="n">__ATTR</span><span class="p">(</span><span class="n">waiting</span><span class="p">,</span> <span class="n">S_IFREG</span> <span class="o">|</span> <span class="mo">0400</span><span class="p">,</span> <span class="n">cuse_class_waiting_show</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">),</span>
+	<span class="n">__ATTR</span><span class="p">(</span><span class="n">abort</span><span class="p">,</span> <span class="n">S_IFREG</span> <span class="o">|</span> <span class="mo">0200</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">cuse_class_abort_store</span><span class="p">),</span>
+	<span class="p">{</span> <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">miscdevice</span> <span class="n">cuse_miscdev</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">minor</span>		<span class="o">=</span> <span class="n">MISC_DYNAMIC_MINOR</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">name</span>		<span class="o">=</span> <span class="s">&quot;cuse&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">fops</span>		<span class="o">=</span> <span class="o">&amp;</span><span class="n">cuse_channel_fops</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">cuse_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* init conntbl */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">CUSE_CONNTBL_LEN</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_conntbl</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="cm">/* inherit and extend fuse_dev_operations */</span>
+	<span class="n">cuse_channel_fops</span>		<span class="o">=</span> <span class="n">fuse_dev_operations</span><span class="p">;</span>
+	<span class="n">cuse_channel_fops</span><span class="p">.</span><span class="n">owner</span>		<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">;</span>
+	<span class="n">cuse_channel_fops</span><span class="p">.</span><span class="n">open</span>		<span class="o">=</span> <span class="n">cuse_channel_open</span><span class="p">;</span>
+	<span class="n">cuse_channel_fops</span><span class="p">.</span><span class="n">release</span>	<span class="o">=</span> <span class="n">cuse_channel_release</span><span class="p">;</span>
+
+	<span class="n">cuse_class</span> <span class="o">=</span> <span class="n">class_create</span><span class="p">(</span><span class="n">THIS_MODULE</span><span class="p">,</span> <span class="s">&quot;cuse&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">cuse_class</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">cuse_class</span><span class="p">);</span>
+
+	<span class="n">cuse_class</span><span class="o">-&gt;</span><span class="n">dev_attrs</span> <span class="o">=</span> <span class="n">cuse_class_dev_attrs</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">misc_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_miscdev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">class_destroy</span><span class="p">(</span><span class="n">cuse_class</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">cuse_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cuse_miscdev</span><span class="p">);</span>
+	<span class="n">class_destroy</span><span class="p">(</span><span class="n">cuse_class</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">cuse_init</span><span class="p">);</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">cuse_exit</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Tejun Heo &lt;tj@kernel.org&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Character device in Userspace&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

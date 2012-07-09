@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › md › dm-snap-persistent.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>dm-snap-persistent.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2001-2002 Sistina Software (UK) Limited.</span>
+<span class="cm"> * Copyright (C) 2006-2008 Red Hat GmbH</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPL.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &quot;dm-exception-store.h&quot;</span>
+
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/vmalloc.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/dm-io.h&gt;</span>
+
+<span class="cp">#define DM_MSG_PREFIX &quot;persistent snapshot&quot;</span>
+<span class="cp">#define DM_CHUNK_SIZE_DEFAULT_SECTORS 32	</span><span class="cm">/* 16KB */</span><span class="cp"></span>
+
+<span class="cm">/*-----------------------------------------------------------------</span>
+<span class="cm"> * Persistent snapshots, by persistent we mean that the snapshot</span>
+<span class="cm"> * will survive a reboot.</span>
+<span class="cm"> *---------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We need to store a record of which parts of the origin have</span>
+<span class="cm"> * been copied to the snapshot device.  The snapshot code</span>
+<span class="cm"> * requires that we copy exception chunks to chunk aligned areas</span>
+<span class="cm"> * of the COW store.  It makes sense therefore, to store the</span>
+<span class="cm"> * metadata in chunk size blocks.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There is no backward or forward compatibility implemented,</span>
+<span class="cm"> * snapshots with different disk versions than the kernel will</span>
+<span class="cm"> * not be usable.  It is expected that &quot;lvcreate&quot; will blank out</span>
+<span class="cm"> * the start of a fresh COW device before calling the snapshot</span>
+<span class="cm"> * constructor.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The first chunk of the COW device just contains the header.</span>
+<span class="cm"> * After this there is a chunk filled with exception metadata,</span>
+<span class="cm"> * followed by as many exception chunks as can fit in the</span>
+<span class="cm"> * metadata areas.</span>
+<span class="cm"> *</span>
+<span class="cm"> * All on disk structures are in little-endian format.  The end</span>
+<span class="cm"> * of the exceptions info is indicated by an exception with a</span>
+<span class="cm"> * new_chunk of 0, which is invalid since it would point to the</span>
+<span class="cm"> * header chunk.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Magic for persistent snapshots: &quot;SnAp&quot; - Feeble isn&#39;t it.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SNAP_MAGIC 0x70416e53</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The on-disk version of the metadata.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SNAPSHOT_DISK_VERSION 1</span>
+
+<span class="cp">#define NUM_SNAPSHOT_HDR_CHUNKS 1</span>
+
+<span class="k">struct</span> <span class="n">disk_header</span> <span class="p">{</span>
+	<span class="n">__le32</span> <span class="n">magic</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Is this snapshot valid.  There is no way of recovering</span>
+<span class="cm">	 * an invalid snapshot.</span>
+<span class="cm">	 */</span>
+	<span class="n">__le32</span> <span class="n">valid</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Simple, incrementing version. no backward</span>
+<span class="cm">	 * compatibility.</span>
+<span class="cm">	 */</span>
+	<span class="n">__le32</span> <span class="n">version</span><span class="p">;</span>
+
+	<span class="cm">/* In sectors */</span>
+	<span class="n">__le32</span> <span class="n">chunk_size</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">__packed</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">disk_exception</span> <span class="p">{</span>
+	<span class="n">__le64</span> <span class="n">old_chunk</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">new_chunk</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">__packed</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">core_exception</span> <span class="p">{</span>
+	<span class="kt">uint64_t</span> <span class="n">old_chunk</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">new_chunk</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">commit_callback</span> <span class="p">{</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">callback</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="p">,</span> <span class="kt">int</span> <span class="n">success</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The top level structure for a persistent exception store.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">pstore</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">version</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">valid</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">exceptions_per_area</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now that we have an asynchronous kcopyd there is no</span>
+<span class="cm">	 * need for large chunk sizes, so it wont hurt to have a</span>
+<span class="cm">	 * whole chunks worth of metadata in memory at once.</span>
+<span class="cm">	 */</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">area</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * An area of zeros used to clear the next area.</span>
+<span class="cm">	 */</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">zero_area</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * An area used for header. The header can be written</span>
+<span class="cm">	 * concurrently with metadata (when invalidating the snapshot),</span>
+<span class="cm">	 * so it needs a separate buffer.</span>
+<span class="cm">	 */</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">header_area</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Used to keep track of which metadata area the data in</span>
+<span class="cm">	 * &#39;chunk&#39; refers to.</span>
+<span class="cm">	 */</span>
+	<span class="n">chunk_t</span> <span class="n">current_area</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The next free chunk for an exception.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * When creating exceptions, all the chunks here and above are</span>
+<span class="cm">	 * free.  It holds the next chunk to be allocated.  On rare</span>
+<span class="cm">	 * occasions (e.g. after a system crash) holes can be left in</span>
+<span class="cm">	 * the exception store because chunks can be committed out of</span>
+<span class="cm">	 * order.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * When merging exceptions, it does not necessarily mean all the</span>
+<span class="cm">	 * chunks here and above are free.  It holds the value it would</span>
+<span class="cm">	 * have held if all chunks had been committed in order of</span>
+<span class="cm">	 * allocation.  Consequently the value may occasionally be</span>
+<span class="cm">	 * slightly too low, but since it&#39;s only used for &#39;status&#39; and</span>
+<span class="cm">	 * it can never reach its minimum value too early this doesn&#39;t</span>
+<span class="cm">	 * matter.</span>
+<span class="cm">	 */</span>
+
+	<span class="n">chunk_t</span> <span class="n">next_free</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The index of next free exception in the current</span>
+<span class="cm">	 * metadata area.</span>
+<span class="cm">	 */</span>
+	<span class="kt">uint32_t</span> <span class="n">current_committed</span><span class="p">;</span>
+
+	<span class="n">atomic_t</span> <span class="n">pending_count</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">callback_count</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">commit_callback</span> <span class="o">*</span><span class="n">callbacks</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_io_client</span> <span class="o">*</span><span class="n">io_client</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">metadata_wq</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">alloc_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">&lt;&lt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Allocate the chunk_size block of memory that will hold</span>
+<span class="cm">	 * a single metadata area.</span>
+<span class="cm">	 */</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span> <span class="o">=</span> <span class="n">vmalloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_area</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span> <span class="o">=</span> <span class="n">vzalloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_zero_area</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span> <span class="o">=</span> <span class="n">vmalloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_header_area</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">err_header_area:</span>
+	<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span><span class="p">);</span>
+
+<span class="nl">err_zero_area:</span>
+	<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">);</span>
+
+<span class="nl">err_area:</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">)</span>
+		<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span><span class="p">)</span>
+		<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">)</span>
+		<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">mdata_req</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_io_region</span> <span class="o">*</span><span class="n">where</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_io_request</span> <span class="o">*</span><span class="n">io_req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">work_struct</span> <span class="n">work</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">do_metadata</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mdata_req</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mdata_req</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">result</span> <span class="o">=</span> <span class="n">dm_io</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">io_req</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">where</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Read or write a chunk aligned and sized block of data from a device.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">chunk_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">area</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">chunk</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rw</span><span class="p">,</span>
+		    <span class="kt">int</span> <span class="n">metadata</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_io_region</span> <span class="n">where</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">dm_snap_cow</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">snap</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sector</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">*</span> <span class="n">chunk</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">,</span>
+	<span class="p">};</span>
+	<span class="k">struct</span> <span class="n">dm_io_request</span> <span class="n">io_req</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bi_rw</span> <span class="o">=</span> <span class="n">rw</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="n">DM_IO_VMA</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">ptr</span><span class="p">.</span><span class="n">vma</span> <span class="o">=</span> <span class="n">area</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">client</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">notify</span><span class="p">.</span><span class="n">fn</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">};</span>
+	<span class="k">struct</span> <span class="n">mdata_req</span> <span class="n">req</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">metadata</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">dm_io</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_req</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">where</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">req</span><span class="p">.</span><span class="n">where</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">where</span><span class="p">;</span>
+	<span class="n">req</span><span class="p">.</span><span class="n">io_req</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">io_req</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Issue the synchronous I/O from a different thread</span>
+<span class="cm">	 * to avoid generic_make_request recursion.</span>
+<span class="cm">	 */</span>
+	<span class="n">INIT_WORK_ONSTACK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="p">.</span><span class="n">work</span><span class="p">,</span> <span class="n">do_metadata</span><span class="p">);</span>
+	<span class="n">queue_work</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">metadata_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">req</span><span class="p">.</span><span class="n">work</span><span class="p">);</span>
+	<span class="n">flush_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="p">.</span><span class="n">work</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">req</span><span class="p">.</span><span class="n">result</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Convert a metadata area index to a chunk index.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">chunk_t</span> <span class="nf">area_location</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">area</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">NUM_SNAPSHOT_HDR_CHUNKS</span> <span class="o">+</span> <span class="p">((</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">area</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Read or write a metadata area.  Remembering to skip the first</span>
+<span class="cm"> * chunk which holds the header.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">area_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rw</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">chunk_t</span> <span class="n">chunk</span><span class="p">;</span>
+
+	<span class="n">chunk</span> <span class="o">=</span> <span class="n">area_location</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">chunk_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">,</span> <span class="n">chunk</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">zero_memory_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">&lt;&lt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">zero_disk_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">area</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">chunk_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span><span class="p">,</span> <span class="n">area_location</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">area</span><span class="p">),</span> <span class="n">WRITE</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">read_header</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="kt">int</span> <span class="o">*</span><span class="n">new_snapshot</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">disk_header</span> <span class="o">*</span><span class="n">dh</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">chunk_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">chunk_size_supplied</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">chunk_err</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Use default chunk size (or logical_block_size, if larger)</span>
+<span class="cm">	 * if none supplied</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">DM_CHUNK_SIZE_DEFAULT_SECTORS</span><span class="p">,</span>
+		    <span class="n">bdev_logical_block_size</span><span class="p">(</span><span class="n">dm_snap_cow</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">snap</span><span class="p">)</span><span class="o">-&gt;</span>
+					    <span class="n">bdev</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">9</span><span class="p">);</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_mask</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_shift</span> <span class="o">=</span> <span class="n">ffs</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">chunk_size_supplied</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span> <span class="o">=</span> <span class="n">dm_io_client_create</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">alloc_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">chunk_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">READ</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="n">dh</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">dh</span><span class="o">-&gt;</span><span class="n">magic</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">new_snapshot</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">dh</span><span class="o">-&gt;</span><span class="n">magic</span><span class="p">)</span> <span class="o">!=</span> <span class="n">SNAP_MAGIC</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;Invalid or corrupt snapshot&quot;</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">new_snapshot</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">dh</span><span class="o">-&gt;</span><span class="n">valid</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">dh</span><span class="o">-&gt;</span><span class="n">version</span><span class="p">);</span>
+	<span class="n">chunk_size</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">dh</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">==</span> <span class="n">chunk_size</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chunk_size_supplied</span><span class="p">)</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;chunk size %u in device metadata overrides &quot;</span>
+		       <span class="s">&quot;table chunk size of %u.&quot;</span><span class="p">,</span>
+		       <span class="n">chunk_size</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">);</span>
+
+	<span class="cm">/* We had a bogus chunk_size. Fix stuff up. */</span>
+	<span class="n">free_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_exception_store_set_chunk_size</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">,</span>
+					      <span class="o">&amp;</span><span class="n">chunk_err</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;invalid on-disk chunk size %u: %s.&quot;</span><span class="p">,</span>
+		      <span class="n">chunk_size</span><span class="p">,</span> <span class="n">chunk_err</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">alloc_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+<span class="nl">bad:</span>
+	<span class="n">free_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">write_header</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">disk_header</span> <span class="o">*</span><span class="n">dh</span><span class="p">;</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">&lt;&lt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">);</span>
+
+	<span class="n">dh</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">;</span>
+	<span class="n">dh</span><span class="o">-&gt;</span><span class="n">magic</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">SNAP_MAGIC</span><span class="p">);</span>
+	<span class="n">dh</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span><span class="p">);</span>
+	<span class="n">dh</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">version</span><span class="p">);</span>
+	<span class="n">dh</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">chunk_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">WRITE</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Access functions for the disk exceptions, these do the endian conversions.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">disk_exception</span> <span class="o">*</span><span class="nf">get_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">((</span><span class="k">struct</span> <span class="n">disk_exception</span> <span class="o">*</span><span class="p">)</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span><span class="p">)</span> <span class="o">+</span> <span class="n">index</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">read_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span>
+			   <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span> <span class="k">struct</span> <span class="n">core_exception</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">disk_exception</span> <span class="o">*</span><span class="n">de</span> <span class="o">=</span> <span class="n">get_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+	<span class="cm">/* copy it */</span>
+	<span class="n">result</span><span class="o">-&gt;</span><span class="n">old_chunk</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">old_chunk</span><span class="p">);</span>
+	<span class="n">result</span><span class="o">-&gt;</span><span class="n">new_chunk</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">new_chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">write_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span>
+			    <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span> <span class="k">struct</span> <span class="n">core_exception</span> <span class="o">*</span><span class="n">e</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">disk_exception</span> <span class="o">*</span><span class="n">de</span> <span class="o">=</span> <span class="n">get_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+	<span class="cm">/* copy it */</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">old_chunk</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">old_chunk</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">new_chunk</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">new_chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">clear_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">disk_exception</span> <span class="o">*</span><span class="n">de</span> <span class="o">=</span> <span class="n">get_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+	<span class="cm">/* clear it */</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">old_chunk</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">new_chunk</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Registers the exceptions that are present in the current area.</span>
+<span class="cm"> * &#39;full&#39; is filled in to indicate if the area has been</span>
+<span class="cm"> * filled.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">insert_exceptions</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span>
+			     <span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">callback</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">,</span>
+					     <span class="n">chunk_t</span> <span class="n">old</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">new</span><span class="p">),</span>
+			     <span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">,</span>
+			     <span class="kt">int</span> <span class="o">*</span><span class="n">full</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">core_exception</span> <span class="n">e</span><span class="p">;</span>
+
+	<span class="cm">/* presume the area is full */</span>
+	<span class="o">*</span><span class="n">full</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">read_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">e</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * If the new_chunk is pointing at the start of</span>
+<span class="cm">		 * the COW device, where the first metadata area</span>
+<span class="cm">		 * is we know that we&#39;ve hit the end of the</span>
+<span class="cm">		 * exceptions.  Therefore the area is not full.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">e</span><span class="p">.</span><span class="n">new_chunk</span> <span class="o">==</span> <span class="mi">0LL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="o">*</span><span class="n">full</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Keep track of the start of the free chunks.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">&lt;=</span> <span class="n">e</span><span class="p">.</span><span class="n">new_chunk</span><span class="p">)</span>
+			<span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">=</span> <span class="n">e</span><span class="p">.</span><span class="n">new_chunk</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Otherwise we add the exception to the snapshot.</span>
+<span class="cm">		 */</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">callback</span><span class="p">(</span><span class="n">callback_context</span><span class="p">,</span> <span class="n">e</span><span class="p">.</span><span class="n">old_chunk</span><span class="p">,</span> <span class="n">e</span><span class="p">.</span><span class="n">new_chunk</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">read_exceptions</span><span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span>
+			   <span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">callback</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">old</span><span class="p">,</span>
+					   <span class="n">chunk_t</span> <span class="n">new</span><span class="p">),</span>
+			   <span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">full</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Keeping reading chunks and inserting exceptions until</span>
+<span class="cm">	 * we find a partially full area.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">full</span><span class="p">;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">area_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">READ</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+		<span class="n">r</span> <span class="o">=</span> <span class="n">insert_exceptions</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">callback</span><span class="p">,</span> <span class="n">callback_context</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">full</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="o">--</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="nf">get_info</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="p">)</span> <span class="n">store</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">persistent_usage</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+			     <span class="n">sector_t</span> <span class="o">*</span><span class="n">total_sectors</span><span class="p">,</span>
+			     <span class="n">sector_t</span> <span class="o">*</span><span class="n">sectors_allocated</span><span class="p">,</span>
+			     <span class="n">sector_t</span> <span class="o">*</span><span class="n">metadata_sectors</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+
+	<span class="o">*</span><span class="n">sectors_allocated</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">*</span> <span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">total_sectors</span> <span class="o">=</span> <span class="n">get_dev_size</span><span class="p">(</span><span class="n">dm_snap_cow</span><span class="p">(</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">snap</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * First chunk is the fixed header.</span>
+<span class="cm">	 * Then there are (ps-&gt;current_area + 1) metadata chunks, each one</span>
+<span class="cm">	 * separated from the next by ps-&gt;exceptions_per_area data chunks.</span>
+<span class="cm">	 */</span>
+	<span class="o">*</span><span class="n">metadata_sectors</span> <span class="o">=</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">NUM_SNAPSHOT_HDR_CHUNKS</span><span class="p">)</span> <span class="o">*</span>
+			    <span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">persistent_dtr</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+
+	<span class="n">destroy_workqueue</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">metadata_wq</span><span class="p">);</span>
+
+	<span class="cm">/* Created in read_header */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span><span class="p">)</span>
+		<span class="n">dm_io_client_destroy</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">io_client</span><span class="p">);</span>
+	<span class="n">free_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+
+	<span class="cm">/* Allocated in persistent_read_metadata */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span><span class="p">)</span>
+		<span class="n">vfree</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">persistent_read_metadata</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+				    <span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">callback</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">,</span>
+						    <span class="n">chunk_t</span> <span class="n">old</span><span class="p">,</span> <span class="n">chunk_t</span> <span class="n">new</span><span class="p">),</span>
+				    <span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">uninitialized_var</span><span class="p">(</span><span class="n">new_snapshot</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Read the snapshot header.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">read_header</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new_snapshot</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now we know correct chunk_size, complete the initialisation.</span>
+<span class="cm">	 */</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span> <span class="o">=</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span> <span class="o">&lt;&lt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">)</span> <span class="o">/</span>
+				  <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">disk_exception</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span> <span class="o">=</span> <span class="n">dm_vcalloc</span><span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">,</span>
+				   <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Do we need to setup a new snapshot ?</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">new_snapshot</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">write_header</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;write_header failed&quot;</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">zero_memory_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">zero_disk_area</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+			<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;zero_disk_area(0) failed&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Sanity checks.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">!=</span> <span class="n">SNAPSHOT_DISK_VERSION</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;unable to handle snapshot disk version %d&quot;</span><span class="p">,</span>
+		       <span class="n">ps</span><span class="o">-&gt;</span><span class="n">version</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Metadata are valid, but snapshot is invalidated</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Read the metadata.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">read_exceptions</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">callback</span><span class="p">,</span> <span class="n">callback_context</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">persistent_prepare_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">dm_exception</span> <span class="o">*</span><span class="n">e</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+	<span class="kt">uint32_t</span> <span class="n">stride</span><span class="p">;</span>
+	<span class="n">chunk_t</span> <span class="n">next_free</span><span class="p">;</span>
+	<span class="n">sector_t</span> <span class="n">size</span> <span class="o">=</span> <span class="n">get_dev_size</span><span class="p">(</span><span class="n">dm_snap_cow</span><span class="p">(</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">snap</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">);</span>
+
+	<span class="cm">/* Is there enough room ? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="p">((</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOSPC</span><span class="p">;</span>
+
+	<span class="n">e</span><span class="o">-&gt;</span><span class="n">new_chunk</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Move onto the next free pending, making sure to take</span>
+<span class="cm">	 * into account the location of the metadata chunks.</span>
+<span class="cm">	 */</span>
+	<span class="n">stride</span> <span class="o">=</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">next_free</span> <span class="o">=</span> <span class="o">++</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sector_div</span><span class="p">(</span><span class="n">next_free</span><span class="p">,</span> <span class="n">stride</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">pending_count</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">persistent_commit_exception</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">dm_exception</span> <span class="o">*</span><span class="n">e</span><span class="p">,</span>
+					<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">callback</span><span class="p">)</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">,</span> <span class="kt">int</span> <span class="n">success</span><span class="p">),</span>
+					<span class="kt">void</span> <span class="o">*</span><span class="n">callback_context</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">core_exception</span> <span class="n">ce</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">commit_callback</span> <span class="o">*</span><span class="n">cb</span><span class="p">;</span>
+
+	<span class="n">ce</span><span class="p">.</span><span class="n">old_chunk</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">old_chunk</span><span class="p">;</span>
+	<span class="n">ce</span><span class="p">.</span><span class="n">new_chunk</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">new_chunk</span><span class="p">;</span>
+	<span class="n">write_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span><span class="o">++</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ce</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Add the callback to the back of the array.  This code</span>
+<span class="cm">	 * is the only place where the callback array is</span>
+<span class="cm">	 * manipulated, and we know that it will never be called</span>
+<span class="cm">	 * multiple times concurrently.</span>
+<span class="cm">	 */</span>
+	<span class="n">cb</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span> <span class="o">+</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">callback_count</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">cb</span><span class="o">-&gt;</span><span class="n">callback</span> <span class="o">=</span> <span class="n">callback</span><span class="p">;</span>
+	<span class="n">cb</span><span class="o">-&gt;</span><span class="n">context</span> <span class="o">=</span> <span class="n">callback_context</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If there are exceptions in flight and we have not yet</span>
+<span class="cm">	 * filled this metadata area there&#39;s nothing more to do.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">pending_count</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">!=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If we completely filled the current area, then wipe the next one.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">==</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">zero_disk_area</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Commit exceptions to disk.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">&amp;&amp;</span> <span class="n">area_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">WRITE_FLUSH_FUA</span><span class="p">))</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Advance to the next area if this one is full.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">==</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">zero_memory_area</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">callback_count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cb</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span> <span class="o">+</span> <span class="n">i</span><span class="p">;</span>
+		<span class="n">cb</span><span class="o">-&gt;</span><span class="n">callback</span><span class="p">(</span><span class="n">cb</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">callback_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">persistent_prepare_merge</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+				    <span class="n">chunk_t</span> <span class="o">*</span><span class="n">last_old_chunk</span><span class="p">,</span>
+				    <span class="n">chunk_t</span> <span class="o">*</span><span class="n">last_new_chunk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">core_exception</span> <span class="n">ce</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nr_consecutive</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * When current area is empty, move back to preceding area.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Have we finished?</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="o">--</span><span class="p">;</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">area_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">READ</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+		<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">exceptions_per_area</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">read_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ce</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">last_old_chunk</span> <span class="o">=</span> <span class="n">ce</span><span class="p">.</span><span class="n">old_chunk</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">last_new_chunk</span> <span class="o">=</span> <span class="n">ce</span><span class="p">.</span><span class="n">new_chunk</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Find number of consecutive chunks within the current area,</span>
+<span class="cm">	 * working backwards.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">nr_consecutive</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="n">nr_consecutive</span> <span class="o">&lt;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span><span class="p">;</span>
+	     <span class="n">nr_consecutive</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">read_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">nr_consecutive</span><span class="p">,</span>
+			       <span class="o">&amp;</span><span class="n">ce</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ce</span><span class="p">.</span><span class="n">old_chunk</span> <span class="o">!=</span> <span class="o">*</span><span class="n">last_old_chunk</span> <span class="o">-</span> <span class="n">nr_consecutive</span> <span class="o">||</span>
+		    <span class="n">ce</span><span class="p">.</span><span class="n">new_chunk</span> <span class="o">!=</span> <span class="o">*</span><span class="n">last_new_chunk</span> <span class="o">-</span> <span class="n">nr_consecutive</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">nr_consecutive</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">persistent_commit_merge</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+				   <span class="kt">int</span> <span class="n">nr_merged</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">nr_merged</span> <span class="o">&gt;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nr_merged</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">clear_exception</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">area_io</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">WRITE_FLUSH_FUA</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">-=</span> <span class="n">nr_merged</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * At this stage, only persistent_usage() uses ps-&gt;next_free, so</span>
+<span class="cm">	 * we make no attempt to keep ps-&gt;next_free strictly accurate</span>
+<span class="cm">	 * as exceptions may have been committed out-of-order originally.</span>
+<span class="cm">	 * Once a snapshot has become merging, we set it to the value it</span>
+<span class="cm">	 * would have held had all the exceptions been committed in order.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * ps-&gt;current_area does not get reduced by prepare_merge() until</span>
+<span class="cm">	 * after commit_merge() has removed the nr_merged previous exceptions.</span>
+<span class="cm">	 */</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">=</span> <span class="n">area_location</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_area</span><span class="p">)</span> <span class="o">+</span>
+			<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">persistent_drop_snapshot</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span> <span class="o">=</span> <span class="n">get_info</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">write_header</span><span class="p">(</span><span class="n">ps</span><span class="p">))</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;write header failed&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">persistent_ctr</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+			  <span class="kt">unsigned</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pstore</span> <span class="o">*</span><span class="n">ps</span><span class="p">;</span>
+
+	<span class="cm">/* allocate the pstore */</span>
+	<span class="n">ps</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ps</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">store</span> <span class="o">=</span> <span class="n">store</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">valid</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">SNAPSHOT_DISK_VERSION</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">zero_area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">header_area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">next_free</span> <span class="o">=</span> <span class="n">NUM_SNAPSHOT_HDR_CHUNKS</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* header and 1st area */</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">current_committed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">callback_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">pending_count</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">callbacks</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">ps</span><span class="o">-&gt;</span><span class="n">metadata_wq</span> <span class="o">=</span> <span class="n">alloc_workqueue</span><span class="p">(</span><span class="s">&quot;ksnaphd&quot;</span><span class="p">,</span> <span class="n">WQ_MEM_RECLAIM</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">metadata_wq</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">ps</span><span class="p">);</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;couldn&#39;t start header metadata update thread&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">store</span><span class="o">-&gt;</span><span class="n">context</span> <span class="o">=</span> <span class="n">ps</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">persistent_status</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_exception_store</span> <span class="o">*</span><span class="n">store</span><span class="p">,</span>
+				  <span class="n">status_type_t</span> <span class="n">status</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">result</span><span class="p">,</span>
+				  <span class="kt">unsigned</span> <span class="n">maxlen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">sz</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">STATUSTYPE_INFO</span>:
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">STATUSTYPE_TABLE</span>:
+		<span class="n">DMEMIT</span><span class="p">(</span><span class="s">&quot; P %llu&quot;</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">store</span><span class="o">-&gt;</span><span class="n">chunk_size</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">sz</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_exception_store_type</span> <span class="n">_persistent_type</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;persistent&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">module</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ctr</span> <span class="o">=</span> <span class="n">persistent_ctr</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dtr</span> <span class="o">=</span> <span class="n">persistent_dtr</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read_metadata</span> <span class="o">=</span> <span class="n">persistent_read_metadata</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">prepare_exception</span> <span class="o">=</span> <span class="n">persistent_prepare_exception</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">commit_exception</span> <span class="o">=</span> <span class="n">persistent_commit_exception</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">prepare_merge</span> <span class="o">=</span> <span class="n">persistent_prepare_merge</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">commit_merge</span> <span class="o">=</span> <span class="n">persistent_commit_merge</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">drop_snapshot</span> <span class="o">=</span> <span class="n">persistent_drop_snapshot</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">usage</span> <span class="o">=</span> <span class="n">persistent_usage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">status</span> <span class="o">=</span> <span class="n">persistent_status</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_exception_store_type</span> <span class="n">_persistent_compat_type</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;P&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">module</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ctr</span> <span class="o">=</span> <span class="n">persistent_ctr</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dtr</span> <span class="o">=</span> <span class="n">persistent_dtr</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read_metadata</span> <span class="o">=</span> <span class="n">persistent_read_metadata</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">prepare_exception</span> <span class="o">=</span> <span class="n">persistent_prepare_exception</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">commit_exception</span> <span class="o">=</span> <span class="n">persistent_commit_exception</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">prepare_merge</span> <span class="o">=</span> <span class="n">persistent_prepare_merge</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">commit_merge</span> <span class="o">=</span> <span class="n">persistent_commit_merge</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">drop_snapshot</span> <span class="o">=</span> <span class="n">persistent_drop_snapshot</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">usage</span> <span class="o">=</span> <span class="n">persistent_usage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">status</span> <span class="o">=</span> <span class="n">persistent_status</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="nf">dm_persistent_snapshot_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_exception_store_type_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_persistent_type</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;Unable to register persistent exception store type&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_exception_store_type_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_persistent_compat_type</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;Unable to register old-style persistent exception &quot;</span>
+		      <span class="s">&quot;store type&quot;</span><span class="p">);</span>
+		<span class="n">dm_exception_store_type_unregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_persistent_type</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">dm_persistent_snapshot_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dm_exception_store_type_unregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_persistent_type</span><span class="p">);</span>
+	<span class="n">dm_exception_store_type_unregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_persistent_compat_type</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

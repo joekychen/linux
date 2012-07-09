@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › hwspinlock › hwspinlock_core.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>hwspinlock_core.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Hardware spinlock framework</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2010 Texas Instruments Incorporated - http://www.ti.com</span>
+<span class="cm"> *</span>
+<span class="cm"> * Contact: Ohad Ben-Cohen &lt;ohad@wizery.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify it</span>
+<span class="cm"> * under the terms of the GNU General Public License version 2 as published</span>
+<span class="cm"> * by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</span>
+<span class="cm"> * GNU General Public License for more details.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define pr_fmt(fmt)    &quot;%s: &quot; fmt, __func__</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/err.h&gt;</span>
+<span class="cp">#include &lt;linux/jiffies.h&gt;</span>
+<span class="cp">#include &lt;linux/radix-tree.h&gt;</span>
+<span class="cp">#include &lt;linux/hwspinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/pm_runtime.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+
+<span class="cp">#include &quot;hwspinlock_internal.h&quot;</span>
+
+<span class="cm">/* radix tree tags */</span>
+<span class="cp">#define HWSPINLOCK_UNUSED	(0) </span><span class="cm">/* tags an hwspinlock as unused */</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A radix tree is used to maintain the available hwspinlock instances.</span>
+<span class="cm"> * The tree associates hwspinlock pointers with their integer key id,</span>
+<span class="cm"> * and provides easy-to-use API which makes the hwspinlock core code simple</span>
+<span class="cm"> * and easy to read.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Radix trees are quick on lookups, and reasonably efficient in terms of</span>
+<span class="cm"> * storage, especially with high density usages such as this framework</span>
+<span class="cm"> * requires (a continuous range of integer keys, beginning with zero, is</span>
+<span class="cm"> * used as the ID&#39;s of the hwspinlock instances).</span>
+<span class="cm"> *</span>
+<span class="cm"> * The radix tree API supports tagging items in the tree, which this</span>
+<span class="cm"> * framework uses to mark unused hwspinlock instances (see the</span>
+<span class="cm"> * HWSPINLOCK_UNUSED tag above). As a result, the process of querying the</span>
+<span class="cm"> * tree, looking for an unused hwspinlock instance, is now reduced to a</span>
+<span class="cm"> * single radix tree API call.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">RADIX_TREE</span><span class="p">(</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Synchronization of access to the tree is achieved using this mutex,</span>
+<span class="cm"> * as the radix-tree API requires that users provide all synchronisation.</span>
+<span class="cm"> * A mutex is needed because we&#39;re using non-atomic radix tree allocations.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+
+<span class="cm">/**</span>
+<span class="cm"> * __hwspin_trylock() - attempt to lock a specific hwspinlock</span>
+<span class="cm"> * @hwlock: an hwspinlock which we want to trylock</span>
+<span class="cm"> * @mode: controls whether local interrupts are disabled or not</span>
+<span class="cm"> * @flags: a pointer where the caller&#39;s interrupt state will be saved at (if</span>
+<span class="cm"> *         requested)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function attempts to lock an hwspinlock, and will immediately</span>
+<span class="cm"> * fail if the hwspinlock is already taken.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Upon a successful return from this function, preemption (and possibly</span>
+<span class="cm"> * interrupts) is disabled, so the caller must not sleep, and is advised to</span>
+<span class="cm"> * release the hwspinlock as soon as possible. This is required in order to</span>
+<span class="cm"> * minimize remote cores polling on the hardware interconnect.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The user decides whether local interrupts are disabled or not, and if yes,</span>
+<span class="cm"> * whether he wants their previous state to be saved. It is up to the user</span>
+<span class="cm"> * to choose the appropriate @mode of operation, exactly the same way users</span>
+<span class="cm"> * should decide between spin_trylock, spin_trylock_irq and</span>
+<span class="cm"> * spin_trylock_irqsave.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 if we successfully locked the hwspinlock or -EBUSY if</span>
+<span class="cm"> * the hwspinlock was already taken.</span>
+<span class="cm"> * This function will never sleep.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">__hwspin_trylock</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">,</span> <span class="kt">int</span> <span class="n">mode</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">flags</span> <span class="o">&amp;&amp;</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQSTATE</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This spin_lock{_irq, _irqsave} serves three purposes:</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * 1. Disable preemption, in order to minimize the period of time</span>
+<span class="cm">	 *    in which the hwspinlock is taken. This is important in order</span>
+<span class="cm">	 *    to minimize the possible polling on the hardware interconnect</span>
+<span class="cm">	 *    by a remote user of this lock.</span>
+<span class="cm">	 * 2. Make the hwspinlock SMP-safe (so we can take it from</span>
+<span class="cm">	 *    additional contexts on the local host).</span>
+<span class="cm">	 * 3. Ensure that in_atomic/might_sleep checks catch potential</span>
+<span class="cm">	 *    problems with hwspinlock usage (e.g. scheduler checks like</span>
+<span class="cm">	 *    &#39;scheduling while atomic&#39; etc.)</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQSTATE</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">spin_trylock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="o">*</span><span class="n">flags</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQ</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">spin_trylock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">spin_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="cm">/* is lock already taken by another context on the local cpu ? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+
+	<span class="cm">/* try to take the hwspinlock device */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">trylock</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+
+	<span class="cm">/* if hwlock is already taken, undo spin_trylock_* and exit */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQSTATE</span><span class="p">)</span>
+			<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="o">*</span><span class="n">flags</span><span class="p">);</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQ</span><span class="p">)</span>
+			<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We can be sure the other core&#39;s memory operations</span>
+<span class="cm">	 * are observable to us only _after_ we successfully take</span>
+<span class="cm">	 * the hwspinlock, and we must make sure that subsequent memory</span>
+<span class="cm">	 * operations (both reads and writes) will not be reordered before</span>
+<span class="cm">	 * we actually took the hwspinlock.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Note: the implicit memory barrier of the spinlock above is too</span>
+<span class="cm">	 * early, so we need this additional explicit memory barrier.</span>
+<span class="cm">	 */</span>
+	<span class="n">mb</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">__hwspin_trylock</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __hwspin_lock_timeout() - lock an hwspinlock with timeout limit</span>
+<span class="cm"> * @hwlock: the hwspinlock to be locked</span>
+<span class="cm"> * @timeout: timeout value in msecs</span>
+<span class="cm"> * @mode: mode which controls whether local interrupts are disabled or not</span>
+<span class="cm"> * @flags: a pointer to where the caller&#39;s interrupt state will be saved at (if</span>
+<span class="cm"> *         requested)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function locks the given @hwlock. If the @hwlock</span>
+<span class="cm"> * is already taken, the function will busy loop waiting for it to</span>
+<span class="cm"> * be released, but give up after @timeout msecs have elapsed.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Upon a successful return from this function, preemption is disabled</span>
+<span class="cm"> * (and possibly local interrupts, too), so the caller must not sleep,</span>
+<span class="cm"> * and is advised to release the hwspinlock as soon as possible.</span>
+<span class="cm"> * This is required in order to minimize remote cores polling on the</span>
+<span class="cm"> * hardware interconnect.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The user decides whether local interrupts are disabled or not, and if yes,</span>
+<span class="cm"> * whether he wants their previous state to be saved. It is up to the user</span>
+<span class="cm"> * to choose the appropriate @mode of operation, exactly the same way users</span>
+<span class="cm"> * should decide between spin_lock, spin_lock_irq and spin_lock_irqsave.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 when the @hwlock was successfully taken, and an appropriate</span>
+<span class="cm"> * error code otherwise (most notably -ETIMEDOUT if the @hwlock is still</span>
+<span class="cm"> * busy after @timeout msecs). The function will never sleep.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">__hwspin_lock_timeout</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">to</span><span class="p">,</span>
+					<span class="kt">int</span> <span class="n">mode</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">expire</span><span class="p">;</span>
+
+	<span class="n">expire</span> <span class="o">=</span> <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="n">to</span><span class="p">)</span> <span class="o">+</span> <span class="n">jiffies</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="cm">/* Try to take the hwspinlock */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">__hwspin_trylock</span><span class="p">(</span><span class="n">hwlock</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * The lock is already taken, let&#39;s check if the user wants</span>
+<span class="cm">		 * us to try again</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_is_before_eq_jiffies</span><span class="p">(</span><span class="n">expire</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ETIMEDOUT</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Allow platform-specific relax handlers to prevent</span>
+<span class="cm">		 * hogging the interconnect (no sleeping, though)</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">relax</span><span class="p">)</span>
+			<span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">relax</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">__hwspin_lock_timeout</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __hwspin_unlock() - unlock a specific hwspinlock</span>
+<span class="cm"> * @hwlock: a previously-acquired hwspinlock which we want to unlock</span>
+<span class="cm"> * @mode: controls whether local interrupts needs to be restored or not</span>
+<span class="cm"> * @flags: previous caller&#39;s interrupt state to restore (if requested)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function will unlock a specific hwspinlock, enable preemption and</span>
+<span class="cm"> * (possibly) enable interrupts or restore their previous state.</span>
+<span class="cm"> * @hwlock must be already locked before calling this function: it is a bug</span>
+<span class="cm"> * to call unlock on a @hwlock that is already unlocked.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The user decides whether local interrupts should be enabled or not, and</span>
+<span class="cm"> * if yes, whether he wants their previous state to be restored. It is up</span>
+<span class="cm"> * to the user to choose the appropriate @mode of operation, exactly the</span>
+<span class="cm"> * same way users decide between spin_unlock, spin_unlock_irq and</span>
+<span class="cm"> * spin_unlock_irqrestore.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The function will never sleep.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">__hwspin_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">,</span> <span class="kt">int</span> <span class="n">mode</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">flags</span> <span class="o">&amp;&amp;</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQSTATE</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We must make sure that memory operations (both reads and writes),</span>
+<span class="cm">	 * done before unlocking the hwspinlock, will not be reordered</span>
+<span class="cm">	 * after the lock is released.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * That&#39;s the purpose of this explicit memory barrier.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Note: the memory barrier induced by the spin_unlock below is too</span>
+<span class="cm">	 * late; the other core is going to access memory soon after it will</span>
+<span class="cm">	 * take the hwspinlock, and by then we want to be sure our memory</span>
+<span class="cm">	 * operations are already observable.</span>
+<span class="cm">	 */</span>
+	<span class="n">mb</span><span class="p">();</span>
+
+	<span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">unlock</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+
+	<span class="cm">/* Undo the spin_trylock{_irq, _irqsave} called while locking */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQSTATE</span><span class="p">)</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="o">*</span><span class="n">flags</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">==</span> <span class="n">HWLOCK_IRQ</span><span class="p">)</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">__hwspin_unlock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwspin_lock_register_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">,</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">hwlock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">)</span>
+			<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;hwspinlock id %d already exists!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* mark this hwspinlock as available */</span>
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">radix_tree_tag_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+
+	<span class="cm">/* self-sanity check which should never fail */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tmp</span> <span class="o">!=</span> <span class="n">hwlock</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="nf">hwspin_lock_unregister_single</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+	<span class="cm">/* make sure the hwspinlock is not in use (tag is set) */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_tag_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;hwspinlock %d still in use (or not present)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">hwlock</span> <span class="o">=</span> <span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;failed to delete hwspinlock %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">hwlock</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_register() - register a new hw spinlock device</span>
+<span class="cm"> * @bank: the hwspinlock device, which usually provides numerous hw locks</span>
+<span class="cm"> * @dev: the backing device</span>
+<span class="cm"> * @ops: hwspinlock handlers for this device</span>
+<span class="cm"> * @base_id: id of the first hardware spinlock in this bank</span>
+<span class="cm"> * @num_locks: number of hwspinlocks provided by this device</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function should be called from the underlying platform-specific</span>
+<span class="cm"> * implementation, to register a new hwspinlock device instance.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should be called from a process context (might sleep)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, or an appropriate error code on failure</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">hwspin_lock_register</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock_device</span> <span class="o">*</span><span class="n">bank</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+		<span class="k">const</span> <span class="k">struct</span> <span class="n">hwspinlock_ops</span> <span class="o">*</span><span class="n">ops</span><span class="p">,</span> <span class="kt">int</span> <span class="n">base_id</span><span class="p">,</span> <span class="kt">int</span> <span class="n">num_locks</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bank</span> <span class="o">||</span> <span class="o">!</span><span class="n">ops</span> <span class="o">||</span> <span class="o">!</span><span class="n">dev</span> <span class="o">||</span> <span class="o">!</span><span class="n">num_locks</span> <span class="o">||</span> <span class="o">!</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">trylock</span> <span class="o">||</span>
+							<span class="o">!</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">unlock</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;invalid parameters</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">bank</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="n">bank</span><span class="o">-&gt;</span><span class="n">ops</span> <span class="o">=</span> <span class="n">ops</span><span class="p">;</span>
+	<span class="n">bank</span><span class="o">-&gt;</span><span class="n">base_id</span> <span class="o">=</span> <span class="n">base_id</span><span class="p">;</span>
+	<span class="n">bank</span><span class="o">-&gt;</span><span class="n">num_locks</span> <span class="o">=</span> <span class="n">num_locks</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num_locks</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span> <span class="o">=</span> <span class="n">bank</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">hwspin_lock_register_single</span><span class="p">(</span><span class="n">hwlock</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">reg_failed</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">reg_failed:</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">--</span><span class="n">i</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">hwspin_lock_unregister_single</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_register</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_unregister() - unregister an hw spinlock device</span>
+<span class="cm"> * @bank: the hwspinlock device, which usually provides numerous hw locks</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function should be called from the underlying platform-specific</span>
+<span class="cm"> * implementation, to unregister an existing (and unused) hwspinlock.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should be called from a process context (might sleep)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, or an appropriate error code on failure</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">hwspin_lock_unregister</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock_device</span> <span class="o">*</span><span class="n">bank</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">bank</span><span class="o">-&gt;</span><span class="n">num_locks</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">hwspin_lock_unregister_single</span><span class="p">(</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">base_id</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tmp</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+
+		<span class="cm">/* self-sanity check that should never fail */</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tmp</span> <span class="o">!=</span> <span class="n">hwlock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_unregister</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __hwspin_lock_request() - tag an hwspinlock as used and power it up</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is an internal function that prepares an hwspinlock instance</span>
+<span class="cm"> * before it is given to the user. The function assumes that</span>
+<span class="cm"> * hwspinlock_tree_lock is taken.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 or positive to indicate success, and a negative value to</span>
+<span class="cm"> * indicate an error (with the appropriate error code)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__hwspin_lock_request</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="cm">/* prevent underlying implementation from being removed */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">try_module_get</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: can&#39;t get owner</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* notify PM core that power is now needed */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">pm_runtime_get_sync</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: can&#39;t power on device</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* mark hwspinlock as used, should not fail */</span>
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">radix_tree_tag_clear</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">hwlock_to_id</span><span class="p">(</span><span class="n">hwlock</span><span class="p">),</span>
+							<span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+
+	<span class="cm">/* self-sanity check that should never fail */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tmp</span> <span class="o">!=</span> <span class="n">hwlock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_get_id() - retrieve id number of a given hwspinlock</span>
+<span class="cm"> * @hwlock: a valid hwspinlock instance</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns the id number of a given @hwlock, or -EINVAL if @hwlock is invalid.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">hwspin_lock_get_id</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;invalid hwlock</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">hwlock_to_id</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_get_id</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_request() - request an hwspinlock</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function should be called by users of the hwspinlock device,</span>
+<span class="cm"> * in order to dynamically assign them an unused hwspinlock.</span>
+<span class="cm"> * Usually the user of this lock will then have to communicate the lock&#39;s id</span>
+<span class="cm"> * to the remote core before it can be used for synchronization (to get the</span>
+<span class="cm"> * id of a given hwlock, use hwspin_lock_get_id()).</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should be called from a process context (might sleep)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns the address of the assigned hwspinlock, or NULL on error</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="nf">hwspin_lock_request</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+	<span class="cm">/* look for an unused lock */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup_tag</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">hwlock</span><span class="p">,</span>
+						<span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="s">&quot;a free hwspinlock is not available</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* sanity check that should never fail */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">ret</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="cm">/* mark as used and power up */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">__hwspin_lock_request</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">hwlock</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_request</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_request_specific() - request for a specific hwspinlock</span>
+<span class="cm"> * @id: index of the specific hwspinlock that is requested</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function should be called by users of the hwspinlock module,</span>
+<span class="cm"> * in order to assign them a specific hwspinlock.</span>
+<span class="cm"> * Usually early board code will be calling this function in order to</span>
+<span class="cm"> * reserve specific hwspinlock ids for predefined purposes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should be called from a process context (might sleep)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns the address of the assigned hwspinlock, or NULL on error</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="nf">hwspin_lock_request_specific</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+	<span class="cm">/* make sure this hwspinlock exists */</span>
+	<span class="n">hwlock</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="s">&quot;hwspinlock %u does not exist</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* sanity check (this shouldn&#39;t happen) */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">hwlock_to_id</span><span class="p">(</span><span class="n">hwlock</span><span class="p">)</span> <span class="o">!=</span> <span class="n">id</span><span class="p">);</span>
+
+	<span class="cm">/* make sure this hwspinlock is unused */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_tag_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="s">&quot;hwspinlock %u is already in use</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* mark as used and power up */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">__hwspin_lock_request</span><span class="p">(</span><span class="n">hwlock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">hwlock</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">hwlock</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_request_specific</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * hwspin_lock_free() - free a specific hwspinlock</span>
+<span class="cm"> * @hwlock: the specific hwspinlock to free</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function mark @hwlock as free again.</span>
+<span class="cm"> * Should only be called with an @hwlock that was retrieved from</span>
+<span class="cm"> * an earlier call to omap_hwspin_lock_request{_specific}.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should be called from a process context (might sleep)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, or an appropriate error code on failure</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">hwspin_lock_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">hwlock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">hwlock</span><span class="o">-&gt;</span><span class="n">bank</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">hwspinlock</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwlock</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;invalid hwlock</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+
+	<span class="cm">/* make sure the hwspinlock is used */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_tag_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">hwlock_to_id</span><span class="p">(</span><span class="n">hwlock</span><span class="p">),</span>
+							<span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: hwlock is already free</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="n">dump_stack</span><span class="p">();</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* notify the underlying device that power is not needed */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">pm_runtime_put</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* mark this hwspinlock as available */</span>
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">radix_tree_tag_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree</span><span class="p">,</span> <span class="n">hwlock_to_id</span><span class="p">(</span><span class="n">hwlock</span><span class="p">),</span>
+							<span class="n">HWSPINLOCK_UNUSED</span><span class="p">);</span>
+
+	<span class="cm">/* sanity check (this shouldn&#39;t happen) */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">tmp</span> <span class="o">!=</span> <span class="n">hwlock</span><span class="p">);</span>
+
+	<span class="n">module_put</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hwspinlock_tree_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwspin_lock_free</span><span class="p">);</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL v2&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Hardware spinlock interface&quot;</span><span class="p">);</span>
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Ohad Ben-Cohen &lt;ohad@wizery.com&gt;&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

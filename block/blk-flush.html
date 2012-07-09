@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » block › blk-flush.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>blk-flush.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Functions to sequence FLUSH and FUA writes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2011		Max Planck Institute for Gravitational Physics</span>
+<span class="cm"> * Copyright (C) 2011		Tejun Heo &lt;tj@kernel.org&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPLv2.</span>
+<span class="cm"> *</span>
+<span class="cm"> * REQ_{FLUSH|FUA} requests are decomposed to sequences consisted of three</span>
+<span class="cm"> * optional steps - PREFLUSH, DATA and POSTFLUSH - according to the request</span>
+<span class="cm"> * properties and hardware capability.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If a request doesn&#39;t have data, only REQ_FLUSH makes sense, which</span>
+<span class="cm"> * indicates a simple flush request.  If there is data, REQ_FLUSH indicates</span>
+<span class="cm"> * that the device cache should be flushed before the data is executed, and</span>
+<span class="cm"> * REQ_FUA means that the data must be on non-volatile media on request</span>
+<span class="cm"> * completion.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the device doesn&#39;t have writeback cache, FLUSH and FUA don&#39;t make any</span>
+<span class="cm"> * difference.  The requests are either completed immediately if there&#39;s no</span>
+<span class="cm"> * data or executed as normal requests otherwise.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the device has writeback cache and supports FUA, REQ_FLUSH is</span>
+<span class="cm"> * translated to PREFLUSH but REQ_FUA is passed down directly with DATA.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the device has writeback cache and doesn&#39;t support FUA, REQ_FLUSH is</span>
+<span class="cm"> * translated to PREFLUSH and REQ_FUA to POSTFLUSH.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The actual execution of flush is double buffered.  Whenever a request</span>
+<span class="cm"> * needs to execute PRE or POSTFLUSH, it queues at</span>
+<span class="cm"> * q-&gt;flush_queue[q-&gt;flush_pending_idx].  Once certain criteria are met, a</span>
+<span class="cm"> * flush is issued and the pending_idx is toggled.  When the flush</span>
+<span class="cm"> * completes, all the requests which were pending are proceeded to the next</span>
+<span class="cm"> * step.  This allows arbitrary merging of different types of FLUSH/FUA</span>
+<span class="cm"> * requests.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Currently, the following conditions are used to determine when to issue</span>
+<span class="cm"> * flush.</span>
+<span class="cm"> *</span>
+<span class="cm"> * C1. At any given time, only one flush shall be in progress.  This makes</span>
+<span class="cm"> *     double buffering sufficient.</span>
+<span class="cm"> *</span>
+<span class="cm"> * C2. Flush is deferred if any request is executing DATA of its sequence.</span>
+<span class="cm"> *     This avoids issuing separate POSTFLUSHes for requests which shared</span>
+<span class="cm"> *     PREFLUSH.</span>
+<span class="cm"> *</span>
+<span class="cm"> * C3. The second condition is ignored if there is a request which has</span>
+<span class="cm"> *     waited longer than FLUSH_PENDING_TIMEOUT.  This is to avoid</span>
+<span class="cm"> *     starvation in the unlikely case where there are continuous stream of</span>
+<span class="cm"> *     FUA (without FLUSH) requests.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For devices which support FUA, it isn&#39;t clear whether C2 (and thus C3)</span>
+<span class="cm"> * is beneficial.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that a sequenced FLUSH/FUA request with DATA is completed twice.</span>
+<span class="cm"> * Once while executing DATA and again after the whole sequence is</span>
+<span class="cm"> * complete.  The first completion updates the contained bio but doesn&#39;t</span>
+<span class="cm"> * finish it so that the bio submitter is notified only after the whole</span>
+<span class="cm"> * sequence is complete.  This is implemented by testing REQ_FLUSH_SEQ in</span>
+<span class="cm"> * req_bio_endio().</span>
+<span class="cm"> *</span>
+<span class="cm"> * The above peculiarity requires that each FLUSH/FUA request has only one</span>
+<span class="cm"> * bio attached to it, which is guaranteed as they aren&#39;t allowed to be</span>
+<span class="cm"> * merged in the usual way.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/bio.h&gt;</span>
+<span class="cp">#include &lt;linux/blkdev.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+
+<span class="cp">#include &quot;blk.h&quot;</span>
+
+<span class="cm">/* FLUSH/FUA sequences */</span>
+<span class="k">enum</span> <span class="p">{</span>
+	<span class="n">REQ_FSEQ_PREFLUSH</span>	<span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">0</span><span class="p">),</span> <span class="cm">/* pre-flushing in progress */</span>
+	<span class="n">REQ_FSEQ_DATA</span>		<span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">1</span><span class="p">),</span> <span class="cm">/* data write in progress */</span>
+	<span class="n">REQ_FSEQ_POSTFLUSH</span>	<span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">2</span><span class="p">),</span> <span class="cm">/* post-flushing in progress */</span>
+	<span class="n">REQ_FSEQ_DONE</span>		<span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">3</span><span class="p">),</span>
+
+	<span class="n">REQ_FSEQ_ACTIONS</span>	<span class="o">=</span> <span class="n">REQ_FSEQ_PREFLUSH</span> <span class="o">|</span> <span class="n">REQ_FSEQ_DATA</span> <span class="o">|</span>
+				  <span class="n">REQ_FSEQ_POSTFLUSH</span><span class="p">,</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If flush has been pending longer than the following timeout,</span>
+<span class="cm">	 * it&#39;s issued even if flush_data requests are still in flight.</span>
+<span class="cm">	 */</span>
+	<span class="n">FLUSH_PENDING_TIMEOUT</span>	<span class="o">=</span> <span class="mi">5</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="n">blk_kick_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">blk_flush_policy</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">fflags</span><span class="p">,</span> <span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">policy</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">blk_rq_sectors</span><span class="p">(</span><span class="n">rq</span><span class="p">))</span>
+		<span class="n">policy</span> <span class="o">|=</span> <span class="n">REQ_FSEQ_DATA</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">fflags</span> <span class="o">&amp;</span> <span class="n">REQ_FLUSH</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">&amp;</span> <span class="n">REQ_FLUSH</span><span class="p">)</span>
+			<span class="n">policy</span> <span class="o">|=</span> <span class="n">REQ_FSEQ_PREFLUSH</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">fflags</span> <span class="o">&amp;</span> <span class="n">REQ_FUA</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">&amp;</span> <span class="n">REQ_FUA</span><span class="p">))</span>
+			<span class="n">policy</span> <span class="o">|=</span> <span class="n">REQ_FSEQ_POSTFLUSH</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">policy</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">blk_flush_cur_seq</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ffz</span><span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">seq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">blk_flush_restore_request</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * After flush data completion, @rq-&gt;bio is %NULL but we need to</span>
+<span class="cm">	 * complete the bio again.  @rq-&gt;biotail is guaranteed to equal the</span>
+<span class="cm">	 * original @rq-&gt;bio.  Restore it.</span>
+<span class="cm">	 */</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">bio</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">biotail</span><span class="p">;</span>
+
+	<span class="cm">/* make @rq a normal request */</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">REQ_FLUSH_SEQ</span><span class="p">;</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">end_io</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">saved_end_io</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blk_flush_complete_seq - complete flush sequence</span>
+<span class="cm"> * @rq: FLUSH/FUA request being sequenced</span>
+<span class="cm"> * @seq: sequences to complete (mask of %REQ_FSEQ_*, can be zero)</span>
+<span class="cm"> * @error: whether an error occurred</span>
+<span class="cm"> *</span>
+<span class="cm"> * @rq just completed @seq part of its flush sequence, record the</span>
+<span class="cm"> * completion and trigger the next step.</span>
+<span class="cm"> *</span>
+<span class="cm"> * CONTEXT:</span>
+<span class="cm"> * spin_lock_irq(q-&gt;queue_lock)</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * %true if requests were added to the dispatch queue, %false otherwise.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">blk_flush_complete_seq</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">seq</span><span class="p">,</span>
+				   <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pending</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_idx</span><span class="p">];</span>
+	<span class="n">bool</span> <span class="n">queued</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">seq</span> <span class="o">&amp;</span> <span class="n">seq</span><span class="p">);</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">seq</span> <span class="o">|=</span> <span class="n">seq</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="o">!</span><span class="n">error</span><span class="p">))</span>
+		<span class="n">seq</span> <span class="o">=</span> <span class="n">blk_flush_cur_seq</span><span class="p">(</span><span class="n">rq</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">seq</span> <span class="o">=</span> <span class="n">REQ_FSEQ_DONE</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">seq</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">REQ_FSEQ_PREFLUSH</span>:
+	<span class="k">case</span> <span class="n">REQ_FSEQ_POSTFLUSH</span>:
+		<span class="cm">/* queue for flush */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="n">pending</span><span class="p">))</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_since</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+		<span class="n">list_move_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">,</span> <span class="n">pending</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">REQ_FSEQ_DATA</span>:
+		<span class="n">list_move_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_data_in_flight</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">queuelist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_head</span><span class="p">);</span>
+		<span class="n">queued</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">REQ_FSEQ_DONE</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * @rq was previously adjusted by blk_flush_issue() for</span>
+<span class="cm">		 * flush sequencing and may already have gone through the</span>
+<span class="cm">		 * flush data request completion path.  Restore @rq for</span>
+<span class="cm">		 * normal completion and end it.</span>
+<span class="cm">		 */</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">queuelist</span><span class="p">));</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">blk_flush_restore_request</span><span class="p">(</span><span class="n">rq</span><span class="p">);</span>
+		<span class="n">__blk_end_request_all</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">blk_kick_flush</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">|</span> <span class="n">queued</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">flush_end_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">flush_rq</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">flush_rq</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_running_idx</span><span class="p">];</span>
+	<span class="n">bool</span> <span class="n">queued</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_idx</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_running_idx</span><span class="p">);</span>
+
+	<span class="cm">/* account completion of the flush request */</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_running_idx</span> <span class="o">^=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">elv_completed_request</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">flush_rq</span><span class="p">);</span>
+
+	<span class="cm">/* and push the waiting requests to the next stage */</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">running</span><span class="p">,</span> <span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">seq</span> <span class="o">=</span> <span class="n">blk_flush_cur_seq</span><span class="p">(</span><span class="n">rq</span><span class="p">);</span>
+
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">seq</span> <span class="o">!=</span> <span class="n">REQ_FSEQ_PREFLUSH</span> <span class="o">&amp;&amp;</span> <span class="n">seq</span> <span class="o">!=</span> <span class="n">REQ_FSEQ_POSTFLUSH</span><span class="p">);</span>
+		<span class="n">queued</span> <span class="o">|=</span> <span class="n">blk_flush_complete_seq</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">seq</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Kick the queue to avoid stall for two cases:</span>
+<span class="cm">	 * 1. Moving a request silently to empty queue_head may stall the</span>
+<span class="cm">	 * queue.</span>
+<span class="cm">	 * 2. When flush request is running in non-queueable queue, the</span>
+<span class="cm">	 * queue is hold. Restart the queue after flush request is finished</span>
+<span class="cm">	 * to avoid stall.</span>
+<span class="cm">	 * This function is called from request completion path and calling</span>
+<span class="cm">	 * directly into request_fn may confuse the driver.  Always use</span>
+<span class="cm">	 * kblockd.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">queued</span> <span class="o">||</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue_delayed</span><span class="p">)</span>
+		<span class="n">blk_run_queue_async</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue_delayed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blk_kick_flush - consider issuing flush request</span>
+<span class="cm"> * @q: request_queue being kicked</span>
+<span class="cm"> *</span>
+<span class="cm"> * Flush related states of @q have changed, consider issuing flush request.</span>
+<span class="cm"> * Please read the comment at the top of this file for more info.</span>
+<span class="cm"> *</span>
+<span class="cm"> * CONTEXT:</span>
+<span class="cm"> * spin_lock_irq(q-&gt;queue_lock)</span>
+<span class="cm"> *</span>
+<span class="cm"> * RETURNS:</span>
+<span class="cm"> * %true if flush was issued, %false otherwise.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">blk_kick_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pending</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_idx</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">first_rq</span> <span class="o">=</span>
+		<span class="n">list_first_entry</span><span class="p">(</span><span class="n">pending</span><span class="p">,</span> <span class="k">struct</span> <span class="n">request</span><span class="p">,</span> <span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="cm">/* C1 described at the top of this file */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_idx</span> <span class="o">!=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_running_idx</span> <span class="o">||</span> <span class="n">list_empty</span><span class="p">(</span><span class="n">pending</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/* C2 and C3 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_data_in_flight</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">time_before</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_since</span> <span class="o">+</span> <span class="n">FLUSH_PENDING_TIMEOUT</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Issue flush and toggle pending_idx.  This makes pending_idx</span>
+<span class="cm">	 * different from running_idx, which means flush is in flight.</span>
+<span class="cm">	 */</span>
+	<span class="n">blk_rq_init</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">.</span><span class="n">cmd_type</span> <span class="o">=</span> <span class="n">REQ_TYPE_FS</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">.</span><span class="n">cmd_flags</span> <span class="o">=</span> <span class="n">WRITE_FLUSH</span> <span class="o">|</span> <span class="n">REQ_FLUSH_SEQ</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">.</span><span class="n">rq_disk</span> <span class="o">=</span> <span class="n">first_rq</span><span class="o">-&gt;</span><span class="n">rq_disk</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">.</span><span class="n">end_io</span> <span class="o">=</span> <span class="n">flush_end_io</span><span class="p">;</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_pending_idx</span> <span class="o">^=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_rq</span><span class="p">.</span><span class="n">queuelist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_head</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">flush_data_end_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * After populating an empty queue, kick it to avoid stall.  Read</span>
+<span class="cm">	 * the comment in flush_end_io().</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">blk_flush_complete_seq</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">REQ_FSEQ_DATA</span><span class="p">,</span> <span class="n">error</span><span class="p">))</span>
+		<span class="n">blk_run_queue_async</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blk_insert_flush - insert a new FLUSH/FUA request</span>
+<span class="cm"> * @rq: request to insert</span>
+<span class="cm"> *</span>
+<span class="cm"> * To be called from __elv_add_request() for %ELEVATOR_INSERT_FLUSH insertions.</span>
+<span class="cm"> * @rq is being submitted.  Analyze what needs to be done and put it on the</span>
+<span class="cm"> * right queue.</span>
+<span class="cm"> *</span>
+<span class="cm"> * CONTEXT:</span>
+<span class="cm"> * spin_lock_irq(q-&gt;queue_lock)</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">blk_insert_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">fflags</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_flags</span><span class="p">;</span>	<span class="cm">/* may change, cache */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">policy</span> <span class="o">=</span> <span class="n">blk_flush_policy</span><span class="p">(</span><span class="n">fflags</span><span class="p">,</span> <span class="n">rq</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * @policy now records what operations need to be done.  Adjust</span>
+<span class="cm">	 * REQ_FLUSH and FUA for the driver.</span>
+<span class="cm">	 */</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">REQ_FLUSH</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">fflags</span> <span class="o">&amp;</span> <span class="n">REQ_FUA</span><span class="p">))</span>
+		<span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">REQ_FUA</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * An empty flush handed down from a stacking driver may</span>
+<span class="cm">	 * translate into nothing if the underlying device does not</span>
+<span class="cm">	 * advertise a write-back cache.  In this case, simply</span>
+<span class="cm">	 * complete the request.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">policy</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__blk_end_bidi_request</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">bio</span> <span class="o">!=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">biotail</span><span class="p">);</span> <span class="cm">/*assumes zero or single bio rq */</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If there&#39;s data but flush is not necessary, the request can be</span>
+<span class="cm">	 * processed directly without going through flush machinery.  Queue</span>
+<span class="cm">	 * for normal execution.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">policy</span> <span class="o">&amp;</span> <span class="n">REQ_FSEQ_DATA</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="p">(</span><span class="n">policy</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">REQ_FSEQ_PREFLUSH</span> <span class="o">|</span> <span class="n">REQ_FSEQ_POSTFLUSH</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">queuelist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_head</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * @rq should go through flush machinery.  Mark it part of flush</span>
+<span class="cm">	 * sequence and submit for further processing.</span>
+<span class="cm">	 */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">));</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">cmd_flags</span> <span class="o">|=</span> <span class="n">REQ_FLUSH_SEQ</span><span class="p">;</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">saved_end_io</span> <span class="o">=</span> <span class="n">rq</span><span class="o">-&gt;</span><span class="n">end_io</span><span class="p">;</span> <span class="cm">/* Usually NULL */</span>
+	<span class="n">rq</span><span class="o">-&gt;</span><span class="n">end_io</span> <span class="o">=</span> <span class="n">flush_data_end_io</span><span class="p">;</span>
+
+	<span class="n">blk_flush_complete_seq</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">REQ_FSEQ_ACTIONS</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">policy</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blk_abort_flushes - @q is being aborted, abort flush requests</span>
+<span class="cm"> * @q: request_queue being aborted</span>
+<span class="cm"> *</span>
+<span class="cm"> * To be called from elv_abort_queue().  @q is being aborted.  Prepare all</span>
+<span class="cm"> * FLUSH/FUA requests for abortion.</span>
+<span class="cm"> *</span>
+<span class="cm"> * CONTEXT:</span>
+<span class="cm"> * spin_lock_irq(q-&gt;queue_lock)</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">blk_abort_flushes</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request</span> <span class="o">*</span><span class="n">rq</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Requests in flight for data are already owned by the dispatch</span>
+<span class="cm">	 * queue or the device driver.  Just restore for normal completion.</span>
+<span class="cm">	 */</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_data_in_flight</span><span class="p">,</span> <span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">blk_flush_restore_request</span><span class="p">(</span><span class="n">rq</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We need to give away requests on flush queues.  Restore for</span>
+<span class="cm">	 * normal completion and put them on the dispatch queue.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flush_queue</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+					 <span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">blk_flush_restore_request</span><span class="p">(</span><span class="n">rq</span><span class="p">);</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rq</span><span class="o">-&gt;</span><span class="n">queuelist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_head</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">bio_end_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">int</span> <span class="n">err</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">BIO_UPTODATE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span><span class="p">)</span>
+		<span class="n">complete</span><span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span><span class="p">);</span>
+	<span class="n">bio_put</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blkdev_issue_flush - queue a flush</span>
+<span class="cm"> * @bdev:	blockdev to issue flush for</span>
+<span class="cm"> * @gfp_mask:	memory allocation flags (for bio_alloc)</span>
+<span class="cm"> * @error_sector:	error sector</span>
+<span class="cm"> *</span>
+<span class="cm"> * Description:</span>
+<span class="cm"> *    Issue a flush for the block device in question. Caller can supply</span>
+<span class="cm"> *    room for storing the error offset in case of a flush error, if they</span>
+<span class="cm"> *    wish to. If WAIT flag is not passed then caller may check only what</span>
+<span class="cm"> *    request was pushed in some internal queue for later handling.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">blkdev_issue_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">,</span>
+		<span class="n">sector_t</span> <span class="o">*</span><span class="n">error_sector</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DECLARE_COMPLETION_ONSTACK</span><span class="p">(</span><span class="n">wait</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bdev</span><span class="o">-&gt;</span><span class="n">bd_disk</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="n">q</span> <span class="o">=</span> <span class="n">bdev_get_queue</span><span class="p">(</span><span class="n">bdev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * some block devices may not have their queue correctly set up here</span>
+<span class="cm">	 * (e.g. loop device without a backing file) and so issuing a flush</span>
+<span class="cm">	 * here will panic. Ensure there is a request function before issuing</span>
+<span class="cm">	 * the flush.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">make_request_fn</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="n">bio</span> <span class="o">=</span> <span class="n">bio_alloc</span><span class="p">(</span><span class="n">gfp_mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_end_io</span> <span class="o">=</span> <span class="n">bio_end_flush</span><span class="p">;</span>
+	<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_bdev</span> <span class="o">=</span> <span class="n">bdev</span><span class="p">;</span>
+	<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">;</span>
+
+	<span class="n">bio_get</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="n">submit_bio</span><span class="p">(</span><span class="n">WRITE_FLUSH</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="n">wait_for_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The driver must store the error location in -&gt;bi_sector, if</span>
+<span class="cm">	 * it supports it. For non-stacked drivers, this should be</span>
+<span class="cm">	 * copied from blk_rq_pos(rq).</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">error_sector</span><span class="p">)</span>
+               <span class="o">*</span><span class="n">error_sector</span> <span class="o">=</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_sector</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bio_flagged</span><span class="p">(</span><span class="n">bio</span><span class="p">,</span> <span class="n">BIO_UPTODATE</span><span class="p">))</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+
+	<span class="n">bio_put</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">blkdev_issue_flush</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

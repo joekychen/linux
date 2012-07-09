@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › usb › wusbcore › wa-nep.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>wa-nep.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * WUSB Wire Adapter: Control/Data Streaming Interface (WUSB[8])</span>
+<span class="cm"> * Notification EndPoint support</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2006 Intel Corporation</span>
+<span class="cm"> * Inaky Perez-Gonzalez &lt;inaky.perez-gonzalez@intel.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public License version</span>
+<span class="cm"> * 2 as published by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</span>
+<span class="cm"> * GNU General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License</span>
+<span class="cm"> * along with this program; if not, write to the Free Software</span>
+<span class="cm"> * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA</span>
+<span class="cm"> * 02110-1301, USA.</span>
+<span class="cm"> *</span>
+<span class="cm"> *</span>
+<span class="cm"> * This part takes care of getting the notification from the hw</span>
+<span class="cm"> * only and dispatching through wusbwad into</span>
+<span class="cm"> * wa_notif_dispatch. Handling is done there.</span>
+<span class="cm"> *</span>
+<span class="cm"> * WA notifications are limited in size; most of them are three or</span>
+<span class="cm"> * four bytes long, and the longest is the HWA Device Notification,</span>
+<span class="cm"> * which would not exceed 38 bytes (DNs are limited in payload to 32</span>
+<span class="cm"> * bytes plus 3 bytes header (WUSB1.0[7.6p2]), plus 3 bytes HWA</span>
+<span class="cm"> * header (WUSB1.0[8.5.4.2]).</span>
+<span class="cm"> *</span>
+<span class="cm"> * It is not clear if more than one Device Notification can be packed</span>
+<span class="cm"> * in a HWA Notification, I assume no because of the wording in</span>
+<span class="cm"> * WUSB1.0[8.5.4.2]. In any case, the bigger any notification could</span>
+<span class="cm"> * get is 256 bytes (as the bLength field is a byte).</span>
+<span class="cm"> *</span>
+<span class="cm"> * So what we do is we have this buffer and read into it; when a</span>
+<span class="cm"> * notification arrives we schedule work to a specific, single thread</span>
+<span class="cm"> * workqueue (so notifications are serialized) and copy the</span>
+<span class="cm"> * notification data. After scheduling the work, we rearm the read from</span>
+<span class="cm"> * the notification endpoint.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Entry points here are:</span>
+<span class="cm"> *</span>
+<span class="cm"> * wa_nep_[create|destroy]()   To initialize/release this subsystem</span>
+<span class="cm"> *</span>
+<span class="cm"> * wa_nep_cb()                 Callback for the notification</span>
+<span class="cm"> *                                endpoint; when data is ready, this</span>
+<span class="cm"> *                                does the dispatching.</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+<span class="cp">#include &lt;linux/ctype.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="cp">#include &quot;wa-hc.h&quot;</span>
+<span class="cp">#include &quot;wusbhc.h&quot;</span>
+
+<span class="cm">/* Structure for queueing notifications to the workqueue */</span>
+<span class="k">struct</span> <span class="n">wa_notif_work</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">work_struct</span> <span class="n">work</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">data</span><span class="p">[];</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Process incoming notifications from the WA&#39;s Notification EndPoint</span>
+<span class="cm"> * [the wuswad daemon, basically]</span>
+<span class="cm"> *</span>
+<span class="cm"> * @_nw:	Pointer to a descriptor which has the pointer to the</span>
+<span class="cm"> * 		@wa, the size of the buffer and the work queue</span>
+<span class="cm"> * 		structure (so we can free all when done).</span>
+<span class="cm"> * @returns     0 if ok, &lt; 0 errno code on error.</span>
+<span class="cm"> *</span>
+<span class="cm"> * All notifications follow the same format; they need to start with a</span>
+<span class="cm"> * &#39;struct wa_notif_hdr&#39; header, so it is easy to parse through</span>
+<span class="cm"> * them. We just break the buffer in individual notifications (the</span>
+<span class="cm"> * standard doesn&#39;t say if it can be done or is forbidden, so we are</span>
+<span class="cm"> * cautious) and dispatch each.</span>
+<span class="cm"> *</span>
+<span class="cm"> * So the handling layers are is:</span>
+<span class="cm"> *</span>
+<span class="cm"> *   WA specific notification (from NEP)</span>
+<span class="cm"> *      Device Notification Received -&gt; wa_handle_notif_dn()</span>
+<span class="cm"> *        WUSB Device notification generic handling</span>
+<span class="cm"> *      BPST Adjustment -&gt; wa_handle_notif_bpst_adj()</span>
+<span class="cm"> *      ... -&gt; ...</span>
+<span class="cm"> *</span>
+<span class="cm"> * @wa has to be referenced</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">wa_notif_dispatch</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">ws</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">itr</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">missing</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">wa_notif_work</span> <span class="o">*</span><span class="n">nw</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">ws</span><span class="p">,</span> <span class="k">struct</span> <span class="n">wa_notif_work</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span> <span class="o">=</span> <span class="n">nw</span><span class="o">-&gt;</span><span class="n">wa</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">wa_notif_hdr</span> <span class="o">*</span><span class="n">notif_hdr</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">usb_iface</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+
+<span class="cp">#if 0</span><span class="c"></span>
+<span class="c">	/* FIXME: need to check for this??? */</span>
+<span class="c">	if (usb_hcd-&gt;state == HC_STATE_QUIESCING)	/* Going down? */</span>
+<span class="c">		goto out;				/* screw it */</span>
+<span class="cp">#endif</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">notifs_queued</span><span class="p">);</span>		<span class="cm">/* Throttling ctl */</span>
+	<span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">usb_iface</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="n">size</span> <span class="o">=</span> <span class="n">nw</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+	<span class="n">itr</span> <span class="o">=</span> <span class="n">nw</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">notif_hdr</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">missing</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">notif_hdr</span><span class="p">)</span> <span class="o">-</span> <span class="n">size</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">exhausted_buffer</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">notif_hdr</span> <span class="o">=</span> <span class="n">itr</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bLength</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">exhausted_buffer</span><span class="p">;</span>
+		<span class="n">itr</span> <span class="o">+=</span> <span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bLength</span><span class="p">;</span>
+		<span class="n">size</span> <span class="o">-=</span> <span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bLength</span><span class="p">;</span>
+		<span class="cm">/* Dispatch the notification [don&#39;t use itr or size!] */</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bNotifyType</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">HWA_NOTIF_DN</span>: <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">hwa_notif_dn</span> <span class="o">*</span><span class="n">hwa_dn</span><span class="p">;</span>
+			<span class="n">hwa_dn</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">notif_hdr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">hwa_notif_dn</span><span class="p">,</span>
+					      <span class="n">hdr</span><span class="p">);</span>
+			<span class="n">wusbhc_handle_dn</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">wusb</span><span class="p">,</span> <span class="n">hwa_dn</span><span class="o">-&gt;</span><span class="n">bSourceDeviceAddr</span><span class="p">,</span>
+					 <span class="n">hwa_dn</span><span class="o">-&gt;</span><span class="n">dndata</span><span class="p">,</span>
+					 <span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bLength</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">hwa_dn</span><span class="p">));</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">case</span> <span class="n">WA_NOTIF_TRANSFER</span>:
+			<span class="n">wa_handle_notif_xfer</span><span class="p">(</span><span class="n">wa</span><span class="p">,</span> <span class="n">notif_hdr</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">DWA_NOTIF_RWAKE</span>:
+		<span class="k">case</span> <span class="n">DWA_NOTIF_PORTSTATUS</span>:
+		<span class="k">case</span> <span class="n">HWA_NOTIF_BPST_ADJ</span>:
+			<span class="cm">/* FIXME: unimplemented WA NOTIFs */</span>
+			<span class="cm">/* fallthru */</span>
+		<span class="nl">default:</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;HWA: unknown notification 0x%x, &quot;</span>
+				<span class="s">&quot;%zu bytes; discarding</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bNotifyType</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">size_t</span><span class="p">)</span><span class="n">notif_hdr</span><span class="o">-&gt;</span><span class="n">bLength</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">wa_put</span><span class="p">(</span><span class="n">wa</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">nw</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* THIS SHOULD NOT HAPPEN</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Buffer exahusted with partial data remaining; just warn and</span>
+<span class="cm">	 * discard the data, as this should not happen.</span>
+<span class="cm">	 */</span>
+<span class="nl">exhausted_buffer:</span>
+	<span class="n">dev_warn</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;HWA: device sent short notification, &quot;</span>
+		 <span class="s">&quot;%d bytes missing; discarding %d bytes.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">missing</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">size</span><span class="p">);</span>
+	<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Deliver incoming WA notifications to the wusbwa workqueue</span>
+<span class="cm"> *</span>
+<span class="cm"> * @wa:	Pointer the Wire Adapter Controller Data Streaming</span>
+<span class="cm"> *              instance (part of an &#39;struct usb_hcd&#39;).</span>
+<span class="cm"> * @size:       Size of the received buffer</span>
+<span class="cm"> * @returns     0 if ok, &lt; 0 errno code on error.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The input buffer is @wa-&gt;nep_buffer, with @size bytes</span>
+<span class="cm"> * (guaranteed to fit in the allocated space,</span>
+<span class="cm"> * @wa-&gt;nep_buffer_size).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">wa_nep_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">usb_iface</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">wa_notif_work</span> <span class="o">*</span><span class="n">nw</span><span class="p">;</span>
+
+	<span class="cm">/* dev_fnstart(dev, &quot;(wa %p, size %zu)\n&quot;, wa, size); */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">notifs_queued</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">200</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">printk_ratelimit</span><span class="p">())</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Too many notifications queued, &quot;</span>
+				<span class="s">&quot;throttling back</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">nw</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">nw</span><span class="p">)</span> <span class="o">+</span> <span class="n">size</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nw</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">printk_ratelimit</span><span class="p">())</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;No memory to queue notification</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nw</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">,</span> <span class="n">wa_notif_dispatch</span><span class="p">);</span>
+	<span class="n">nw</span><span class="o">-&gt;</span><span class="n">wa</span> <span class="o">=</span> <span class="n">wa_get</span><span class="p">(</span><span class="n">wa</span><span class="p">);</span>
+	<span class="n">nw</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">nw</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">notifs_queued</span><span class="p">);</span>		<span class="cm">/* Throttling ctl */</span>
+	<span class="n">queue_work</span><span class="p">(</span><span class="n">wusbd</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nw</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="cm">/* dev_fnend(dev, &quot;(wa %p, size %zu) = result\n&quot;, wa, size, result); */</span>
+	<span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Callback for the notification event endpoint</span>
+<span class="cm"> *</span>
+<span class="cm"> * Check&#39;s that everything is fine and then passes the data to be</span>
+<span class="cm"> * queued to the workqueue.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">wa_nep_cb</span><span class="p">(</span><span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">usb_iface</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">result</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="mi">0</span>:
+		<span class="n">result</span> <span class="o">=</span> <span class="n">wa_nep_queue</span><span class="p">(</span><span class="n">wa</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">actual_length</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;NEP: unable to process notification(s): &quot;</span>
+				<span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="o">-</span><span class="n">ECONNRESET</span>:	<span class="cm">/* Not an error, but a controlled situation; */</span>
+	<span class="k">case</span> <span class="o">-</span><span class="n">ENOENT</span>:		<span class="cm">/* (we killed the URB)...so, no broadcast */</span>
+	<span class="k">case</span> <span class="o">-</span><span class="n">ESHUTDOWN</span>:
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;NEP: going down %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="nl">default:</span>	<span class="cm">/* On general errors, we retry unless it gets ugly */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">edc_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_edc</span><span class="p">,</span> <span class="n">EDC_MAX_ERRORS</span><span class="p">,</span>
+			    <span class="n">EDC_ERROR_TIMEFRAME</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;NEP: URB max acceptable errors &quot;</span>
+				<span class="s">&quot;exceeded, resetting device</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">wa_reset_all</span><span class="p">(</span><span class="n">wa</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;NEP: URB error %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">result</span> <span class="o">=</span> <span class="n">wa_nep_arm</span><span class="p">(</span><span class="n">wa</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;NEP: cannot submit URB: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+		<span class="n">wa_reset_all</span><span class="p">(</span><span class="n">wa</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="k">return</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Initialize @wa&#39;s notification and event&#39;s endpoint stuff</span>
+<span class="cm"> *</span>
+<span class="cm"> * This includes the allocating the read buffer, the context ID</span>
+<span class="cm"> * allocation bitmap, the URB and submitting the URB.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">wa_nep_create</span><span class="p">(</span><span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_interface</span> <span class="o">*</span><span class="n">iface</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_endpoint_descriptor</span> <span class="o">*</span><span class="n">epd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_device</span> <span class="o">*</span><span class="n">usb_dev</span> <span class="o">=</span> <span class="n">interface_to_usbdev</span><span class="p">(</span><span class="n">iface</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">iface</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+
+	<span class="n">edc_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_edc</span><span class="p">);</span>
+	<span class="n">epd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">iface</span><span class="o">-&gt;</span><span class="n">cur_altsetting</span><span class="o">-&gt;</span><span class="n">endpoint</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">desc</span><span class="p">;</span>
+	<span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer_size</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">;</span>
+	<span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer_size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Unable to allocate notification&#39;s read buffer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error_nep_buffer</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_urb</span> <span class="o">=</span> <span class="n">usb_alloc_urb</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_urb</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Unable to allocate notification URB</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error_urb_alloc</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">usb_fill_int_urb</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_urb</span><span class="p">,</span> <span class="n">usb_dev</span><span class="p">,</span>
+			 <span class="n">usb_rcvintpipe</span><span class="p">(</span><span class="n">usb_dev</span><span class="p">,</span> <span class="n">epd</span><span class="o">-&gt;</span><span class="n">bEndpointAddress</span><span class="p">),</span>
+			 <span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span><span class="p">,</span> <span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer_size</span><span class="p">,</span>
+			 <span class="n">wa_nep_cb</span><span class="p">,</span> <span class="n">wa</span><span class="p">,</span> <span class="n">epd</span><span class="o">-&gt;</span><span class="n">bInterval</span><span class="p">);</span>
+	<span class="n">result</span> <span class="o">=</span> <span class="n">wa_nep_arm</span><span class="p">(</span><span class="n">wa</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Cannot submit notification URB: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error_nep_arm</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">error_nep_arm:</span>
+	<span class="n">usb_free_urb</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_urb</span><span class="p">);</span>
+<span class="nl">error_urb_alloc:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span><span class="p">);</span>
+<span class="nl">error_nep_buffer:</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">wa_nep_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">wahc</span> <span class="o">*</span><span class="n">wa</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">wa_nep_disarm</span><span class="p">(</span><span class="n">wa</span><span class="p">);</span>
+	<span class="n">usb_free_urb</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_urb</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">wa</span><span class="o">-&gt;</span><span class="n">nep_buffer</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

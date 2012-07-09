@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › char › apm-emulation.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>apm-emulation.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * bios-less APM driver for ARM Linux</span>
+<span class="cm"> *  Jamey Hicks &lt;jamey@crl.dec.com&gt;</span>
+<span class="cm"> *  adapted from the APM BIOS driver for Linux by Stephen Rothwell (sfr@linuxcare.com)</span>
+<span class="cm"> *</span>
+<span class="cm"> * APM 1.2 Reference:</span>
+<span class="cm"> *   Intel Corporation, Microsoft Corporation. Advanced Power Management</span>
+<span class="cm"> *   (APM) BIOS Interface Specification, Revision 1.2, February 1996.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This document is available from Microsoft at:</span>
+<span class="cm"> *    http://www.microsoft.com/whdc/archive/amp_12.mspx</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/poll.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/proc_fs.h&gt;</span>
+<span class="cp">#include &lt;linux/seq_file.h&gt;</span>
+<span class="cp">#include &lt;linux/miscdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/apm_bios.h&gt;</span>
+<span class="cp">#include &lt;linux/capability.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/suspend.h&gt;</span>
+<span class="cp">#include &lt;linux/apm-emulation.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/completion.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * The apm_bios device is one of the misc char devices.</span>
+<span class="cm"> * This is its minor number.</span>
+<span class="cm"> */</span>
+<span class="cp">#define APM_MINOR_DEV	134</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * One option can be changed at boot time as follows:</span>
+<span class="cm"> *	apm=on/off			enable/disable APM</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Maximum number of events stored</span>
+<span class="cm"> */</span>
+<span class="cp">#define APM_MAX_EVENTS		16</span>
+
+<span class="k">struct</span> <span class="n">apm_queue</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>		<span class="n">event_head</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>		<span class="n">event_tail</span><span class="p">;</span>
+	<span class="n">apm_event_t</span>		<span class="n">events</span><span class="p">[</span><span class="n">APM_MAX_EVENTS</span><span class="p">];</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * thread states (for threads using a writable /dev/apm_bios fd):</span>
+<span class="cm"> *</span>
+<span class="cm"> * SUSPEND_NONE:	nothing happening</span>
+<span class="cm"> * SUSPEND_PENDING:	suspend event queued for thread and pending to be read</span>
+<span class="cm"> * SUSPEND_READ:	suspend event read, pending acknowledgement</span>
+<span class="cm"> * SUSPEND_ACKED:	acknowledgement received from thread (via ioctl),</span>
+<span class="cm"> *			waiting for resume</span>
+<span class="cm"> * SUSPEND_ACKTO:	acknowledgement timeout</span>
+<span class="cm"> * SUSPEND_DONE:	thread had acked suspend and is now notified of</span>
+<span class="cm"> *			resume</span>
+<span class="cm"> *</span>
+<span class="cm"> * SUSPEND_WAIT:	this thread invoked suspend and is waiting for resume</span>
+<span class="cm"> *</span>
+<span class="cm"> * A thread migrates in one of three paths:</span>
+<span class="cm"> *	NONE -1-&gt; PENDING -2-&gt; READ -3-&gt; ACKED -4-&gt; DONE -5-&gt; NONE</span>
+<span class="cm"> *				    -6-&gt; ACKTO -7-&gt; NONE</span>
+<span class="cm"> *	NONE -8-&gt; WAIT -9-&gt; NONE</span>
+<span class="cm"> *</span>
+<span class="cm"> * While in PENDING or READ, the thread is accounted for in the</span>
+<span class="cm"> * suspend_acks_pending counter.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The transitions are invoked as follows:</span>
+<span class="cm"> *	1: suspend event is signalled from the core PM code</span>
+<span class="cm"> *	2: the suspend event is read from the fd by the userspace thread</span>
+<span class="cm"> *	3: userspace thread issues the APM_IOC_SUSPEND ioctl (as ack)</span>
+<span class="cm"> *	4: core PM code signals that we have resumed</span>
+<span class="cm"> *	5: APM_IOC_SUSPEND ioctl returns</span>
+<span class="cm"> *</span>
+<span class="cm"> *	6: the notifier invoked from the core PM code timed out waiting</span>
+<span class="cm"> *	   for all relevant threds to enter ACKED state and puts those</span>
+<span class="cm"> *	   that haven&#39;t into ACKTO</span>
+<span class="cm"> *	7: those threads issue APM_IOC_SUSPEND ioctl too late,</span>
+<span class="cm"> *	   get an error</span>
+<span class="cm"> *</span>
+<span class="cm"> *	8: userspace thread issues the APM_IOC_SUSPEND ioctl (to suspend),</span>
+<span class="cm"> *	   ioctl code invokes pm_suspend()</span>
+<span class="cm"> *	9: pm_suspend() returns indicating resume</span>
+<span class="cm"> */</span>
+<span class="k">enum</span> <span class="n">apm_suspend_state</span> <span class="p">{</span>
+	<span class="n">SUSPEND_NONE</span><span class="p">,</span>
+	<span class="n">SUSPEND_PENDING</span><span class="p">,</span>
+	<span class="n">SUSPEND_READ</span><span class="p">,</span>
+	<span class="n">SUSPEND_ACKED</span><span class="p">,</span>
+	<span class="n">SUSPEND_ACKTO</span><span class="p">,</span>
+	<span class="n">SUSPEND_WAIT</span><span class="p">,</span>
+	<span class="n">SUSPEND_DONE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The per-file APM data</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">apm_user</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>		<span class="n">suser</span><span class="o">:</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>		<span class="n">writer</span><span class="o">:</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>		<span class="n">reader</span><span class="o">:</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="kt">int</span>			<span class="n">suspend_result</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">apm_suspend_state</span>	<span class="n">suspend_state</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">apm_queue</span>	<span class="n">queue</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Local variables</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">suspend_acks_pending</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">userspace_notification_inhibit</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">apm_disabled</span><span class="p">;</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">kapmd_tsk</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">apm_waitqueue</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">apm_suspend_waitqueue</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a list of everyone who has opened /dev/apm_bios</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DECLARE_RWSEM</span><span class="p">(</span><span class="n">user_list_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">apm_user_list</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * kapmd info.  kapmd provides us a process context to handle</span>
+<span class="cm"> * &quot;APM&quot; events within - specifically necessary if we&#39;re going</span>
+<span class="cm"> * to be suspending the system.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">kapmd_wait</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">kapmd_queue_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">apm_queue</span> <span class="n">kapmd_queue</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">state_lock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="kt">char</span> <span class="n">driver_version</span><span class="p">[]</span> <span class="o">=</span> <span class="s">&quot;1.13&quot;</span><span class="p">;</span>	<span class="cm">/* no spaces */</span>
+
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Compatibility cruft until the IPAQ people move over to the new</span>
+<span class="cm"> * interface.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__apm_get_power_status</span><span class="p">(</span><span class="k">struct</span> <span class="n">apm_power_info</span> <span class="o">*</span><span class="n">info</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This allows machines to provide their own &quot;apm get power status&quot; function.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">apm_get_power_status</span><span class="p">)(</span><span class="k">struct</span> <span class="n">apm_power_info</span> <span class="o">*</span><span class="p">)</span> <span class="o">=</span> <span class="n">__apm_get_power_status</span><span class="p">;</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">apm_get_power_status</span><span class="p">);</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * APM event queue management.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">queue_empty</span><span class="p">(</span><span class="k">struct</span> <span class="n">apm_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">event_head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">apm_event_t</span> <span class="nf">queue_get_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">apm_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">APM_MAX_EVENTS</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">queue_add_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">apm_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="n">apm_event_t</span> <span class="n">event</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">event_head</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_head</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">APM_MAX_EVENTS</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">static</span> <span class="kt">int</span> <span class="n">notified</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">notified</span><span class="o">++</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		    <span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;apm: an event queue overflowed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_tail</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">APM_MAX_EVENTS</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">event_head</span><span class="p">]</span> <span class="o">=</span> <span class="n">event</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">queue_event</span><span class="p">(</span><span class="n">apm_event_t</span> <span class="n">event</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">as</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_user_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">reader</span><span class="p">)</span>
+			<span class="n">queue_add_event</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="n">event</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+	<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_waitqueue</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">apm_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">fp</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span> <span class="o">=</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="n">apm_event_t</span> <span class="n">event</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="n">count</span><span class="p">,</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">apm_event_t</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_NONBLOCK</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+
+	<span class="n">wait_event_interruptible</span><span class="p">(</span><span class="n">apm_waitqueue</span><span class="p">,</span> <span class="o">!</span><span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">));</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">i</span> <span class="o">&gt;=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">event</span><span class="p">))</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">event</span> <span class="o">=</span> <span class="n">queue_get_event</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">event</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">event</span><span class="p">)))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_PENDING</span> <span class="o">&amp;&amp;</span>
+		    <span class="p">(</span><span class="n">event</span> <span class="o">==</span> <span class="n">APM_SYS_SUSPEND</span> <span class="o">||</span> <span class="n">event</span> <span class="o">==</span> <span class="n">APM_USER_SUSPEND</span><span class="p">))</span>
+			<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_READ</span><span class="p">;</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+		<span class="n">buf</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
+		<span class="n">i</span> <span class="o">-=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">count</span> <span class="o">-</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">apm_poll</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">fp</span><span class="p">,</span> <span class="n">poll_table</span> <span class="o">*</span> <span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span> <span class="o">=</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+
+	<span class="n">poll_wait</span><span class="p">(</span><span class="n">fp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_waitqueue</span><span class="p">,</span> <span class="n">wait</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">)</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="n">POLLIN</span> <span class="o">|</span> <span class="n">POLLRDNORM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * apm_ioctl - handle APM ioctl</span>
+<span class="cm"> *</span>
+<span class="cm"> * APM_IOC_SUSPEND</span>
+<span class="cm"> *   This IOCTL is overloaded, and performs two functions.  It is used to:</span>
+<span class="cm"> *     - initiate a suspend</span>
+<span class="cm"> *     - acknowledge a suspend read from /dev/apm_bios.</span>
+<span class="cm"> *   Only when everyone who has opened /dev/apm_bios with write permission</span>
+<span class="cm"> *   has acknowledge does the actual suspend happen.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">long</span>
+<span class="nf">apm_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="n">u_int</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">u_long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suser</span> <span class="o">||</span> <span class="o">!</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">writer</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EPERM</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">cmd</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">APM_IOC_SUSPEND</span>:
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+		<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_result</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">SUSPEND_READ</span>:
+			<span class="cm">/*</span>
+<span class="cm">			 * If we read a suspend command from /dev/apm_bios,</span>
+<span class="cm">			 * then the corresponding APM_IOC_SUSPEND ioctl is</span>
+<span class="cm">			 * interpreted as an acknowledge.</span>
+<span class="cm">			 */</span>
+			<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_ACKED</span><span class="p">;</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">suspend_acks_pending</span><span class="p">);</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * suspend_acks_pending changed, the notifier needs to</span>
+<span class="cm">			 * be woken up for this</span>
+<span class="cm">			 */</span>
+			<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_suspend_waitqueue</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * Wait for the suspend/resume to complete.  If there</span>
+<span class="cm">			 * are pending acknowledges, we wait here for them.</span>
+<span class="cm">			 * wait_event_freezable() is interruptible and pending</span>
+<span class="cm">			 * signal can cause busy looping.  We aren&#39;t doing</span>
+<span class="cm">			 * anything critical, chill a bit on each iteration.</span>
+<span class="cm">			 */</span>
+			<span class="k">while</span> <span class="p">(</span><span class="n">wait_event_freezable</span><span class="p">(</span><span class="n">apm_suspend_waitqueue</span><span class="p">,</span>
+					<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">!=</span> <span class="n">SUSPEND_ACKED</span><span class="p">))</span>
+				<span class="n">msleep</span><span class="p">(</span><span class="mi">10</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">SUSPEND_ACKTO</span>:
+			<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_result</span> <span class="o">=</span> <span class="o">-</span><span class="n">ETIMEDOUT</span><span class="p">;</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="nl">default:</span>
+			<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_WAIT</span><span class="p">;</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * Otherwise it is a request to suspend the system.</span>
+<span class="cm">			 * Just invoke pm_suspend(), we&#39;ll handle it from</span>
+<span class="cm">			 * there via the notifier.</span>
+<span class="cm">			 */</span>
+			<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_result</span> <span class="o">=</span> <span class="n">pm_suspend</span><span class="p">(</span><span class="n">PM_SUSPEND_MEM</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_result</span><span class="p">;</span>
+		<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_NONE</span><span class="p">;</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">apm_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span> <span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span> <span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+
+	<span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We are now unhooked from the chain.  As far as new</span>
+<span class="cm">	 * events are concerned, we no longer exist.</span>
+<span class="cm">	 */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_PENDING</span> <span class="o">||</span>
+	    <span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_READ</span><span class="p">)</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">suspend_acks_pending</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_suspend_waitqueue</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">as</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">apm_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span> <span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span> <span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span><span class="p">;</span>
+
+	<span class="n">as</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">as</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * XXX - this is a tiny bit broken, when we consider BSD</span>
+<span class="cm">		 * process accounting. If the device is opened by root, we</span>
+<span class="cm">		 * instantly flag that we used superuser privs. Who knows,</span>
+<span class="cm">		 * we might close the device immediately without doing a</span>
+<span class="cm">		 * privileged operation -- cevans</span>
+<span class="cm">		 */</span>
+		<span class="n">as</span><span class="o">-&gt;</span><span class="n">suser</span> <span class="o">=</span> <span class="n">capable</span><span class="p">(</span><span class="n">CAP_SYS_ADMIN</span><span class="p">);</span>
+		<span class="n">as</span><span class="o">-&gt;</span><span class="n">writer</span> <span class="o">=</span> <span class="p">(</span><span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_WRITE</span><span class="p">)</span> <span class="o">==</span> <span class="n">FMODE_WRITE</span><span class="p">;</span>
+		<span class="n">as</span><span class="o">-&gt;</span><span class="n">reader</span> <span class="o">=</span> <span class="p">(</span><span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_READ</span><span class="p">)</span> <span class="o">==</span> <span class="n">FMODE_READ</span><span class="p">;</span>
+
+		<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_user_list</span><span class="p">);</span>
+		<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+
+		<span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">as</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">as</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">apm_bios_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span>		<span class="o">=</span> <span class="n">apm_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">poll</span>		<span class="o">=</span> <span class="n">apm_poll</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span>	<span class="o">=</span> <span class="n">apm_ioctl</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span>		<span class="o">=</span> <span class="n">apm_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span>	<span class="o">=</span> <span class="n">apm_release</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span>		<span class="o">=</span> <span class="n">noop_llseek</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">miscdevice</span> <span class="n">apm_device</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">minor</span>		<span class="o">=</span> <span class="n">APM_MINOR_DEV</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">name</span>		<span class="o">=</span> <span class="s">&quot;apm_bios&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">fops</span>		<span class="o">=</span> <span class="o">&amp;</span><span class="n">apm_bios_fops</span>
+<span class="p">};</span>
+
+
+<span class="cp">#ifdef CONFIG_PROC_FS</span>
+<span class="cm">/*</span>
+<span class="cm"> * Arguments, with symbols from linux/apm_bios.h.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   0) Linux driver version (this will change if format changes)</span>
+<span class="cm"> *   1) APM BIOS Version.  Usually 1.0, 1.1 or 1.2.</span>
+<span class="cm"> *   2) APM flags from APM Installation Check (0x00):</span>
+<span class="cm"> *	bit 0: APM_16_BIT_SUPPORT</span>
+<span class="cm"> *	bit 1: APM_32_BIT_SUPPORT</span>
+<span class="cm"> *	bit 2: APM_IDLE_SLOWS_CLOCK</span>
+<span class="cm"> *	bit 3: APM_BIOS_DISABLED</span>
+<span class="cm"> *	bit 4: APM_BIOS_DISENGAGED</span>
+<span class="cm"> *   3) AC line status</span>
+<span class="cm"> *	0x00: Off-line</span>
+<span class="cm"> *	0x01: On-line</span>
+<span class="cm"> *	0x02: On backup power (BIOS &gt;= 1.1 only)</span>
+<span class="cm"> *	0xff: Unknown</span>
+<span class="cm"> *   4) Battery status</span>
+<span class="cm"> *	0x00: High</span>
+<span class="cm"> *	0x01: Low</span>
+<span class="cm"> *	0x02: Critical</span>
+<span class="cm"> *	0x03: Charging</span>
+<span class="cm"> *	0x04: Selected battery not present (BIOS &gt;= 1.2 only)</span>
+<span class="cm"> *	0xff: Unknown</span>
+<span class="cm"> *   5) Battery flag</span>
+<span class="cm"> *	bit 0: High</span>
+<span class="cm"> *	bit 1: Low</span>
+<span class="cm"> *	bit 2: Critical</span>
+<span class="cm"> *	bit 3: Charging</span>
+<span class="cm"> *	bit 7: No system battery</span>
+<span class="cm"> *	0xff: Unknown</span>
+<span class="cm"> *   6) Remaining battery life (percentage of charge):</span>
+<span class="cm"> *	0-100: valid</span>
+<span class="cm"> *	-1: Unknown</span>
+<span class="cm"> *   7) Remaining battery life (time units):</span>
+<span class="cm"> *	Number of remaining minutes or seconds</span>
+<span class="cm"> *	-1: Unknown</span>
+<span class="cm"> *   8) min = minutes; sec = seconds</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">proc_apm_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">v</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_power_info</span> <span class="n">info</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">units</span><span class="p">;</span>
+
+	<span class="n">info</span><span class="p">.</span><span class="n">ac_line_status</span> <span class="o">=</span> <span class="mh">0xff</span><span class="p">;</span>
+	<span class="n">info</span><span class="p">.</span><span class="n">battery_status</span> <span class="o">=</span> <span class="mh">0xff</span><span class="p">;</span>
+	<span class="n">info</span><span class="p">.</span><span class="n">battery_flag</span>   <span class="o">=</span> <span class="mh">0xff</span><span class="p">;</span>
+	<span class="n">info</span><span class="p">.</span><span class="n">battery_life</span>   <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">info</span><span class="p">.</span><span class="n">time</span>	    <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">info</span><span class="p">.</span><span class="n">units</span>	    <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">apm_get_power_status</span><span class="p">)</span>
+		<span class="n">apm_get_power_status</span><span class="p">(</span><span class="o">&amp;</span><span class="n">info</span><span class="p">);</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">info</span><span class="p">.</span><span class="n">units</span><span class="p">)</span> <span class="p">{</span>
+	<span class="nl">default:</span>	<span class="n">units</span> <span class="o">=</span> <span class="s">&quot;?&quot;</span><span class="p">;</span>	<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="mi">0</span>: 	<span class="n">units</span> <span class="o">=</span> <span class="s">&quot;min&quot;</span><span class="p">;</span>	<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="mi">1</span>: 	<span class="n">units</span> <span class="o">=</span> <span class="s">&quot;sec&quot;</span><span class="p">;</span>	<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">seq_printf</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="s">&quot;%s 1.2 0x%02x 0x%02x 0x%02x 0x%02x %d%% %d %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">driver_version</span><span class="p">,</span> <span class="n">APM_32_BIT_SUPPORT</span><span class="p">,</span>
+		     <span class="n">info</span><span class="p">.</span><span class="n">ac_line_status</span><span class="p">,</span> <span class="n">info</span><span class="p">.</span><span class="n">battery_status</span><span class="p">,</span>
+		     <span class="n">info</span><span class="p">.</span><span class="n">battery_flag</span><span class="p">,</span> <span class="n">info</span><span class="p">.</span><span class="n">battery_life</span><span class="p">,</span>
+		     <span class="n">info</span><span class="p">.</span><span class="n">time</span><span class="p">,</span> <span class="n">units</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">proc_apm_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">single_open</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">proc_apm_show</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">apm_proc_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span>		<span class="o">=</span> <span class="n">proc_apm_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span>		<span class="o">=</span> <span class="n">seq_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span>		<span class="o">=</span> <span class="n">seq_lseek</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span>	<span class="o">=</span> <span class="n">single_release</span><span class="p">,</span>
+<span class="p">};</span>
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">kapmd</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">apm_event_t</span> <span class="n">event</span><span class="p">;</span>
+
+		<span class="n">wait_event_interruptible</span><span class="p">(</span><span class="n">kapmd_wait</span><span class="p">,</span>
+				<span class="o">!</span><span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue</span><span class="p">)</span> <span class="o">||</span> <span class="n">kthread_should_stop</span><span class="p">());</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">kthread_should_stop</span><span class="p">())</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue_lock</span><span class="p">);</span>
+		<span class="n">event</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">queue_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue</span><span class="p">))</span>
+			<span class="n">event</span> <span class="o">=</span> <span class="n">queue_get_event</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue</span><span class="p">);</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue_lock</span><span class="p">);</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">event</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="mi">0</span>:
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="n">APM_LOW_BATTERY</span>:
+		<span class="k">case</span> <span class="n">APM_POWER_STATUS_CHANGE</span>:
+			<span class="n">queue_event</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="n">APM_USER_SUSPEND</span>:
+		<span class="k">case</span> <span class="n">APM_SYS_SUSPEND</span>:
+			<span class="n">pm_suspend</span><span class="p">(</span><span class="n">PM_SUSPEND_MEM</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="n">APM_CRITICAL_SUSPEND</span>:
+			<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">userspace_notification_inhibit</span><span class="p">);</span>
+			<span class="n">pm_suspend</span><span class="p">(</span><span class="n">PM_SUSPEND_MEM</span><span class="p">);</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">userspace_notification_inhibit</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">apm_suspend_notifier</span><span class="p">(</span><span class="k">struct</span> <span class="n">notifier_block</span> <span class="o">*</span><span class="n">nb</span><span class="p">,</span>
+				<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">event</span><span class="p">,</span>
+				<span class="kt">void</span> <span class="o">*</span><span class="n">dummy</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">apm_user</span> <span class="o">*</span><span class="n">as</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="cm">/* short-cut emergency suspends */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">userspace_notification_inhibit</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">NOTIFY_DONE</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">event</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">PM_SUSPEND_PREPARE</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * Queue an event to all &quot;writer&quot; users that we want</span>
+<span class="cm">		 * to suspend and need their ack.</span>
+<span class="cm">		 */</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">as</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_user_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">!=</span> <span class="n">SUSPEND_WAIT</span> <span class="o">&amp;&amp;</span> <span class="n">as</span><span class="o">-&gt;</span><span class="n">reader</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">as</span><span class="o">-&gt;</span><span class="n">writer</span> <span class="o">&amp;&amp;</span> <span class="n">as</span><span class="o">-&gt;</span><span class="n">suser</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_PENDING</span><span class="p">;</span>
+				<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">suspend_acks_pending</span><span class="p">);</span>
+				<span class="n">queue_add_event</span><span class="p">(</span><span class="o">&amp;</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="n">APM_USER_SUSPEND</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_waitqueue</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Wait for the the suspend_acks_pending variable to drop to</span>
+<span class="cm">		 * zero, meaning everybody acked the suspend event (or the</span>
+<span class="cm">		 * process was killed.)</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * If the app won&#39;t answer within a short while we assume it</span>
+<span class="cm">		 * locked up and ignore it.</span>
+<span class="cm">		 */</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">wait_event_interruptible_timeout</span><span class="p">(</span>
+			<span class="n">apm_suspend_waitqueue</span><span class="p">,</span>
+			<span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">suspend_acks_pending</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span>
+			<span class="mi">5</span><span class="o">*</span><span class="n">HZ</span><span class="p">);</span>
+
+		<span class="cm">/* timed out */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Move anybody who timed out to &quot;ack timeout&quot; state.</span>
+<span class="cm">			 *</span>
+<span class="cm">			 * We could time out and the userspace does the ACK</span>
+<span class="cm">			 * right after we time out but before we enter the</span>
+<span class="cm">			 * locked section here, but that&#39;s fine.</span>
+<span class="cm">			 */</span>
+			<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+			<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+			<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">as</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_user_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_PENDING</span> <span class="o">||</span>
+				    <span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_READ</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_ACKTO</span><span class="p">;</span>
+					<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">suspend_acks_pending</span><span class="p">);</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* let suspend proceed */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+
+		<span class="cm">/* interrupted by signal */</span>
+		<span class="k">return</span> <span class="n">notifier_from_errno</span><span class="p">(</span><span class="n">err</span><span class="p">);</span>
+
+	<span class="k">case</span> <span class="n">PM_POST_SUSPEND</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * Anyone on the APM queues will think we&#39;re still suspended.</span>
+<span class="cm">		 * Send a message so everyone knows we&#39;re now awake again.</span>
+<span class="cm">		 */</span>
+		<span class="n">queue_event</span><span class="p">(</span><span class="n">APM_NORMAL_RESUME</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Finally, wake up anyone who is sleeping on the suspend.</span>
+<span class="cm">		 */</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">as</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_user_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">==</span> <span class="n">SUSPEND_ACKED</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/*</span>
+<span class="cm">				 * TODO: maybe grab error code, needs core</span>
+<span class="cm">				 * changes to push the error to the notifier</span>
+<span class="cm">				 * chain (could use the second parameter if</span>
+<span class="cm">				 * implemented)</span>
+<span class="cm">				 */</span>
+				<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_result</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">as</span><span class="o">-&gt;</span><span class="n">suspend_state</span> <span class="o">=</span> <span class="n">SUSPEND_DONE</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_list_lock</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state_lock</span><span class="p">);</span>
+
+		<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_suspend_waitqueue</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="n">NOTIFY_DONE</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">notifier_block</span> <span class="n">apm_notif_block</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">notifier_call</span> <span class="o">=</span> <span class="n">apm_suspend_notifier</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">apm_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">apm_disabled</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_NOTICE</span> <span class="s">&quot;apm: disabled on user request.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">kapmd_tsk</span> <span class="o">=</span> <span class="n">kthread_create</span><span class="p">(</span><span class="n">kapmd</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="s">&quot;kapmd&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">kapmd_tsk</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">kapmd_tsk</span><span class="p">);</span>
+		<span class="n">kapmd_tsk</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">wake_up_process</span><span class="p">(</span><span class="n">kapmd_tsk</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_PROC_FS</span>
+	<span class="n">proc_create</span><span class="p">(</span><span class="s">&quot;apm&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">apm_proc_fops</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">misc_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_device</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_stop</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">register_pm_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_notif_block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_unregister</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">out_unregister:</span>
+	<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_device</span><span class="p">);</span>
+ <span class="nl">out_stop:</span>
+	<span class="n">remove_proc_entry</span><span class="p">(</span><span class="s">&quot;apm&quot;</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">kthread_stop</span><span class="p">(</span><span class="n">kapmd_tsk</span><span class="p">);</span>
+ <span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">apm_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unregister_pm_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_notif_block</span><span class="p">);</span>
+	<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">apm_device</span><span class="p">);</span>
+	<span class="n">remove_proc_entry</span><span class="p">(</span><span class="s">&quot;apm&quot;</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">kthread_stop</span><span class="p">(</span><span class="n">kapmd_tsk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">apm_init</span><span class="p">);</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">apm_exit</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Stephen Rothwell&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Advanced Power Management&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+<span class="cp">#ifndef MODULE</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">apm_setup</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">str</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">while</span> <span class="p">((</span><span class="n">str</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="o">*</span><span class="n">str</span> <span class="o">!=</span> <span class="sc">&#39;\0&#39;</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strncmp</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;off&quot;</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">apm_disabled</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strncmp</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;on&quot;</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">apm_disabled</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">str</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="sc">&#39;,&#39;</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">str</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="n">str</span> <span class="o">+=</span> <span class="n">strspn</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;, </span><span class="se">\t</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">__setup</span><span class="p">(</span><span class="s">&quot;apm=&quot;</span><span class="p">,</span> <span class="n">apm_setup</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * apm_queue_event - queue an APM event for kapmd</span>
+<span class="cm"> * @event: APM event</span>
+<span class="cm"> *</span>
+<span class="cm"> * Queue an APM event for kapmd to process and ultimately take the</span>
+<span class="cm"> * appropriate action.  Only a subset of events are handled:</span>
+<span class="cm"> *   %APM_LOW_BATTERY</span>
+<span class="cm"> *   %APM_POWER_STATUS_CHANGE</span>
+<span class="cm"> *   %APM_USER_SUSPEND</span>
+<span class="cm"> *   %APM_SYS_SUSPEND</span>
+<span class="cm"> *   %APM_CRITICAL_SUSPEND</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">apm_queue_event</span><span class="p">(</span><span class="n">apm_event_t</span> <span class="n">event</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">queue_add_event</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue</span><span class="p">,</span> <span class="n">event</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_queue_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kapmd_wait</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">apm_queue_event</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

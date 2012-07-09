@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › softirq.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>softirq.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> *	linux/kernel/softirq.c</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Copyright (C) 1992 Linus Torvalds</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Distribute under GPLv2.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Rewritten. Old one was good in 2.2, but in 2.3 it was immoral. --ANK (990903)</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Remote softirq infrastructure is by Jens Axboe.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel_stat.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/notifier.h&gt;</span>
+<span class="cp">#include &lt;linux/percpu.h&gt;</span>
+<span class="cp">#include &lt;linux/cpu.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/rcupdate.h&gt;</span>
+<span class="cp">#include &lt;linux/ftrace.h&gt;</span>
+<span class="cp">#include &lt;linux/smp.h&gt;</span>
+<span class="cp">#include &lt;linux/tick.h&gt;</span>
+
+<span class="cp">#define CREATE_TRACE_POINTS</span>
+<span class="cp">#include &lt;trace/events/irq.h&gt;</span>
+
+<span class="cp">#include &lt;asm/irq.h&gt;</span>
+<span class="cm">/*</span>
+<span class="cm">   - No shared variables, all the data are CPU local.</span>
+<span class="cm">   - If a softirq needs serialization, let it serialize itself</span>
+<span class="cm">     by its own spinlocks.</span>
+<span class="cm">   - Even if softirq is serialized, only local cpu is marked for</span>
+<span class="cm">     execution. Hence, we get something sort of weak cpu binding.</span>
+<span class="cm">     Though it is still not clear, will it result in better locality</span>
+<span class="cm">     or will not.</span>
+
+<span class="cm">   Examples:</span>
+<span class="cm">   - NET RX softirq. It is multithreaded and does not require</span>
+<span class="cm">     any global serialization.</span>
+<span class="cm">   - NET TX softirq. It kicks software netdevice queues, hence</span>
+<span class="cm">     it is logically serialized per device, but this serialization</span>
+<span class="cm">     is invisible to common code.</span>
+<span class="cm">   - Tasklets: serialized wrt itself.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#ifndef __ARCH_IRQ_STAT</span>
+<span class="n">irq_cpustat_t</span> <span class="n">irq_stat</span><span class="p">[</span><span class="n">NR_CPUS</span><span class="p">]</span> <span class="n">____cacheline_aligned</span><span class="p">;</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">irq_stat</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">softirq_action</span> <span class="n">softirq_vec</span><span class="p">[</span><span class="n">NR_SOFTIRQS</span><span class="p">]</span> <span class="n">__cacheline_aligned_in_smp</span><span class="p">;</span>
+
+<span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="p">,</span> <span class="n">ksoftirqd</span><span class="p">);</span>
+
+<span class="kt">char</span> <span class="o">*</span><span class="n">softirq_to_name</span><span class="p">[</span><span class="n">NR_SOFTIRQS</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="s">&quot;HI&quot;</span><span class="p">,</span> <span class="s">&quot;TIMER&quot;</span><span class="p">,</span> <span class="s">&quot;NET_TX&quot;</span><span class="p">,</span> <span class="s">&quot;NET_RX&quot;</span><span class="p">,</span> <span class="s">&quot;BLOCK&quot;</span><span class="p">,</span> <span class="s">&quot;BLOCK_IOPOLL&quot;</span><span class="p">,</span>
+	<span class="s">&quot;TASKLET&quot;</span><span class="p">,</span> <span class="s">&quot;SCHED&quot;</span><span class="p">,</span> <span class="s">&quot;HRTIMER&quot;</span><span class="p">,</span> <span class="s">&quot;RCU&quot;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * we cannot loop indefinitely here to avoid userspace starvation,</span>
+<span class="cm"> * but we also don&#39;t want to introduce a worst case 1/HZ latency</span>
+<span class="cm"> * to the pending events, so lets the scheduler to balance</span>
+<span class="cm"> * the softirq load for us.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">wakeup_softirqd</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Interrupts are disabled: no need to stop preemption */</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tsk</span> <span class="o">&amp;&amp;</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">!=</span> <span class="n">TASK_RUNNING</span><span class="p">)</span>
+		<span class="n">wake_up_process</span><span class="p">(</span><span class="n">tsk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * preempt_count and SOFTIRQ_OFFSET usage:</span>
+<span class="cm"> * - preempt_count is changed by SOFTIRQ_OFFSET on entering or leaving</span>
+<span class="cm"> *   softirq processing.</span>
+<span class="cm"> * - preempt_count is changed by SOFTIRQ_DISABLE_OFFSET (= 2 * SOFTIRQ_OFFSET)</span>
+<span class="cm"> *   on local_bh_disable or local_bh_enable.</span>
+<span class="cm"> * This lets us distinguish between whether we are currently processing</span>
+<span class="cm"> * softirq and whether we just have bh disabled.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This one is for softirq.c-internal use,</span>
+<span class="cm"> * where hardirqs are disabled legitimately:</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_TRACE_IRQFLAGS</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__local_bh_disable</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ip</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cnt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="n">in_irq</span><span class="p">());</span>
+
+	<span class="n">raw_local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * The preempt tracer hooks into add_preempt_count and will break</span>
+<span class="cm">	 * lockdep because it calls back into lockdep after SOFTIRQ_OFFSET</span>
+<span class="cm">	 * is set and before current-&gt;softirq_enabled is cleared.</span>
+<span class="cm">	 * We must manually increment preempt_count here and manually</span>
+<span class="cm">	 * call the trace_preempt_off later.</span>
+<span class="cm">	 */</span>
+	<span class="n">preempt_count</span><span class="p">()</span> <span class="o">+=</span> <span class="n">cnt</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Were softirqs turned off above:</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">softirq_count</span><span class="p">()</span> <span class="o">==</span> <span class="n">cnt</span><span class="p">)</span>
+		<span class="n">trace_softirqs_off</span><span class="p">(</span><span class="n">ip</span><span class="p">);</span>
+	<span class="n">raw_local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">preempt_count</span><span class="p">()</span> <span class="o">==</span> <span class="n">cnt</span><span class="p">)</span>
+		<span class="n">trace_preempt_off</span><span class="p">(</span><span class="n">CALLER_ADDR0</span><span class="p">,</span> <span class="n">get_parent_ip</span><span class="p">(</span><span class="n">CALLER_ADDR1</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="cp">#else </span><span class="cm">/* !CONFIG_TRACE_IRQFLAGS */</span><span class="cp"></span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">__local_bh_disable</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ip</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cnt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">add_preempt_count</span><span class="p">(</span><span class="n">cnt</span><span class="p">);</span>
+	<span class="n">barrier</span><span class="p">();</span>
+<span class="p">}</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_TRACE_IRQFLAGS */</span><span class="cp"></span>
+
+<span class="kt">void</span> <span class="nf">local_bh_disable</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__local_bh_disable</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+				<span class="n">SOFTIRQ_DISABLE_OFFSET</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">local_bh_disable</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__local_bh_enable</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cnt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="n">in_irq</span><span class="p">());</span>
+	<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="o">!</span><span class="n">irqs_disabled</span><span class="p">());</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">softirq_count</span><span class="p">()</span> <span class="o">==</span> <span class="n">cnt</span><span class="p">)</span>
+		<span class="n">trace_softirqs_on</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+	<span class="n">sub_preempt_count</span><span class="p">(</span><span class="n">cnt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Special-case - softirqs can safely be enabled in</span>
+<span class="cm"> * cond_resched_softirq(), or by __do_softirq(),</span>
+<span class="cm"> * without processing still-pending softirqs:</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">_local_bh_enable</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__local_bh_enable</span><span class="p">(</span><span class="n">SOFTIRQ_DISABLE_OFFSET</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">_local_bh_enable</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">_local_bh_enable_ip</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="n">in_irq</span><span class="p">()</span> <span class="o">||</span> <span class="n">irqs_disabled</span><span class="p">());</span>
+<span class="cp">#ifdef CONFIG_TRACE_IRQFLAGS</span>
+	<span class="n">local_irq_disable</span><span class="p">();</span>
+<span class="cp">#endif</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Are softirqs going to be turned on now:</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">softirq_count</span><span class="p">()</span> <span class="o">==</span> <span class="n">SOFTIRQ_DISABLE_OFFSET</span><span class="p">)</span>
+		<span class="n">trace_softirqs_on</span><span class="p">(</span><span class="n">ip</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Keep preemption disabled until we are done with</span>
+<span class="cm">	 * softirq processing:</span>
+<span class="cm"> 	 */</span>
+	<span class="n">sub_preempt_count</span><span class="p">(</span><span class="n">SOFTIRQ_DISABLE_OFFSET</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">in_interrupt</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="n">local_softirq_pending</span><span class="p">()))</span>
+		<span class="n">do_softirq</span><span class="p">();</span>
+
+	<span class="n">dec_preempt_count</span><span class="p">();</span>
+<span class="cp">#ifdef CONFIG_TRACE_IRQFLAGS</span>
+	<span class="n">local_irq_enable</span><span class="p">();</span>
+<span class="cp">#endif</span>
+	<span class="n">preempt_check_resched</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">local_bh_enable</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_local_bh_enable_ip</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">local_bh_enable</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">local_bh_enable_ip</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_local_bh_enable_ip</span><span class="p">(</span><span class="n">ip</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">local_bh_enable_ip</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We restart softirq processing MAX_SOFTIRQ_RESTART times,</span>
+<span class="cm"> * and we fall back to softirqd after that.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This number has been established via experimentation.</span>
+<span class="cm"> * The two things to balance is latency against fairness -</span>
+<span class="cm"> * we want to handle softirqs as soon as possible, but they</span>
+<span class="cm"> * should not be able to lock up the box.</span>
+<span class="cm"> */</span>
+<span class="cp">#define MAX_SOFTIRQ_RESTART 10</span>
+
+<span class="n">asmlinkage</span> <span class="kt">void</span> <span class="nf">__do_softirq</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">softirq_action</span> <span class="o">*</span><span class="n">h</span><span class="p">;</span>
+	<span class="n">__u32</span> <span class="n">pending</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">max_restart</span> <span class="o">=</span> <span class="n">MAX_SOFTIRQ_RESTART</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">pending</span> <span class="o">=</span> <span class="n">local_softirq_pending</span><span class="p">();</span>
+	<span class="n">account_system_vtime</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+
+	<span class="n">__local_bh_disable</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+				<span class="n">SOFTIRQ_OFFSET</span><span class="p">);</span>
+	<span class="n">lockdep_softirq_enter</span><span class="p">();</span>
+
+	<span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+<span class="nl">restart:</span>
+	<span class="cm">/* Reset the pending bitmask before enabling irqs */</span>
+	<span class="n">set_softirq_pending</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">local_irq_enable</span><span class="p">();</span>
+
+	<span class="n">h</span> <span class="o">=</span> <span class="n">softirq_vec</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pending</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">vec_nr</span> <span class="o">=</span> <span class="n">h</span> <span class="o">-</span> <span class="n">softirq_vec</span><span class="p">;</span>
+			<span class="kt">int</span> <span class="n">prev_count</span> <span class="o">=</span> <span class="n">preempt_count</span><span class="p">();</span>
+
+			<span class="n">kstat_incr_softirqs_this_cpu</span><span class="p">(</span><span class="n">vec_nr</span><span class="p">);</span>
+
+			<span class="n">trace_softirq_entry</span><span class="p">(</span><span class="n">vec_nr</span><span class="p">);</span>
+			<span class="n">h</span><span class="o">-&gt;</span><span class="n">action</span><span class="p">(</span><span class="n">h</span><span class="p">);</span>
+			<span class="n">trace_softirq_exit</span><span class="p">(</span><span class="n">vec_nr</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">prev_count</span> <span class="o">!=</span> <span class="n">preempt_count</span><span class="p">()))</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;huh, entered softirq %u %s %p&quot;</span>
+				       <span class="s">&quot;with preempt_count %08x,&quot;</span>
+				       <span class="s">&quot; exited with %08x?</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">vec_nr</span><span class="p">,</span>
+				       <span class="n">softirq_to_name</span><span class="p">[</span><span class="n">vec_nr</span><span class="p">],</span> <span class="n">h</span><span class="o">-&gt;</span><span class="n">action</span><span class="p">,</span>
+				       <span class="n">prev_count</span><span class="p">,</span> <span class="n">preempt_count</span><span class="p">());</span>
+				<span class="n">preempt_count</span><span class="p">()</span> <span class="o">=</span> <span class="n">prev_count</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">rcu_bh_qs</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">h</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">pending</span> <span class="o">&gt;&gt;=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">pending</span><span class="p">);</span>
+
+	<span class="n">local_irq_disable</span><span class="p">();</span>
+
+	<span class="n">pending</span> <span class="o">=</span> <span class="n">local_softirq_pending</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pending</span> <span class="o">&amp;&amp;</span> <span class="o">--</span><span class="n">max_restart</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">restart</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">pending</span><span class="p">)</span>
+		<span class="n">wakeup_softirqd</span><span class="p">();</span>
+
+	<span class="n">lockdep_softirq_exit</span><span class="p">();</span>
+
+	<span class="n">account_system_vtime</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="n">__local_bh_enable</span><span class="p">(</span><span class="n">SOFTIRQ_OFFSET</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifndef __ARCH_HAS_DO_SOFTIRQ</span>
+
+<span class="n">asmlinkage</span> <span class="kt">void</span> <span class="nf">do_softirq</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__u32</span> <span class="n">pending</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">in_interrupt</span><span class="p">())</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">pending</span> <span class="o">=</span> <span class="n">local_softirq_pending</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">pending</span><span class="p">)</span>
+		<span class="n">__do_softirq</span><span class="p">();</span>
+
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Enter an interrupt context.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">irq_enter</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+
+	<span class="n">rcu_irq_enter</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_idle_task</span><span class="p">(</span><span class="n">current</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">in_interrupt</span><span class="p">())</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Prevent raise_softirq from needlessly waking up ksoftirqd</span>
+<span class="cm">		 * here, as softirq will be serviced on return from interrupt.</span>
+<span class="cm">		 */</span>
+		<span class="n">local_bh_disable</span><span class="p">();</span>
+		<span class="n">tick_check_idle</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+		<span class="n">_local_bh_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="n">__irq_enter</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">invoke_softirq</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">force_irqthreads</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef __ARCH_IRQ_EXIT_IRQS_DISABLED</span>
+		<span class="n">__do_softirq</span><span class="p">();</span>
+<span class="cp">#else</span>
+		<span class="n">do_softirq</span><span class="p">();</span>
+<span class="cp">#endif</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">__local_bh_disable</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+				<span class="n">SOFTIRQ_OFFSET</span><span class="p">);</span>
+		<span class="n">wakeup_softirqd</span><span class="p">();</span>
+		<span class="n">__local_bh_enable</span><span class="p">(</span><span class="n">SOFTIRQ_OFFSET</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Exit an interrupt context. Process softirqs if needed and possible:</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">irq_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">account_system_vtime</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="n">trace_hardirq_exit</span><span class="p">();</span>
+	<span class="n">sub_preempt_count</span><span class="p">(</span><span class="n">IRQ_EXIT_OFFSET</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">in_interrupt</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="n">local_softirq_pending</span><span class="p">())</span>
+		<span class="n">invoke_softirq</span><span class="p">();</span>
+
+<span class="cp">#ifdef CONFIG_NO_HZ</span>
+	<span class="cm">/* Make sure that timer wheel updates are propagated */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">idle_cpu</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">())</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">in_interrupt</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">need_resched</span><span class="p">())</span>
+		<span class="n">tick_nohz_irq_exit</span><span class="p">();</span>
+<span class="cp">#endif</span>
+	<span class="n">rcu_irq_exit</span><span class="p">();</span>
+	<span class="n">sched_preempt_enable_no_resched</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This function must run with irqs disabled!</span>
+<span class="cm"> */</span>
+<span class="kr">inline</span> <span class="kt">void</span> <span class="nf">raise_softirq_irqoff</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__raise_softirq_irqoff</span><span class="p">(</span><span class="n">nr</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If we&#39;re in an interrupt or softirq, we&#39;re done</span>
+<span class="cm">	 * (this also catches softirq-disabled code). We will</span>
+<span class="cm">	 * actually run the softirq once we return from</span>
+<span class="cm">	 * the irq or softirq.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Otherwise we wake up ksoftirqd to make sure we</span>
+<span class="cm">	 * schedule the softirq soon.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">in_interrupt</span><span class="p">())</span>
+		<span class="n">wakeup_softirqd</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">raise_softirq</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">nr</span><span class="p">);</span>
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">__raise_softirq_irqoff</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">trace_softirq_raise</span><span class="p">(</span><span class="n">nr</span><span class="p">);</span>
+	<span class="n">or_softirq_pending</span><span class="p">(</span><span class="mi">1UL</span> <span class="o">&lt;&lt;</span> <span class="n">nr</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">open_softirq</span><span class="p">(</span><span class="kt">int</span> <span class="n">nr</span><span class="p">,</span> <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">action</span><span class="p">)(</span><span class="k">struct</span> <span class="n">softirq_action</span> <span class="o">*</span><span class="p">))</span>
+<span class="p">{</span>
+	<span class="n">softirq_vec</span><span class="p">[</span><span class="n">nr</span><span class="p">].</span><span class="n">action</span> <span class="o">=</span> <span class="n">action</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Tasklets</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">tasklet_head</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">head</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">**</span><span class="n">tail</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_head</span><span class="p">,</span> <span class="n">tasklet_vec</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_head</span><span class="p">,</span> <span class="n">tasklet_hi_vec</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">__tasklet_schedule</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">t</span><span class="p">;</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">));</span>
+	<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">TASKLET_SOFTIRQ</span><span class="p">);</span>
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__tasklet_schedule</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">__tasklet_hi_schedule</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">t</span><span class="p">;</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span>  <span class="o">&amp;</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">));</span>
+	<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">HI_SOFTIRQ</span><span class="p">);</span>
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__tasklet_hi_schedule</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">__tasklet_hi_schedule_first</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">irqs_disabled</span><span class="p">());</span>
+
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">head</span><span class="p">,</span> <span class="n">t</span><span class="p">);</span>
+	<span class="n">__raise_softirq_irqoff</span><span class="p">(</span><span class="n">HI_SOFTIRQ</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__tasklet_hi_schedule_first</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tasklet_action</span><span class="p">(</span><span class="k">struct</span> <span class="n">softirq_action</span> <span class="o">*</span><span class="n">a</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">list</span><span class="p">;</span>
+
+	<span class="n">local_irq_disable</span><span class="p">();</span>
+	<span class="n">list</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">head</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">).</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">local_irq_enable</span><span class="p">();</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span> <span class="o">=</span> <span class="n">list</span><span class="p">;</span>
+
+		<span class="n">list</span> <span class="o">=</span> <span class="n">list</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">tasklet_trylock</span><span class="p">(</span><span class="n">t</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">))</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_clear_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+					<span class="n">BUG</span><span class="p">();</span>
+				<span class="n">t</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">);</span>
+				<span class="n">tasklet_unlock</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">tasklet_unlock</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">local_irq_disable</span><span class="p">();</span>
+		<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">t</span><span class="p">;</span>
+		<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">));</span>
+		<span class="n">__raise_softirq_irqoff</span><span class="p">(</span><span class="n">TASKLET_SOFTIRQ</span><span class="p">);</span>
+		<span class="n">local_irq_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tasklet_hi_action</span><span class="p">(</span><span class="k">struct</span> <span class="n">softirq_action</span> <span class="o">*</span><span class="n">a</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">list</span><span class="p">;</span>
+
+	<span class="n">local_irq_disable</span><span class="p">();</span>
+	<span class="n">list</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">head</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">).</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">local_irq_enable</span><span class="p">();</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span> <span class="o">=</span> <span class="n">list</span><span class="p">;</span>
+
+		<span class="n">list</span> <span class="o">=</span> <span class="n">list</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">tasklet_trylock</span><span class="p">(</span><span class="n">t</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">))</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_clear_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+					<span class="n">BUG</span><span class="p">();</span>
+				<span class="n">t</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">);</span>
+				<span class="n">tasklet_unlock</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">tasklet_unlock</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">local_irq_disable</span><span class="p">();</span>
+		<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">t</span><span class="p">;</span>
+		<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">));</span>
+		<span class="n">__raise_softirq_irqoff</span><span class="p">(</span><span class="n">HI_SOFTIRQ</span><span class="p">);</span>
+		<span class="n">local_irq_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+
+<span class="kt">void</span> <span class="nf">tasklet_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span>
+		  <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">func</span><span class="p">)(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">),</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">func</span> <span class="o">=</span> <span class="n">func</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">tasklet_init</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">tasklet_kill</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">in_interrupt</span><span class="p">())</span>
+		<span class="n">printk</span><span class="p">(</span><span class="s">&quot;Attempt to kill tasklet from interrupt</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="n">yield</span><span class="p">();</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+	<span class="p">}</span>
+	<span class="n">tasklet_unlock_wait</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">tasklet_kill</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * tasklet_hrtimer</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The trampoline is called when the hrtimer expires. It schedules a tasklet</span>
+<span class="cm"> * to run __tasklet_hrtimer_trampoline() which in turn will call the intended</span>
+<span class="cm"> * hrtimer callback, but from softirq context.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">enum</span> <span class="n">hrtimer_restart</span> <span class="nf">__hrtimer_tasklet_trampoline</span><span class="p">(</span><span class="k">struct</span> <span class="n">hrtimer</span> <span class="o">*</span><span class="n">timer</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_hrtimer</span> <span class="o">*</span><span class="n">ttimer</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">timer</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tasklet_hrtimer</span><span class="p">,</span> <span class="n">timer</span><span class="p">);</span>
+
+	<span class="n">tasklet_hi_schedule</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">tasklet</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">HRTIMER_NORESTART</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Helper function which calls the hrtimer callback from</span>
+<span class="cm"> * tasklet/softirq context</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__tasklet_hrtimer_trampoline</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_hrtimer</span> <span class="o">*</span><span class="n">ttimer</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">hrtimer_restart</span> <span class="n">restart</span><span class="p">;</span>
+
+	<span class="n">restart</span> <span class="o">=</span> <span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">function</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">restart</span> <span class="o">!=</span> <span class="n">HRTIMER_NORESTART</span><span class="p">)</span>
+		<span class="n">hrtimer_restart</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * tasklet_hrtimer_init - Init a tasklet/hrtimer combo for softirq callbacks</span>
+<span class="cm"> * @ttimer:	 tasklet_hrtimer which is initialized</span>
+<span class="cm"> * @function:	 hrtimer callback function which gets called from softirq context</span>
+<span class="cm"> * @which_clock: clock id (CLOCK_MONOTONIC/CLOCK_REALTIME)</span>
+<span class="cm"> * @mode:	 hrtimer mode (HRTIMER_MODE_ABS/HRTIMER_MODE_REL)</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">tasklet_hrtimer_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_hrtimer</span> <span class="o">*</span><span class="n">ttimer</span><span class="p">,</span>
+			  <span class="k">enum</span> <span class="n">hrtimer_restart</span> <span class="p">(</span><span class="o">*</span><span class="n">function</span><span class="p">)(</span><span class="k">struct</span> <span class="n">hrtimer</span> <span class="o">*</span><span class="p">),</span>
+			  <span class="n">clockid_t</span> <span class="n">which_clock</span><span class="p">,</span> <span class="k">enum</span> <span class="n">hrtimer_mode</span> <span class="n">mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">hrtimer_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">,</span> <span class="n">which_clock</span><span class="p">,</span> <span class="n">mode</span><span class="p">);</span>
+	<span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">.</span><span class="n">function</span> <span class="o">=</span> <span class="n">__hrtimer_tasklet_trampoline</span><span class="p">;</span>
+	<span class="n">tasklet_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">tasklet</span><span class="p">,</span> <span class="n">__tasklet_hrtimer_trampoline</span><span class="p">,</span>
+		     <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">ttimer</span><span class="p">);</span>
+	<span class="n">ttimer</span><span class="o">-&gt;</span><span class="n">function</span> <span class="o">=</span> <span class="n">function</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tasklet_hrtimer_init</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Remote softirq bits</span>
+<span class="cm"> */</span>
+
+<span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="p">[</span><span class="n">NR_SOFTIRQS</span><span class="p">],</span> <span class="n">softirq_work_list</span><span class="p">);</span>
+<span class="n">EXPORT_PER_CPU_SYMBOL</span><span class="p">(</span><span class="n">softirq_work_list</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__local_trigger</span><span class="p">(</span><span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">softirq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">softirq_work_list</span><span class="p">[</span><span class="n">softirq</span><span class="p">]);</span>
+
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+
+	<span class="cm">/* Trigger the softirq only if the list was previously empty.  */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">head</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">==</span> <span class="o">&amp;</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">)</span>
+		<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">softirq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_USE_GENERIC_SMP_HELPERS</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">remote_softirq_receive</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">softirq</span><span class="p">;</span>
+
+	<span class="n">softirq</span> <span class="o">=</span> <span class="n">cp</span><span class="o">-&gt;</span><span class="n">priv</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">__local_trigger</span><span class="p">(</span><span class="n">cp</span><span class="p">,</span> <span class="n">softirq</span><span class="p">);</span>
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__try_remote_softirq</span><span class="p">(</span><span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">softirq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpu_online</span><span class="p">(</span><span class="n">cpu</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">cp</span><span class="o">-&gt;</span><span class="n">func</span> <span class="o">=</span> <span class="n">remote_softirq_receive</span><span class="p">;</span>
+		<span class="n">cp</span><span class="o">-&gt;</span><span class="n">info</span> <span class="o">=</span> <span class="n">cp</span><span class="p">;</span>
+		<span class="n">cp</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">cp</span><span class="o">-&gt;</span><span class="n">priv</span> <span class="o">=</span> <span class="n">softirq</span><span class="p">;</span>
+
+		<span class="n">__smp_call_function_single</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">cp</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#else </span><span class="cm">/* CONFIG_USE_GENERIC_SMP_HELPERS */</span><span class="cp"></span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__try_remote_softirq</span><span class="p">(</span><span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">softirq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __send_remote_softirq - try to schedule softirq work on a remote cpu</span>
+<span class="cm"> * @cp: private SMP call function data area</span>
+<span class="cm"> * @cpu: the remote cpu</span>
+<span class="cm"> * @this_cpu: the currently executing cpu</span>
+<span class="cm"> * @softirq: the softirq for the work</span>
+<span class="cm"> *</span>
+<span class="cm"> * Attempt to schedule softirq work on a remote cpu.  If this cannot be</span>
+<span class="cm"> * done, the work is instead queued up on the local cpu.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Interrupts must be disabled.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">__send_remote_softirq</span><span class="p">(</span><span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">this_cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">softirq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpu</span> <span class="o">==</span> <span class="n">this_cpu</span> <span class="o">||</span> <span class="n">__try_remote_softirq</span><span class="p">(</span><span class="n">cp</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">softirq</span><span class="p">))</span>
+		<span class="n">__local_trigger</span><span class="p">(</span><span class="n">cp</span><span class="p">,</span> <span class="n">softirq</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__send_remote_softirq</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * send_remote_softirq - try to schedule softirq work on a remote cpu</span>
+<span class="cm"> * @cp: private SMP call function data area</span>
+<span class="cm"> * @cpu: the remote cpu</span>
+<span class="cm"> * @softirq: the softirq for the work</span>
+<span class="cm"> *</span>
+<span class="cm"> * Like __send_remote_softirq except that disabling interrupts and</span>
+<span class="cm"> * computing the current cpu is done for the caller.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">send_remote_softirq</span><span class="p">(</span><span class="k">struct</span> <span class="n">call_single_data</span> <span class="o">*</span><span class="n">cp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">softirq</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">this_cpu</span><span class="p">;</span>
+
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">this_cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="n">__send_remote_softirq</span><span class="p">(</span><span class="n">cp</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">this_cpu</span><span class="p">,</span> <span class="n">softirq</span><span class="p">);</span>
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">send_remote_softirq</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__cpuinit</span> <span class="nf">remote_softirq_cpu_notify</span><span class="p">(</span><span class="k">struct</span> <span class="n">notifier_block</span> <span class="o">*</span><span class="n">self</span><span class="p">,</span>
+					       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">action</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">hcpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * If a CPU goes away, splice its entries to the current CPU</span>
+<span class="cm">	 * and trigger a run of the softirq</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">action</span> <span class="o">==</span> <span class="n">CPU_DEAD</span> <span class="o">||</span> <span class="n">action</span> <span class="o">==</span> <span class="n">CPU_DEAD_FROZEN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">hcpu</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+		<span class="n">local_irq_disable</span><span class="p">();</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">NR_SOFTIRQS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">softirq_work_list</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">cpu</span><span class="p">);</span>
+			<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">local_head</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="n">head</span><span class="p">))</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="n">local_head</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">softirq_work_list</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+			<span class="n">list_splice_init</span><span class="p">(</span><span class="n">head</span><span class="p">,</span> <span class="n">local_head</span><span class="p">);</span>
+			<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">local_irq_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">notifier_block</span> <span class="n">__cpuinitdata</span> <span class="n">remote_softirq_cpu_notifier</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">notifier_call</span>	<span class="o">=</span> <span class="n">remote_softirq_cpu_notify</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">softirq_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span> <span class="o">=</span>
+			<span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span> <span class="o">=</span>
+			<span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">NR_SOFTIRQS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">softirq_work_list</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">cpu</span><span class="p">));</span>
+	<span class="p">}</span>
+
+	<span class="n">register_hotcpu_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">remote_softirq_cpu_notifier</span><span class="p">);</span>
+
+	<span class="n">open_softirq</span><span class="p">(</span><span class="n">TASKLET_SOFTIRQ</span><span class="p">,</span> <span class="n">tasklet_action</span><span class="p">);</span>
+	<span class="n">open_softirq</span><span class="p">(</span><span class="n">HI_SOFTIRQ</span><span class="p">,</span> <span class="n">tasklet_hi_action</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">run_ksoftirqd</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span> <span class="n">__bind_cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">preempt_disable</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">local_softirq_pending</span><span class="p">())</span> <span class="p">{</span>
+			<span class="n">schedule_preempt_disabled</span><span class="p">();</span>
+		<span class="p">}</span>
+
+		<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+
+		<span class="k">while</span> <span class="p">(</span><span class="n">local_softirq_pending</span><span class="p">())</span> <span class="p">{</span>
+			<span class="cm">/* Preempt disable stops cpu going offline.</span>
+<span class="cm">			   If already offline, we&#39;ll be on wrong CPU:</span>
+<span class="cm">			   don&#39;t process */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">cpu_is_offline</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">__bind_cpu</span><span class="p">))</span>
+				<span class="k">goto</span> <span class="n">wait_to_die</span><span class="p">;</span>
+			<span class="n">local_irq_disable</span><span class="p">();</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">local_softirq_pending</span><span class="p">())</span>
+				<span class="n">__do_softirq</span><span class="p">();</span>
+			<span class="n">local_irq_enable</span><span class="p">();</span>
+			<span class="n">sched_preempt_enable_no_resched</span><span class="p">();</span>
+			<span class="n">cond_resched</span><span class="p">();</span>
+			<span class="n">preempt_disable</span><span class="p">();</span>
+			<span class="n">rcu_note_context_switch</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">__bind_cpu</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">preempt_enable</span><span class="p">();</span>
+		<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">wait_to_die:</span>
+	<span class="n">preempt_enable</span><span class="p">();</span>
+	<span class="cm">/* Wait for kthread_stop */</span>
+	<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">schedule</span><span class="p">();</span>
+		<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_HOTPLUG_CPU</span>
+<span class="cm">/*</span>
+<span class="cm"> * tasklet_kill_immediate is called to remove a tasklet which can already be</span>
+<span class="cm"> * scheduled for execution on @cpu.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Unlike tasklet_kill, this function removes the tasklet</span>
+<span class="cm"> * _immediately_, even if the tasklet is in TASKLET_STATE_SCHED state.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When this function is called, @cpu must be in the CPU_DEAD state.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">tasklet_kill_immediate</span><span class="p">(</span><span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span> <span class="o">**</span><span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">cpu_online</span><span class="p">(</span><span class="n">cpu</span><span class="p">));</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_RUN</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">TASKLET_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* CPU is dead, so no lock needed. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span> <span class="o">*</span><span class="n">i</span><span class="p">;</span> <span class="n">i</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="o">*</span><span class="n">i</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">i</span> <span class="o">==</span> <span class="n">t</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">i</span> <span class="o">=</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+			<span class="cm">/* If this was the tail element, move the tail ptr */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">i</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+				<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">BUG</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">takeover_tasklets</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* CPU is dead, so no lock needed. */</span>
+	<span class="n">local_irq_disable</span><span class="p">();</span>
+
+	<span class="cm">/* Find end, append list for that CPU. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span> <span class="o">!=</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+		<span class="n">this_cpu_write</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span><span class="p">);</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">TASKLET_SOFTIRQ</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span> <span class="o">!=</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">)</span> <span class="o">=</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+		<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">.</span><span class="n">tail</span><span class="p">,</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span><span class="p">);</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">tail</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">tasklet_hi_vec</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">head</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">raise_softirq_irqoff</span><span class="p">(</span><span class="n">HI_SOFTIRQ</span><span class="p">);</span>
+
+	<span class="n">local_irq_enable</span><span class="p">();</span>
+<span class="p">}</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_HOTPLUG_CPU */</span><span class="cp"></span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__cpuinit</span> <span class="nf">cpu_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">notifier_block</span> <span class="o">*</span><span class="n">nfb</span><span class="p">,</span>
+				  <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">action</span><span class="p">,</span>
+				  <span class="kt">void</span> <span class="o">*</span><span class="n">hcpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">hotcpu</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">hcpu</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">action</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">CPU_UP_PREPARE</span>:
+	<span class="k">case</span> <span class="n">CPU_UP_PREPARE_FROZEN</span>:
+		<span class="n">p</span> <span class="o">=</span> <span class="n">kthread_create_on_node</span><span class="p">(</span><span class="n">run_ksoftirqd</span><span class="p">,</span>
+					   <span class="n">hcpu</span><span class="p">,</span>
+					   <span class="n">cpu_to_node</span><span class="p">(</span><span class="n">hotcpu</span><span class="p">),</span>
+					   <span class="s">&quot;ksoftirqd/%d&quot;</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="s">&quot;ksoftirqd for %i failed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">notifier_from_errno</span><span class="p">(</span><span class="n">PTR_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">));</span>
+		<span class="p">}</span>
+		<span class="n">kthread_bind</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">);</span>
+  		<span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">)</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+ 		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">CPU_ONLINE</span>:
+	<span class="k">case</span> <span class="n">CPU_ONLINE_FROZEN</span>:
+		<span class="n">wake_up_process</span><span class="p">(</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">));</span>
+		<span class="k">break</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_HOTPLUG_CPU</span>
+	<span class="k">case</span> <span class="n">CPU_UP_CANCELED</span>:
+	<span class="k">case</span> <span class="n">CPU_UP_CANCELED_FROZEN</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="cm">/* Unbind so it can run.  Fall thru. */</span>
+		<span class="n">kthread_bind</span><span class="p">(</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">),</span>
+			     <span class="n">cpumask_any</span><span class="p">(</span><span class="n">cpu_online_mask</span><span class="p">));</span>
+	<span class="k">case</span> <span class="n">CPU_DEAD</span>:
+	<span class="k">case</span> <span class="n">CPU_DEAD_FROZEN</span>: <span class="p">{</span>
+		<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">sched_param</span> <span class="n">param</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">sched_priority</span> <span class="o">=</span> <span class="n">MAX_RT_PRIO</span><span class="o">-</span><span class="mi">1</span>
+		<span class="p">};</span>
+
+		<span class="n">p</span> <span class="o">=</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">);</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">ksoftirqd</span><span class="p">,</span> <span class="n">hotcpu</span><span class="p">)</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">sched_setscheduler_nocheck</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">SCHED_FIFO</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">param</span><span class="p">);</span>
+		<span class="n">kthread_stop</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+		<span class="n">takeover_tasklets</span><span class="p">(</span><span class="n">hotcpu</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_HOTPLUG_CPU */</span><span class="cp"></span>
+ 	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">notifier_block</span> <span class="n">__cpuinitdata</span> <span class="n">cpu_nfb</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">notifier_call</span> <span class="o">=</span> <span class="n">cpu_callback</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">__init</span> <span class="kt">int</span> <span class="nf">spawn_ksoftirqd</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">cpu</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)(</span><span class="kt">long</span><span class="p">)</span><span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="n">cpu_callback</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpu_nfb</span><span class="p">,</span> <span class="n">CPU_UP_PREPARE</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">err</span> <span class="o">!=</span> <span class="n">NOTIFY_OK</span><span class="p">);</span>
+	<span class="n">cpu_callback</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpu_nfb</span><span class="p">,</span> <span class="n">CPU_ONLINE</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="n">register_cpu_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpu_nfb</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">early_initcall</span><span class="p">(</span><span class="n">spawn_ksoftirqd</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * [ These __weak aliases are kept in a separate compilation unit, so that</span>
+<span class="cm"> *   GCC does not inline them incorrectly. ]</span>
+<span class="cm"> */</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="n">__weak</span> <span class="nf">early_irq_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_GENERIC_HARDIRQS</span>
+<span class="kt">int</span> <span class="n">__init</span> <span class="n">__weak</span> <span class="nf">arch_probe_nr_irqs</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">NR_IRQS_LEGACY</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="n">__weak</span> <span class="nf">arch_early_irq_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

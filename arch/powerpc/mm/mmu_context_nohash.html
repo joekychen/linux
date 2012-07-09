@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › powerpc › mm › mmu_context_nohash.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>mmu_context_nohash.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * This file contains the routines for handling the MMU on those</span>
+<span class="cm"> * PowerPC implementations where the MMU is not using the hash</span>
+<span class="cm"> * table, such as 8xx, 4xx, BookE&#39;s etc...</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright 2008 Ben Herrenschmidt &lt;benh@kernel.crashing.org&gt;</span>
+<span class="cm"> *                IBM Corp.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Derived from previous arch/powerpc/mm/mmu_context.c</span>
+<span class="cm"> *  and arch/powerpc/include/asm/mmu_context.h</span>
+<span class="cm"> *</span>
+<span class="cm"> *  This program is free software; you can redistribute it and/or</span>
+<span class="cm"> *  modify it under the terms of the GNU General Public License</span>
+<span class="cm"> *  as published by the Free Software Foundation; either version</span>
+<span class="cm"> *  2 of the License, or (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * TODO:</span>
+<span class="cm"> *</span>
+<span class="cm"> *   - The global context lock will not scale very well</span>
+<span class="cm"> *   - The maps should be dynamically allocated to allow for processors</span>
+<span class="cm"> *     that support more PID bits at runtime</span>
+<span class="cm"> *   - Implement flush_tlb_mm() by making the context stale and picking</span>
+<span class="cm"> *     a new one</span>
+<span class="cm"> *   - More aggressively clear stale map bits and maybe find some way to</span>
+<span class="cm"> *     also clear mm-&gt;cpu_vm_mask bits when processes are migrated</span>
+<span class="cm"> */</span></pre></div></td></tr>
+
+
+<tr id="section-2"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-2">&#182;</a></div><h1>define DEBUG<em>MAP</em>CONSISTENCY</h1>
+
+<h1>define DEBUG<em>CLAMP</em>LAST_CONTEXT   31</h1>
+
+<h1>define DEBUG_HARDER</h1></td><td class="code"><div class="highlight"><pre><span class="cm">/* We don&#39;t use DEBUG because it tends to be compiled in always nowadays</span>
+<span class="cm"> * and this would generate way too much output</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef DEBUG_HARDER</span>
+<span class="cp">#define pr_hard(args...)	printk(KERN_DEBUG args)</span>
+<span class="cp">#define pr_hardcont(args...)	printk(KERN_CONT args)</span>
+<span class="cp">#else</span>
+<span class="cp">#define pr_hard(args...)	do { } while(0)</span>
+<span class="cp">#define pr_hardcont(args...)	do { } while(0)</span>
+<span class="cp">#endif</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/bootmem.h&gt;</span>
+<span class="cp">#include &lt;linux/notifier.h&gt;</span>
+<span class="cp">#include &lt;linux/cpu.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="cp">#include &lt;asm/mmu_context.h&gt;</span>
+<span class="cp">#include &lt;asm/tlbflush.h&gt;</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">first_context</span><span class="p">,</span> <span class="n">last_context</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">next_context</span><span class="p">,</span> <span class="n">nr_free_contexts</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">context_map</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">stale_map</span><span class="p">[</span><span class="n">NR_CPUS</span><span class="p">];</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">**</span><span class="n">context_mm</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_RAW_SPINLOCK</span><span class="p">(</span><span class="n">context_lock</span><span class="p">);</span>
+
+<span class="cp">#define CTX_MAP_SIZE	\</span>
+<span class="cp">	(sizeof(unsigned long) * (last_context / BITS_PER_LONG + 1))</span>
+
+
+<span class="cm">/* Steal a context from a task that has one at the moment.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is used when we are running out of available PID numbers</span>
+<span class="cm"> * on the processors.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This isn&#39;t an LRU system, it just frees up each context in</span>
+<span class="cm"> * turn (sort-of pseudo-random replacement :).  This would be the</span>
+<span class="cm"> * place to implement an LRU scheme if anyone was motivated to do it.</span>
+<span class="cm"> *  -- paulus</span>
+<span class="cm"> *</span>
+<span class="cm"> * For context stealing, we use a slightly different approach for</span>
+<span class="cm"> * SMP and UP. Basically, the UP one is simpler and doesn&#39;t use</span>
+<span class="cm"> * the stale map as we can just flush the local CPU</span>
+<span class="cm"> *  -- benh</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_SMP</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">steal_context_smp</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">max</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">max</span> <span class="o">=</span> <span class="n">last_context</span> <span class="o">-</span> <span class="n">first_context</span><span class="p">;</span>
+
+	<span class="cm">/* Attempt to free next_context first and then loop until we manage */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">max</span><span class="o">--</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Pick up the victim mm */</span>
+		<span class="n">mm</span> <span class="o">=</span> <span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">];</span>
+
+		<span class="cm">/* We have a candidate victim, check if it&#39;s active, on SMP</span>
+<span class="cm">		 * we cannot steal active contexts</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">id</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">id</span> <span class="o">&gt;</span> <span class="n">last_context</span><span class="p">)</span>
+				<span class="n">id</span> <span class="o">=</span> <span class="n">first_context</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; | steal %d from 0x%p&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">mm</span><span class="p">);</span>
+
+		<span class="cm">/* Mark this mm has having no context anymore */</span>
+		<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">;</span>
+
+		<span class="cm">/* Mark it stale on all CPUs that used this mm. For threaded</span>
+<span class="cm">		 * implementations, we set it on all threads on each core</span>
+<span class="cm">		 * represented in the mask. A future implementation will use</span>
+<span class="cm">		 * a core map instead but this will do for now.</span>
+<span class="cm">		 */</span>
+		<span class="n">for_each_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">cpu_first_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+			     <span class="n">i</span> <span class="o">&lt;=</span> <span class="n">cpu_last_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+				<span class="n">__set_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">stale_map</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+			<span class="n">cpu</span> <span class="o">=</span> <span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">return</span> <span class="n">id</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* This will happen if you have more CPUs than available contexts,</span>
+<span class="cm">	 * all we can do here is wait a bit and try again</span>
+<span class="cm">	 */</span>
+	<span class="n">raw_spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">);</span>
+	<span class="n">cpu_relax</span><span class="p">();</span>
+	<span class="n">raw_spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">);</span>
+
+	<span class="cm">/* This will cause the caller to try again */</span>
+	<span class="k">return</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif  </span><span class="cm">/* CONFIG_SMP */</span><span class="cp"></span>
+
+<span class="cm">/* Note that this will also be called on SMP if all other CPUs are</span>
+<span class="cm"> * offlined, which means that it may be called for cpu != 0. For</span>
+<span class="cm"> * this to work, we somewhat assume that CPUs that are onlined</span>
+<span class="cm"> * come up with a fully clean TLB (or are cleaned when offlined)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">steal_context_up</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+
+	<span class="cm">/* Pick up the victim mm */</span>
+	<span class="n">mm</span> <span class="o">=</span> <span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">];</span>
+
+	<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; | steal %d from 0x%p&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">mm</span><span class="p">);</span>
+
+	<span class="cm">/* Flush the TLB for that context */</span>
+	<span class="n">local_flush_tlb_mm</span><span class="p">(</span><span class="n">mm</span><span class="p">);</span>
+
+	<span class="cm">/* Mark this mm has having no context anymore */</span>
+	<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">;</span>
+
+	<span class="cm">/* XXX This clear should ultimately be part of local_flush_tlb_mm */</span>
+	<span class="n">__clear_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">stale_map</span><span class="p">[</span><span class="n">cpu</span><span class="p">]);</span>
+
+	<span class="k">return</span> <span class="n">id</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef DEBUG_MAP_CONSISTENCY</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">context_check_map</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">,</span> <span class="n">nrf</span><span class="p">,</span> <span class="n">nact</span><span class="p">;</span>
+
+	<span class="n">nrf</span> <span class="o">=</span> <span class="n">nact</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">id</span> <span class="o">=</span> <span class="n">first_context</span><span class="p">;</span> <span class="n">id</span> <span class="o">&lt;=</span> <span class="n">last_context</span><span class="p">;</span> <span class="n">id</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">used</span> <span class="o">=</span> <span class="n">test_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">context_map</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">used</span><span class="p">)</span>
+			<span class="n">nrf</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">used</span> <span class="o">!=</span> <span class="p">(</span><span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;MMU: Context %d is %s and MM is %p !</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">id</span><span class="p">,</span> <span class="n">used</span> <span class="o">?</span> <span class="s">&quot;used&quot;</span> <span class="o">:</span> <span class="s">&quot;free&quot;</span><span class="p">,</span> <span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="n">nact</span> <span class="o">+=</span> <span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nrf</span> <span class="o">!=</span> <span class="n">nr_free_contexts</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;MMU: Free context count out of sync ! (%d vs %d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">nr_free_contexts</span><span class="p">,</span> <span class="n">nrf</span><span class="p">);</span>
+		<span class="n">nr_free_contexts</span> <span class="o">=</span> <span class="n">nrf</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nact</span> <span class="o">&gt;</span> <span class="n">num_online_cpus</span><span class="p">())</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;MMU: More active contexts than CPUs ! (%d vs %d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">nact</span><span class="p">,</span> <span class="n">num_online_cpus</span><span class="p">());</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">first_context</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">context_map</span><span class="p">))</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;MMU: Context 0 has been freed !!!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#else</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">context_check_map</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="p">{</span> <span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="kt">void</span> <span class="nf">switch_mmu_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">prev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">next</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">map</span><span class="p">;</span>
+
+	<span class="cm">/* No lockless fast path .. yet */</span>
+	<span class="n">raw_spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">);</span>
+
+	<span class="n">pr_hard</span><span class="p">(</span><span class="s">&quot;[%d] activating context for mm @%p, active=%d, id=%d&quot;</span><span class="p">,</span>
+		<span class="n">cpu</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="n">next</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="p">,</span> <span class="n">next</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_SMP</span>
+	<span class="cm">/* Mark us active and the previous one not anymore */</span>
+	<span class="n">next</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">prev</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; (old=0x%p a=%d)&quot;</span><span class="p">,</span> <span class="n">prev</span><span class="p">,</span> <span class="n">prev</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="p">);</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">prev</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">prev</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+ <span class="nl">again:</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_SMP */</span><span class="cp"></span>
+
+	<span class="cm">/* If we already have a valid assigned context, skip all that */</span>
+	<span class="n">id</span> <span class="o">=</span> <span class="n">next</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">id</span> <span class="o">!=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">))</span> <span class="p">{</span>
+<span class="cp">#ifdef DEBUG_MAP_CONSISTENCY</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span> <span class="o">!=</span> <span class="n">next</span><span class="p">)</span>
+			<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;MMU: mm 0x%p has id %d but context_mm[%d] says 0x%p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">next</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]);</span>
+<span class="cp">#endif</span>
+		<span class="k">goto</span> <span class="n">ctxt_ok</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* We really don&#39;t have a context, let&#39;s try to acquire one */</span>
+	<span class="n">id</span> <span class="o">=</span> <span class="n">next_context</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">id</span> <span class="o">&gt;</span> <span class="n">last_context</span><span class="p">)</span>
+		<span class="n">id</span> <span class="o">=</span> <span class="n">first_context</span><span class="p">;</span>
+	<span class="n">map</span> <span class="o">=</span> <span class="n">context_map</span><span class="p">;</span>
+
+	<span class="cm">/* No more free contexts, let&#39;s try to steal one */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_free_contexts</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_SMP</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">num_online_cpus</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">id</span> <span class="o">=</span> <span class="n">steal_context_smp</span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">id</span> <span class="o">==</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">)</span>
+				<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">stolen</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_SMP */</span><span class="cp"></span>
+		<span class="n">id</span> <span class="o">=</span> <span class="n">steal_context_up</span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">stolen</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">nr_free_contexts</span><span class="o">--</span><span class="p">;</span>
+
+	<span class="cm">/* We know there&#39;s at least one free context, try to find it */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">__test_and_set_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">map</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">id</span> <span class="o">=</span> <span class="n">find_next_zero_bit</span><span class="p">(</span><span class="n">map</span><span class="p">,</span> <span class="n">last_context</span><span class="o">+</span><span class="mi">1</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">id</span> <span class="o">&gt;</span> <span class="n">last_context</span><span class="p">)</span>
+			<span class="n">id</span> <span class="o">=</span> <span class="n">first_context</span><span class="p">;</span>
+	<span class="p">}</span>
+ <span class="nl">stolen:</span>
+	<span class="n">next_context</span> <span class="o">=</span> <span class="n">id</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+	<span class="n">next</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">id</span><span class="p">;</span>
+	<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; | new id=%d,nrf=%d&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">,</span> <span class="n">nr_free_contexts</span><span class="p">);</span>
+
+	<span class="n">context_check_map</span><span class="p">();</span>
+ <span class="nl">ctxt_ok:</span>
+
+	<span class="cm">/* If that context got marked stale on this CPU, then flush the</span>
+<span class="cm">	 * local TLB for it and unmark it before we use it</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">stale_map</span><span class="p">[</span><span class="n">cpu</span><span class="p">]))</span> <span class="p">{</span>
+		<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; | stale flush %d [%d..%d]&quot;</span><span class="p">,</span>
+			    <span class="n">id</span><span class="p">,</span> <span class="n">cpu_first_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">),</span>
+			    <span class="n">cpu_last_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">));</span>
+
+		<span class="n">local_flush_tlb_mm</span><span class="p">(</span><span class="n">next</span><span class="p">);</span>
+
+		<span class="cm">/* XXX This clear should ultimately be part of local_flush_tlb_mm */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">cpu_first_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+		     <span class="n">i</span> <span class="o">&lt;=</span> <span class="n">cpu_last_thread_sibling</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">__clear_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">stale_map</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Flick the MMU and release lock */</span>
+	<span class="n">pr_hardcont</span><span class="p">(</span><span class="s">&quot; -&gt; %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+	<span class="n">set_context</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">next</span><span class="o">-&gt;</span><span class="n">pgd</span><span class="p">);</span>
+	<span class="n">raw_spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Set up the context for a new address space.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">init_new_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pr_hard</span><span class="p">(</span><span class="s">&quot;initing context for mm @%p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">mm</span><span class="p">);</span>
+
+	<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">;</span>
+	<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_PPC_MM_SLICES</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slice_mm_new_context</span><span class="p">(</span><span class="n">mm</span><span class="p">))</span>
+		<span class="n">slice_set_user_psize</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">mmu_virtual_psize</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We&#39;re finished using the context for an address space.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">destroy_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">id</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">==</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">raw_spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">id</span> <span class="o">=</span> <span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">id</span> <span class="o">!=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__clear_bit</span><span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">context_map</span><span class="p">);</span>
+		<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">MMU_NO_CONTEXT</span><span class="p">;</span>
+<span class="cp">#ifdef DEBUG_MAP_CONSISTENCY</span>
+		<span class="n">mm</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">.</span><span class="n">active</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="cp">#endif</span>
+		<span class="n">context_mm</span><span class="p">[</span><span class="n">id</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">nr_free_contexts</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">raw_spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">context_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_SMP</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__cpuinit</span> <span class="nf">mmu_context_cpu_notify</span><span class="p">(</span><span class="k">struct</span> <span class="n">notifier_block</span> <span class="o">*</span><span class="n">self</span><span class="p">,</span>
+					    <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">action</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">hcpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)(</span><span class="kt">long</span><span class="p">)</span><span class="n">hcpu</span><span class="p">;</span>
+
+	<span class="cm">/* We don&#39;t touch CPU 0 map, it&#39;s allocated at aboot and kept</span>
+<span class="cm">	 * around forever</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpu</span> <span class="o">==</span> <span class="n">boot_cpuid</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">action</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">CPU_UP_PREPARE</span>:
+	<span class="k">case</span> <span class="n">CPU_UP_PREPARE_FROZEN</span>:
+		<span class="n">pr_devel</span><span class="p">(</span><span class="s">&quot;MMU: Allocating stale context map for CPU %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+		<span class="n">stale_map</span><span class="p">[</span><span class="n">cpu</span><span class="p">]</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">CTX_MAP_SIZE</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_HOTPLUG_CPU</span>
+	<span class="k">case</span> <span class="n">CPU_UP_CANCELED</span>:
+	<span class="k">case</span> <span class="n">CPU_UP_CANCELED_FROZEN</span>:
+	<span class="k">case</span> <span class="n">CPU_DEAD</span>:
+	<span class="k">case</span> <span class="n">CPU_DEAD_FROZEN</span>:
+		<span class="n">pr_devel</span><span class="p">(</span><span class="s">&quot;MMU: Freeing stale context map for CPU %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">stale_map</span><span class="p">[</span><span class="n">cpu</span><span class="p">]);</span>
+		<span class="n">stale_map</span><span class="p">[</span><span class="n">cpu</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="cm">/* We also clear the cpu_vm_mask bits of CPUs going away */</span>
+		<span class="n">clear_tasks_mm_cpumask</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="k">break</span><span class="p">;</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_HOTPLUG_CPU */</span><span class="cp"></span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">notifier_block</span> <span class="n">__cpuinitdata</span> <span class="n">mmu_context_cpu_nb</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">notifier_call</span>	<span class="o">=</span> <span class="n">mmu_context_cpu_notify</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cp">#endif </span><span class="cm">/* CONFIG_SMP */</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Initialize the context management stuff.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">mmu_context_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Mark init_mm as being active on all possible CPUs since</span>
+<span class="cm">	 * we&#39;ll get called with prev == init_mm the first time</span>
+<span class="cm">	 * we schedule on a given CPU</span>
+<span class="cm">	 */</span>
+	<span class="n">init_mm</span><span class="p">.</span><span class="n">context</span><span class="p">.</span><span class="n">active</span> <span class="o">=</span> <span class="n">NR_CPUS</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 *   The MPC8xx has only 16 contexts.  We rotate through them on each</span>
+<span class="cm">	 * task switch.  A better way would be to keep track of tasks that</span>
+<span class="cm">	 * own contexts, and implement an LRU usage.  That way very active</span>
+<span class="cm">	 * tasks don&#39;t always have to pay the TLB reload overhead.  The</span>
+<span class="cm">	 * kernel pages are mapped shared, so the kernel can run on behalf</span>
+<span class="cm">	 * of any task that makes a kernel entry.  Shared does not mean they</span>
+<span class="cm">	 * are not protected, just that the ASID comparison is not performed.</span>
+<span class="cm">	 *      -- Dan</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * The IBM4xx has 256 contexts, so we can just rotate through these</span>
+<span class="cm">	 * as a way of &quot;switching&quot; contexts.  If the TID of the TLB is zero,</span>
+<span class="cm">	 * the PID/TID comparison is disabled, so we can use a TID of zero</span>
+<span class="cm">	 * to represent all kernel pages as shared among all contexts.</span>
+<span class="cm">	 * 	-- Dan</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * The IBM 47x core supports 16-bit PIDs, thus 65535 contexts. We</span>
+<span class="cm">	 * should normally never have to steal though the facility is</span>
+<span class="cm">	 * present if needed.</span>
+<span class="cm">	 *      -- BenH</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mmu_has_feature</span><span class="p">(</span><span class="n">MMU_FTR_TYPE_8xx</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">first_context</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">last_context</span> <span class="o">=</span> <span class="mi">15</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mmu_has_feature</span><span class="p">(</span><span class="n">MMU_FTR_TYPE_47x</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">first_context</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">last_context</span> <span class="o">=</span> <span class="mi">65535</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+<span class="cp">#ifdef CONFIG_PPC_BOOK3E_MMU</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mmu_has_feature</span><span class="p">(</span><span class="n">MMU_FTR_TYPE_3E</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">u32</span> <span class="n">mmucfg</span> <span class="o">=</span> <span class="n">mfspr</span><span class="p">(</span><span class="n">SPRN_MMUCFG</span><span class="p">);</span>
+		<span class="n">u32</span> <span class="n">pid_bits</span> <span class="o">=</span> <span class="p">(</span><span class="n">mmucfg</span> <span class="o">&amp;</span> <span class="n">MMUCFG_PIDSIZE_MASK</span><span class="p">)</span>
+				<span class="o">&gt;&gt;</span> <span class="n">MMUCFG_PIDSIZE_SHIFT</span><span class="p">;</span>
+		<span class="n">first_context</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">last_context</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1UL</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">pid_bits</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+<span class="cp">#endif</span>
+	<span class="p">{</span>
+		<span class="n">first_context</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">last_context</span> <span class="o">=</span> <span class="mi">255</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="cp">#ifdef DEBUG_CLAMP_LAST_CONTEXT</span>
+	<span class="n">last_context</span> <span class="o">=</span> <span class="n">DEBUG_CLAMP_LAST_CONTEXT</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Allocate the maps used by context management</span>
+<span class="cm">	 */</span>
+	<span class="n">context_map</span> <span class="o">=</span> <span class="n">alloc_bootmem</span><span class="p">(</span><span class="n">CTX_MAP_SIZE</span><span class="p">);</span>
+	<span class="n">context_mm</span> <span class="o">=</span> <span class="n">alloc_bootmem</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">last_context</span> <span class="o">+</span> <span class="mi">1</span><span class="p">));</span>
+<span class="cp">#ifndef CONFIG_SMP</span>
+	<span class="n">stale_map</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">alloc_bootmem</span><span class="p">(</span><span class="n">CTX_MAP_SIZE</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="n">stale_map</span><span class="p">[</span><span class="n">boot_cpuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">alloc_bootmem</span><span class="p">(</span><span class="n">CTX_MAP_SIZE</span><span class="p">);</span>
+
+	<span class="n">register_cpu_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mmu_context_cpu_nb</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span>
+	       <span class="s">&quot;MMU: Allocated %zu bytes of context maps for %d contexts</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	       <span class="mi">2</span> <span class="o">*</span> <span class="n">CTX_MAP_SIZE</span> <span class="o">+</span> <span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">last_context</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)),</span>
+	       <span class="n">last_context</span> <span class="o">-</span> <span class="n">first_context</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Some processors have too few contexts to reserve one for</span>
+<span class="cm">	 * init_mm, and require using context 0 for a normal task.</span>
+<span class="cm">	 * Other processors reserve the use of context zero for the kernel.</span>
+<span class="cm">	 * This code assumes first_context &lt; 32.</span>
+<span class="cm">	 */</span>
+	<span class="n">context_map</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">first_context</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">next_context</span> <span class="o">=</span> <span class="n">first_context</span><span class="p">;</span>
+	<span class="n">nr_free_contexts</span> <span class="o">=</span> <span class="n">last_context</span> <span class="o">-</span> <span class="n">first_context</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

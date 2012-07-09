@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › audit_tree.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>audit_tree.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cp">#include &quot;audit.h&quot;</span>
+<span class="cp">#include &lt;linux/fsnotify_backend.h&gt;</span>
+<span class="cp">#include &lt;linux/namei.h&gt;</span>
+<span class="cp">#include &lt;linux/mount.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="k">struct</span> <span class="n">audit_tree</span><span class="p">;</span>
+<span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">audit_tree</span> <span class="p">{</span>
+	<span class="n">atomic_t</span> <span class="n">count</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">goner</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">chunks</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">rules</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">same_root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rcu_head</span> <span class="n">head</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">pathname</span><span class="p">[];</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">hash</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="n">mark</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">trees</span><span class="p">;</span>		<span class="cm">/* with root here */</span>
+	<span class="kt">int</span> <span class="n">dead</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count</span><span class="p">;</span>
+	<span class="n">atomic_long_t</span> <span class="n">refs</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rcu_head</span> <span class="n">head</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">node</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">owner</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">index</span><span class="p">;</span>		<span class="cm">/* index; upper bit indicates &#39;will prune&#39; */</span>
+	<span class="p">}</span> <span class="n">owners</span><span class="p">[];</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">tree_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">prune_list</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * One struct chunk is attached to each inode of interest.</span>
+<span class="cm"> * We replace struct chunk on tagging/untagging.</span>
+<span class="cm"> * Rules have pointer to struct audit_tree.</span>
+<span class="cm"> * Rules have struct list_head rlist forming a list of rules over</span>
+<span class="cm"> * the same tree.</span>
+<span class="cm"> * References to struct chunk are collected at audit_inode{,_child}()</span>
+<span class="cm"> * time and used in AUDIT_TREE rule matching.</span>
+<span class="cm"> * These references are dropped at the same time we are calling</span>
+<span class="cm"> * audit_free_names(), etc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Cyclic lists galore:</span>
+<span class="cm"> * tree.chunks anchors chunk.owners[].list			hash_lock</span>
+<span class="cm"> * tree.rules anchors rule.rlist				audit_filter_mutex</span>
+<span class="cm"> * chunk.trees anchors tree.same_root				hash_lock</span>
+<span class="cm"> * chunk.hash is a hash with middle bits of watch.inode as</span>
+<span class="cm"> * a hash function.						RCU, hash_lock</span>
+<span class="cm"> *</span>
+<span class="cm"> * tree is refcounted; one reference for &quot;some rules on rules_list refer to</span>
+<span class="cm"> * it&quot;, one for each chunk with pointer to it.</span>
+<span class="cm"> *</span>
+<span class="cm"> * chunk is refcounted by embedded fsnotify_mark + .refs (non-zero refcount</span>
+<span class="cm"> * of watch contributes 1 to .refs).</span>
+<span class="cm"> *</span>
+<span class="cm"> * node.index allows to get from node.list to containing chunk.</span>
+<span class="cm"> * MSB of that sucker is stolen to mark taggings that we might have to</span>
+<span class="cm"> * revert - several operations have very unpleasant cleanup logics and</span>
+<span class="cm"> * that makes a difference.  Some.</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">audit_tree_group</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="nf">alloc_tree</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">s</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+
+	<span class="n">tree</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span><span class="p">)</span> <span class="o">+</span> <span class="n">strlen</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tree</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">);</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">);</span>
+		<span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">strcpy</span><span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">,</span> <span class="n">s</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">tree</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">get_tree</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">put_tree</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">))</span>
+		<span class="n">kfree_rcu</span><span class="p">(</span><span class="n">tree</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* to avoid bringing the entire thing in audit.h */</span>
+<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="nf">audit_tree_path</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">owner</span><span class="p">)</span>
+			<span class="n">put_tree</span><span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">owner</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_put_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_long_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">))</span>
+		<span class="n">free_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__put_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">rcu_head</span> <span class="o">*</span><span class="n">rcu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">rcu</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+	<span class="n">audit_put_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_tree_destroy_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+	<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span> <span class="n">__put_chunk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="nf">alloc_chunk</span><span class="p">(</span><span class="kt">int</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">owners</span><span class="p">)</span> <span class="o">+</span> <span class="n">count</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">node</span><span class="p">);</span>
+	<span class="n">chunk</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">chunk</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+	<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">count</span><span class="p">;</span>
+	<span class="n">atomic_long_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fsnotify_init_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">,</span> <span class="n">audit_tree_destroy_watch</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">chunk</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">enum</span> <span class="p">{</span><span class="n">HASH_SIZE</span> <span class="o">=</span> <span class="mi">128</span><span class="p">};</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="n">chunk_hash_heads</span><span class="p">[</span><span class="n">HASH_SIZE</span><span class="p">];</span>
+<span class="k">static</span> <span class="n">__cacheline_aligned_in_smp</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">hash_lock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="nf">chunk_hash</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">n</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">inode</span> <span class="o">/</span> <span class="n">L1_CACHE_BYTES</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">chunk_hash_heads</span> <span class="o">+</span> <span class="n">n</span> <span class="o">%</span> <span class="n">HASH_SIZE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* hash_lock &amp; entry-&gt;lock is held by caller */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">insert_hash</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">list</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">list</span> <span class="o">=</span> <span class="n">chunk_hash</span><span class="p">(</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">list_add_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* called under rcu_read_lock */</span>
+<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="nf">audit_tree_lookup</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">list</span> <span class="o">=</span> <span class="n">chunk_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_rcu</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">list</span><span class="p">,</span> <span class="n">hash</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* mark.inode may have gone NULL, but who cares? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">.</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span> <span class="o">==</span> <span class="n">inode</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">atomic_long_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">audit_tree_match</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">n</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">owner</span> <span class="o">==</span> <span class="n">tree</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* tagging and untagging inodes with trees */</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="nf">find_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">);</span>
+	<span class="n">p</span> <span class="o">-=</span> <span class="n">index</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">container_of</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">owners</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">untag_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">find_chunk</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">new</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">owner</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">size</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">;</span>
+
+	<span class="n">fsnotify_get_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span><span class="p">)</span>
+		<span class="n">new</span> <span class="o">=</span> <span class="n">alloc_chunk</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">||</span> <span class="o">!</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">new</span><span class="p">)</span>
+			<span class="n">free_chunk</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">owner</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">==</span> <span class="n">chunk</span><span class="p">)</span>
+			<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">new</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">Fallback</span><span class="p">;</span>
+
+	<span class="n">fsnotify_duplicate_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">,</span> <span class="n">entry</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsnotify_add_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">,</span> <span class="n">new</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">.</span><span class="n">group</span><span class="p">,</span> <span class="n">new</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">.</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">free_chunk</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">Fallback</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">==</span> <span class="n">chunk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">);</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;=</span> <span class="n">size</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">,</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">s</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">j</span><span class="p">]</span> <span class="o">==</span> <span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">i</span><span class="o">--</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">s</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">owner</span><span class="p">;</span>
+		<span class="n">new</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">owner</span> <span class="o">=</span> <span class="n">s</span><span class="p">;</span>
+		<span class="n">new</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">index</span> <span class="o">-</span> <span class="n">j</span> <span class="o">+</span> <span class="n">i</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="p">)</span> <span class="cm">/* result of earlier fallback */</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">get_tree</span><span class="p">(</span><span class="n">s</span><span class="p">);</span>
+		<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">list_replace_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">owner</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">,</span> <span class="n">same_root</span><span class="p">)</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">new</span><span class="p">;</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+	<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+	<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+<span class="nl">Fallback:</span></pre></div></td></tr>
+
+
+<tr id="section-2"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-2">&#182;</a></div><p>do the best we can</p></td><td class="code"><div class="highlight"><pre>	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">==</span> <span class="n">chunk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">);</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">owner</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">put_tree</span><span class="p">(</span><span class="n">owner</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">create_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">alloc_chunk</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">chunk</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">entry</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsnotify_add_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="n">audit_tree_group</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">free_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOSPC</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1U</span> <span class="o">&lt;&lt;</span> <span class="mi">31</span><span class="p">);</span>
+	<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">owner</span> <span class="o">=</span> <span class="n">tree</span><span class="p">;</span>
+	<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">;</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">insert_hash</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* the first tagged inode becomes root of tree */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tag_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">old_entry</span><span class="p">,</span> <span class="o">*</span><span class="n">chunk_entry</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">owner</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">,</span> <span class="o">*</span><span class="n">old</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">n</span><span class="p">;</span>
+
+	<span class="n">old_entry</span> <span class="o">=</span> <span class="n">fsnotify_find_inode_mark</span><span class="p">(</span><span class="n">audit_tree_group</span><span class="p">,</span> <span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">old_entry</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">create_chunk</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">tree</span><span class="p">);</span>
+
+	<span class="n">old</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">old_entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+
+	<span class="cm">/* are we already there? */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">owner</span> <span class="o">==</span> <span class="n">tree</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+			<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="n">chunk</span> <span class="o">=</span> <span class="n">alloc_chunk</span><span class="p">(</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">chunk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">chunk_entry</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* old_entry is being shot, lets just lie */</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+		<span class="n">free_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">fsnotify_duplicate_mark</span><span class="p">(</span><span class="n">chunk_entry</span><span class="p">,</span> <span class="n">old_entry</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsnotify_add_mark</span><span class="p">(</span><span class="n">chunk_entry</span><span class="p">,</span> <span class="n">chunk_entry</span><span class="o">-&gt;</span><span class="n">group</span><span class="p">,</span> <span class="n">chunk_entry</span><span class="o">-&gt;</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">free_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOSPC</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* even though we hold old_entry-&gt;lock, this is safe since chunk_entry-&gt;lock could NEVER have been grabbed before */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="cm">/* we now hold old_entry-&gt;lock, chunk_entry-&gt;lock, and hash_lock */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="n">chunk_entry</span><span class="p">);</span>
+
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">chunk_entry</span><span class="p">);</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">,</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">s</span> <span class="o">=</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">owner</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">owner</span> <span class="o">=</span> <span class="n">s</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">=</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">index</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="p">)</span> <span class="cm">/* result of fallback in untag */</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">get_tree</span><span class="p">(</span><span class="n">s</span><span class="p">);</span>
+		<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">);</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">owner</span> <span class="o">=</span> <span class="n">tree</span><span class="p">;</span>
+	<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">);</span>
+	<span class="n">list_replace_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">owner</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">,</span> <span class="n">same_root</span><span class="p">)</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">;</span>
+	<span class="n">old</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">;</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">old_entry</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span>
+	<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span> <span class="cm">/* pair to fsnotify_find mark_entry */</span>
+	<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">old_entry</span><span class="p">);</span> <span class="cm">/* and kill it */</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">kill_rules</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">rule</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_entry</span> <span class="o">*</span><span class="n">entry</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_buffer</span> <span class="o">*</span><span class="n">ab</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">rule</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">,</span> <span class="n">rlist</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">entry</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">rule</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_entry</span><span class="p">,</span> <span class="n">rule</span><span class="p">);</span>
+
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* not a half-baked one */</span>
+			<span class="n">ab</span> <span class="o">=</span> <span class="n">audit_log_start</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">AUDIT_CONFIG_CHANGE</span><span class="p">);</span>
+			<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot;op=&quot;</span><span class="p">);</span>
+			<span class="n">audit_log_string</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot;remove rule&quot;</span><span class="p">);</span>
+			<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot; dir=&quot;</span><span class="p">);</span>
+			<span class="n">audit_log_untrustedstring</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">);</span>
+			<span class="n">audit_log_key</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">filterkey</span><span class="p">);</span>
+			<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot; list=%d res=1&quot;</span><span class="p">,</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">listnr</span><span class="p">);</span>
+			<span class="n">audit_log_end</span><span class="p">(</span><span class="n">ab</span><span class="p">);</span>
+			<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">rcu</span><span class="p">,</span> <span class="n">audit_free_rule_rcu</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * finish killing struct audit_tree</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">prune_one</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">victim</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">victim</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+
+		<span class="n">p</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">victim</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">node</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+
+		<span class="n">untag_chunk</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">put_tree</span><span class="p">(</span><span class="n">victim</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* trim the uncommitted chunks from tree */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">trim_marked</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="o">*</span><span class="n">q</span><span class="p">;</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* reorder */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">.</span><span class="n">next</span><span class="p">;</span> <span class="n">p</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">;</span> <span class="n">p</span> <span class="o">=</span> <span class="n">q</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">node</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="k">struct</span> <span class="n">node</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">q</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;</span> <span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+
+		<span class="n">node</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">node</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+
+		<span class="cm">/* have we run out of marked? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;</span> <span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">)))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">untag_chunk</span><span class="p">(</span><span class="n">node</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+		<span class="n">kill_rules</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+		<span class="n">prune_one</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">audit_schedule_prune</span><span class="p">(</span><span class="kt">void</span><span class="p">);</span>
+
+<span class="cm">/* called with audit_filter_mutex */</span>
+<span class="kt">int</span> <span class="nf">audit_remove_tree_rule</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">rule</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+	<span class="n">tree</span> <span class="o">=</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tree</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">tree</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">);</span>
+			<span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">prune_list</span><span class="p">);</span>
+			<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+			<span class="n">audit_schedule_prune</span><span class="p">();</span>
+			<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">compare_root</span><span class="p">(</span><span class="k">struct</span> <span class="n">vfsmount</span> <span class="o">*</span><span class="n">mnt</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">mnt</span><span class="o">-&gt;</span><span class="n">mnt_root</span><span class="o">-&gt;</span><span class="n">d_inode</span> <span class="o">==</span> <span class="n">arg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_trim_trees</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">cursor</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">cursor</span><span class="p">.</span><span class="n">next</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">path</span> <span class="n">path</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">vfsmount</span> <span class="o">*</span><span class="n">root_mnt</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+		<span class="n">tree</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">cursor</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+		<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path</span><span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">skip_it</span><span class="p">;</span>
+
+		<span class="n">root_mnt</span> <span class="o">=</span> <span class="n">collect_mounts</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+		<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">root_mnt</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">skip_it</span><span class="p">;</span>
+
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">find_chunk</span><span class="p">(</span><span class="n">node</span><span class="p">);</span>
+			<span class="cm">/* this could be NULL if the watch is dying else where... */</span>
+			<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">.</span><span class="n">i</span><span class="p">.</span><span class="n">inode</span><span class="p">;</span>
+			<span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">|=</span> <span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">iterate_mounts</span><span class="p">(</span><span class="n">compare_root</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">root_mnt</span><span class="p">))</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">trim_marked</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">drop_collected_mounts</span><span class="p">(</span><span class="n">root_mnt</span><span class="p">);</span>
+<span class="nl">skip_it:</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">audit_make_tree</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">rule</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">pathname</span><span class="p">,</span> <span class="n">u32</span> <span class="n">op</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">pathname</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="sc">&#39;/&#39;</span> <span class="o">||</span>
+	    <span class="n">rule</span><span class="o">-&gt;</span><span class="n">listnr</span> <span class="o">!=</span> <span class="n">AUDIT_FILTER_EXIT</span> <span class="o">||</span>
+	    <span class="n">op</span> <span class="o">!=</span> <span class="n">Audit_equal</span> <span class="o">||</span>
+	    <span class="n">rule</span><span class="o">-&gt;</span><span class="n">inode_f</span> <span class="o">||</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">watch</span> <span class="o">||</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="n">alloc_tree</span><span class="p">(</span><span class="n">pathname</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_put_tree</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tag_mount</span><span class="p">(</span><span class="k">struct</span> <span class="n">vfsmount</span> <span class="o">*</span><span class="n">mnt</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tag_chunk</span><span class="p">(</span><span class="n">mnt</span><span class="o">-&gt;</span><span class="n">mnt_root</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">,</span> <span class="n">arg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* called with audit_filter_mutex */</span>
+<span class="kt">int</span> <span class="nf">audit_add_tree_rule</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">rule</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">seed</span> <span class="o">=</span> <span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">,</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">path</span> <span class="n">path</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vfsmount</span> <span class="o">*</span><span class="n">mnt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">tree</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">(</span><span class="n">seed</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">,</span> <span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">put_tree</span><span class="p">(</span><span class="n">seed</span><span class="p">);</span>
+			<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="n">tree</span><span class="p">;</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">tree</span> <span class="o">=</span> <span class="n">seed</span><span class="p">;</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+	<span class="cm">/* do not set rule-&gt;tree yet */</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path</span><span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">Err</span><span class="p">;</span>
+	<span class="n">mnt</span> <span class="o">=</span> <span class="n">collect_mounts</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+	<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mnt</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">Err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">iterate_mounts</span><span class="p">(</span><span class="n">tag_mount</span><span class="p">,</span> <span class="n">tree</span><span class="p">,</span> <span class="n">mnt</span><span class="p">);</span>
+	<span class="n">drop_collected_mounts</span><span class="p">(</span><span class="n">mnt</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+			<span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">trim_marked</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">Err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">rule</span><span class="o">-&gt;</span><span class="n">tree</span> <span class="o">=</span> <span class="n">tree</span><span class="p">;</span>
+	<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">Err:</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+	<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">audit_tag_tree</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">old</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">new</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">cursor</span><span class="p">,</span> <span class="n">barrier</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">failed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">path</span> <span class="n">path1</span><span class="p">,</span> <span class="n">path2</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vfsmount</span> <span class="o">*</span><span class="n">tagged</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path</span><span class="p">(</span><span class="n">new</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+	<span class="n">tagged</span> <span class="o">=</span> <span class="n">collect_mounts</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+	<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tagged</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path</span><span class="p">(</span><span class="n">old</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">drop_collected_mounts</span><span class="p">(</span><span class="n">tagged</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">barrier</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">barrier</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">cursor</span><span class="p">.</span><span class="n">next</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">good_one</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">tree</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">cursor</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+		<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path</span><span class="p">(</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">pathname</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">good_one</span> <span class="o">=</span> <span class="n">path_is_under</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+			<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path2</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">good_one</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+			<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">failed</span> <span class="o">=</span> <span class="n">iterate_mounts</span><span class="p">(</span><span class="n">tag_mount</span><span class="p">,</span> <span class="n">tree</span><span class="p">,</span> <span class="n">tagged</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">failed</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+			<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">goner</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">barrier</span><span class="p">.</span><span class="n">prev</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">tree_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">tree</span><span class="p">;</span>
+
+		<span class="n">tree</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">barrier</span><span class="p">.</span><span class="n">prev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">get_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">barrier</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">failed</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">node</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+			<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+			<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tree</span><span class="o">-&gt;</span><span class="n">chunks</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="mi">1U</span><span class="o">&lt;&lt;</span><span class="mi">31</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">trim_marked</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">put_tree</span><span class="p">(</span><span class="n">tree</span><span class="p">);</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">barrier</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cursor</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path1</span><span class="p">);</span>
+	<span class="n">drop_collected_mounts</span><span class="p">(</span><span class="n">tagged</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">failed</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * That gets run when evict_chunk() ends up needing to kill audit_tree.</span>
+<span class="cm"> * Runs from a separate thread.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">prune_tree_thread</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">unused</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_cmd_mutex</span><span class="p">);</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">prune_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">victim</span><span class="p">;</span>
+
+		<span class="n">victim</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">prune_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">victim</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+		<span class="n">prune_one</span><span class="p">(</span><span class="n">victim</span><span class="p">);</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_cmd_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_schedule_prune</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kthread_run</span><span class="p">(</span><span class="n">prune_tree_thread</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="s">&quot;audit_prune_tree&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * ... and that one is done if evict_chunk() decides to delay until the end</span>
+<span class="cm"> * of syscall.  Runs synchronously.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">audit_kill_trees</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">list</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_cmd_mutex</span><span class="p">);</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">victim</span><span class="p">;</span>
+
+		<span class="n">victim</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">list</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">kill_rules</span><span class="p">(</span><span class="n">victim</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">victim</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+		<span class="n">prune_one</span><span class="p">(</span><span class="n">victim</span><span class="p">);</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_cmd_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *  Here comes the stuff asynchronous to auditctl operations</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">evict_chunk</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_tree</span> <span class="o">*</span><span class="n">owner</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">postponed</span> <span class="o">=</span> <span class="n">audit_killed_trees</span><span class="p">();</span>
+	<span class="kt">int</span> <span class="n">need_prune</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">n</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">chunk</span><span class="o">-&gt;</span><span class="n">dead</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">owner</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">trees</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">audit_tree</span><span class="p">,</span> <span class="n">same_root</span><span class="p">);</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">goner</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">owner</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">same_root</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">postponed</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kill_rules</span><span class="p">(</span><span class="n">owner</span><span class="p">);</span>
+			<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">prune_list</span><span class="p">);</span>
+			<span class="n">need_prune</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">owner</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">postponed</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">chunk</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk</span><span class="o">-&gt;</span><span class="n">owners</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">need_prune</span><span class="p">)</span>
+		<span class="n">audit_schedule_prune</span><span class="p">();</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">audit_tree_handle_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">inode_mark</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">vfsmonut_mark</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">fsnotify_event</span> <span class="o">*</span><span class="n">event</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG</span><span class="p">();</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EOPNOTSUPP</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_tree_freeing_mark</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">group</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_chunk</span> <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_chunk</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+
+	<span class="n">evict_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">);</span>
+	<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">audit_tree_send_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span>
+				  <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">inode_mark</span><span class="p">,</span>
+				  <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">vfsmount_mark</span><span class="p">,</span>
+				  <span class="n">__u32</span> <span class="n">mask</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">int</span> <span class="n">data_type</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">fsnotify_ops</span> <span class="n">audit_tree_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">handle_event</span> <span class="o">=</span> <span class="n">audit_tree_handle_event</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">should_send_event</span> <span class="o">=</span> <span class="n">audit_tree_send_event</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_group_priv</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_event_priv</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">freeing_mark</span> <span class="o">=</span> <span class="n">audit_tree_freeing_mark</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">audit_tree_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">audit_tree_group</span> <span class="o">=</span> <span class="n">fsnotify_alloc_group</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_tree_ops</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">audit_tree_group</span><span class="p">))</span>
+		<span class="n">audit_panic</span><span class="p">(</span><span class="s">&quot;cannot initialize fsnotify group for rectree watches&quot;</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">HASH_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chunk_hash_heads</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">__initcall</span><span class="p">(</span><span class="n">audit_tree_init</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

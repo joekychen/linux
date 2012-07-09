@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › sunrpc › svc_xprt.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>svc_xprt.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * linux/net/sunrpc/svc_xprt.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * Author: Tom Tucker &lt;tom@opengridcomputing.com&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;net/sock.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/stats.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/svc_xprt.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/svcsock.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/xprt.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+
+<span class="cp">#define RPCDBG_FACILITY	RPCDBG_SVCXPRT</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">svc_deferred_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">svc_deferred_recv</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cache_deferred_req</span> <span class="o">*</span><span class="n">svc_defer</span><span class="p">(</span><span class="k">struct</span> <span class="n">cache_req</span> <span class="o">*</span><span class="n">req</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">svc_age_temp_xprts</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">closure</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">svc_delete_xprt</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">);</span>
+
+<span class="cm">/* apparently the &quot;standard&quot; is that clients close</span>
+<span class="cm"> * idle connections after 5 minutes, servers after</span>
+<span class="cm"> * 6 minutes</span>
+<span class="cm"> *   http://www.connectathon.org/talks96/nfstcp.pdf</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">svc_conn_age_period</span> <span class="o">=</span> <span class="mi">6</span><span class="o">*</span><span class="mi">60</span><span class="p">;</span>
+
+<span class="cm">/* List of registered transport classes */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">svc_xprt_class_list</span><span class="p">);</span>
+
+<span class="cm">/* SMP locking strategy:</span>
+<span class="cm"> *</span>
+<span class="cm"> *	svc_pool-&gt;sp_lock protects most of the fields of that pool.</span>
+<span class="cm"> *	svc_serv-&gt;sv_lock protects sv_tempsocks, sv_permsocks, sv_tmpcnt.</span>
+<span class="cm"> *	when both need to be taken (rare), svc_serv-&gt;sv_lock is first.</span>
+<span class="cm"> *	BKL protects svc_serv-&gt;sv_nrthread.</span>
+<span class="cm"> *	svc_sock-&gt;sk_lock protects the svc_sock-&gt;sk_deferred list</span>
+<span class="cm"> *             and the -&gt;sk_info_authunix cache.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	The XPT_BUSY bit in xprt-&gt;xpt_flags prevents a transport being</span>
+<span class="cm"> *	enqueued multiply. During normal transport processing this bit</span>
+<span class="cm"> *	is set by svc_xprt_enqueue and cleared by svc_xprt_received.</span>
+<span class="cm"> *	Providers should not manipulate this bit directly.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Some flags can be set to certain values at any time</span>
+<span class="cm"> *	providing that certain rules are followed:</span>
+<span class="cm"> *</span>
+<span class="cm"> *	XPT_CONN, XPT_DATA:</span>
+<span class="cm"> *		- Can be set or cleared at any time.</span>
+<span class="cm"> *		- After a set, svc_xprt_enqueue must be called to enqueue</span>
+<span class="cm"> *		  the transport for processing.</span>
+<span class="cm"> *		- After a clear, the transport must be read/accepted.</span>
+<span class="cm"> *		  If this succeeds, it must be set again.</span>
+<span class="cm"> *	XPT_CLOSE:</span>
+<span class="cm"> *		- Can set at any time. It is never cleared.</span>
+<span class="cm"> *      XPT_DEAD:</span>
+<span class="cm"> *		- Can only be set while XPT_BUSY is held which ensures</span>
+<span class="cm"> *		  that no other thread will be using the transport or will</span>
+<span class="cm"> *		  try to set XPT_DEAD.</span>
+<span class="cm"> */</span>
+
+<span class="kt">int</span> <span class="nf">svc_reg_xprt_class</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">cl</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">res</span> <span class="o">=</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: Adding svc transport class &#39;%s&#39;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">);</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_list</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="cm">/* Make sure there isn&#39;t already a class with the same name */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">cl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc_xprt_class_list</span><span class="p">,</span> <span class="n">xcl_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">,</span> <span class="n">cl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc_xprt_class_list</span><span class="p">);</span>
+	<span class="n">res</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">res</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_reg_xprt_class</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">svc_unreg_xprt_class</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: Removing svc transport class &#39;%s&#39;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_unreg_xprt_class</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Format the transport list for printing</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">svc_print_xprts</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">maxlen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">tmpstr</span><span class="p">[</span><span class="mi">80</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">buf</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="sc">&#39;\0&#39;</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xcl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc_xprt_class_list</span><span class="p">,</span> <span class="n">xcl_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">slen</span><span class="p">;</span>
+
+		<span class="n">sprintf</span><span class="p">(</span><span class="n">tmpstr</span><span class="p">,</span> <span class="s">&quot;%s %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">,</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_max_payload</span><span class="p">);</span>
+		<span class="n">slen</span> <span class="o">=</span> <span class="n">strlen</span><span class="p">(</span><span class="n">tmpstr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">+</span> <span class="n">slen</span> <span class="o">&gt;</span> <span class="n">maxlen</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">+=</span> <span class="n">slen</span><span class="p">;</span>
+		<span class="n">strcat</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">tmpstr</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_xprt_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">kref</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xprt</span><span class="p">,</span> <span class="n">xpt_ref</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">module</span> <span class="o">*</span><span class="n">owner</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_class</span><span class="o">-&gt;</span><span class="n">xcl_owner</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_CACHE_AUTH</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="n">svcauth_unix_info_release</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">put_net</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span><span class="p">);</span>
+	<span class="cm">/* See comment on corresponding get in xs_setup_bc_tcp(): */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_bc_xprt</span><span class="p">)</span>
+		<span class="n">xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_bc_xprt</span><span class="p">);</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_free</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">module_put</span><span class="p">(</span><span class="n">owner</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">svc_xprt_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ref</span><span class="p">,</span> <span class="n">svc_xprt_free</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_put</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called by transport drivers to initialize the transport independent</span>
+<span class="cm"> * portion of the transport instance.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_xprt_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">,</span>
+		   <span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">xprt</span><span class="p">));</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_class</span> <span class="o">=</span> <span class="n">xcl</span><span class="p">;</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span> <span class="o">=</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_ops</span><span class="p">;</span>
+	<span class="n">kref_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ref</span><span class="p">);</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_server</span> <span class="o">=</span> <span class="n">serv</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ready</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_deferred</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_users</span><span class="p">);</span>
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_mutex</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="n">rpc_init_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_bc_pending</span><span class="p">,</span> <span class="s">&quot;xpt_bc_pending&quot;</span><span class="p">);</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">=</span> <span class="n">get_net</span><span class="p">(</span><span class="n">net</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_init</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="nf">__svc_xpo_create</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">,</span>
+					 <span class="k">const</span> <span class="kt">int</span> <span class="n">family</span><span class="p">,</span>
+					 <span class="k">const</span> <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">port</span><span class="p">,</span>
+					 <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sockaddr_in</span> <span class="n">sin</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">sin_family</span>		<span class="o">=</span> <span class="n">AF_INET</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sin_addr</span><span class="p">.</span><span class="n">s_addr</span>	<span class="o">=</span> <span class="n">htonl</span><span class="p">(</span><span class="n">INADDR_ANY</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">sin_port</span>		<span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">port</span><span class="p">),</span>
+	<span class="p">};</span>
+<span class="cp">#if IS_ENABLED(CONFIG_IPV6)</span>
+	<span class="k">struct</span> <span class="n">sockaddr_in6</span> <span class="n">sin6</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">sin6_family</span>		<span class="o">=</span> <span class="n">AF_INET6</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sin6_addr</span>		<span class="o">=</span> <span class="n">IN6ADDR_ANY_INIT</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sin6_port</span>		<span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">port</span><span class="p">),</span>
+	<span class="p">};</span>
+<span class="cp">#endif</span>
+	<span class="k">struct</span> <span class="n">sockaddr</span> <span class="o">*</span><span class="n">sap</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">family</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">PF_INET</span>:
+		<span class="n">sap</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sockaddr</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">sin</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sin</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+<span class="cp">#if IS_ENABLED(CONFIG_IPV6)</span>
+	<span class="k">case</span> <span class="n">PF_INET6</span>:
+		<span class="n">sap</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sockaddr</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">sin6</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sin6</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">EAFNOSUPPORT</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_ops</span><span class="o">-&gt;</span><span class="n">xpo_create</span><span class="p">(</span><span class="n">serv</span><span class="p">,</span> <span class="n">net</span><span class="p">,</span> <span class="n">sap</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">svc_create_xprt</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">xprt_name</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">,</span> <span class="k">const</span> <span class="kt">int</span> <span class="n">family</span><span class="p">,</span>
+		    <span class="k">const</span> <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">port</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt_class</span> <span class="o">*</span><span class="n">xcl</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: creating transport %s[%d]</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt_name</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xcl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc_xprt_class_list</span><span class="p">,</span> <span class="n">xcl_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">newxprt</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">newport</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">xprt_name</span><span class="p">,</span> <span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">try_module_get</span><span class="p">(</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_owner</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+		<span class="n">newxprt</span> <span class="o">=</span> <span class="n">__svc_xpo_create</span><span class="p">(</span><span class="n">xcl</span><span class="p">,</span> <span class="n">serv</span><span class="p">,</span> <span class="n">net</span><span class="p">,</span> <span class="n">family</span><span class="p">,</span> <span class="n">port</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">newxprt</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">module_put</span><span class="p">(</span><span class="n">xcl</span><span class="o">-&gt;</span><span class="n">xcl_owner</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">newxprt</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">XPT_TEMP</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">newxprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">newxprt</span><span class="o">-&gt;</span><span class="n">xpt_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_permsocks</span><span class="p">);</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+		<span class="n">newport</span> <span class="o">=</span> <span class="n">svc_xprt_local_port</span><span class="p">(</span><span class="n">newxprt</span><span class="p">);</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">newxprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">newport</span><span class="p">;</span>
+	<span class="p">}</span>
+ <span class="nl">err:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc_xprt_class_lock</span><span class="p">);</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: transport %s not found</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt_name</span><span class="p">);</span>
+
+	<span class="cm">/* This errno is exposed to user space.  Provide a reasonable</span>
+<span class="cm">	 * perror msg for a bad transport. */</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EPROTONOSUPPORT</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_create_xprt</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Copy the local and remote xprt addresses to the rqstp structure</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_xprt_copy_addrs</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_remote</span><span class="p">,</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_remotelen</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addrlen</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_remotelen</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Destination address in request is needed for binding the</span>
+<span class="cm">	 * source address in RPC replies/callbacks later.</span>
+<span class="cm">	 */</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_daddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_local</span><span class="p">,</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_locallen</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_daddrlen</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_locallen</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_copy_addrs</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * svc_print_addr - Format rq_addr field for printing</span>
+<span class="cm"> * @rqstp: svc_rqst struct containing address to print</span>
+<span class="cm"> * @buf: target buffer for formatted address</span>
+<span class="cm"> * @len: length of target buffer</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+<span class="kt">char</span> <span class="o">*</span><span class="nf">svc_print_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">__svc_print_addr</span><span class="p">(</span><span class="n">svc_addr</span><span class="p">(</span><span class="n">rqstp</span><span class="p">),</span> <span class="n">buf</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_print_addr</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Queue up an idle server thread.  Must have pool-&gt;sp_lock held.</span>
+<span class="cm"> * Note: this is really a stack rather than a queue, so that we only</span>
+<span class="cm"> * use as many different threads as we need, and the rest don&#39;t pollute</span>
+<span class="cm"> * the cache.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_thread_enqueue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Dequeue an nfsd thread.  Must have pool-&gt;sp_lock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_thread_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_list</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">svc_xprt_has_something_to_do</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span> <span class="o">&amp;</span> <span class="p">((</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="n">XPT_CONN</span><span class="p">)</span><span class="o">|</span><span class="p">(</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="n">XPT_CLOSE</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span> <span class="o">&amp;</span> <span class="p">((</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="n">XPT_DATA</span><span class="p">)</span><span class="o">|</span><span class="p">(</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="n">XPT_DEFERRED</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_has_wspace</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Queue up a transport with data pending. If there are idle nfsd</span>
+<span class="cm"> * processes, wake &#39;em up.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_xprt_enqueue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span>	<span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_server</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_rqst</span>	<span class="o">*</span><span class="n">rqstp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">svc_xprt_has_something_to_do</span><span class="p">(</span><span class="n">xprt</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">cpu</span> <span class="o">=</span> <span class="n">get_cpu</span><span class="p">();</span>
+	<span class="n">pool</span> <span class="o">=</span> <span class="n">svc_pool_for_cpu</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_server</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="n">put_cpu</span><span class="p">();</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_sockets</span><span class="p">))</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		       <span class="s">&quot;svc_xprt_enqueue: &quot;</span>
+		       <span class="s">&quot;threads and transports both waiting??</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">packets</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="cm">/* Mark transport as busy. It will remain in this state until</span>
+<span class="cm">	 * the provider calls svc_xprt_received. We update XPT_BUSY</span>
+<span class="cm">	 * atomically because it also guards against trying to enqueue</span>
+<span class="cm">	 * the transport twice.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Don&#39;t enqueue transport while already enqueued */</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: transport %p busy, not enqueued</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rqstp</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">svc_rqst</span><span class="p">,</span>
+				   <span class="n">rq_list</span><span class="p">);</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: transport %p served by daemon %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">xprt</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+		<span class="n">svc_thread_dequeue</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">)</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+				<span class="s">&quot;svc_xprt_enqueue: server %p, rq_xprt=%p!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">rqstp</span><span class="p">,</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">);</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span> <span class="o">=</span> <span class="n">xprt</span><span class="p">;</span>
+		<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span> <span class="o">=</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_max_mesg</span><span class="p">;</span>
+		<span class="n">atomic_add</span><span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_reserved</span><span class="p">);</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">threads_woken</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_wait</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: transport %p put into queue</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt</span><span class="p">);</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ready</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_sockets</span><span class="p">);</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">sockets_queued</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out_unlock:</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_enqueue</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Dequeue the first transport.  Must be called with the pool-&gt;sp_lock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="nf">svc_xprt_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span>	<span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_sockets</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">xprt</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_sockets</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">svc_xprt</span><span class="p">,</span> <span class="n">xpt_ready</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ready</span><span class="p">);</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: transport %p dequeued, inuse=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">xprt</span><span class="p">,</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ref</span><span class="p">.</span><span class="n">refcount</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">xprt</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * svc_xprt_received conditionally queues the transport for processing</span>
+<span class="cm"> * by another thread. The caller must hold the XPT_BUSY bit and must</span>
+<span class="cm"> * not thereafter touch transport data.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note: XPT_DATA only gets cleared when a read-attempt finds no (or</span>
+<span class="cm"> * insufficient) data.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_xprt_received</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">));</span>
+	<span class="cm">/* As soon as we clear busy, the xprt could be closed and</span>
+<span class="cm">	 * &#39;put&#39;, so we need a reference to call svc_xprt_enqueue with:</span>
+<span class="cm">	 */</span>
+	<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="n">svc_xprt_enqueue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_received</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * svc_reserve - change the space reserved for the reply to a request.</span>
+<span class="cm"> * @rqstp:  The request in question</span>
+<span class="cm"> * @space: new max space to reserve</span>
+<span class="cm"> *</span>
+<span class="cm"> * Each request reserves some space on the output queue of the transport</span>
+<span class="cm"> * to make sure the reply fits.  This function reduces that reserved</span>
+<span class="cm"> * space to be the amount of space used already, plus @space.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_reserve</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">space</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">space</span> <span class="o">+=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">space</span> <span class="o">&lt;</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">;</span>
+		<span class="n">atomic_sub</span><span class="p">((</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span> <span class="o">-</span> <span class="n">space</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_reserved</span><span class="p">);</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span> <span class="o">=</span> <span class="n">space</span><span class="p">;</span>
+
+		<span class="n">svc_xprt_enqueue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_reserve</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_xprt_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span>	<span class="o">*</span><span class="n">xprt</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">;</span>
+
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_release_rqst</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">svc_free_res_pages</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">page_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">page_base</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* Reset response buffer and release</span>
+<span class="cm">	 * the reservation.</span>
+<span class="cm">	 * But first, check that enough space was reserved</span>
+<span class="cm">	 * for the reply, otherwise we have a bug!</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">len</span><span class="p">)</span> <span class="o">&gt;</span>  <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;RPC request reserved %d but used %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span><span class="p">,</span>
+		       <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">svc_reserve</span><span class="p">(</span><span class="n">rqstp</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * External function to wake up a server waiting for data</span>
+<span class="cm"> * This really only makes sense for services like lockd</span>
+<span class="cm"> * which have exactly one thread anyway.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_wake_up</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_rqst</span>	<span class="o">*</span><span class="n">rqstp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_nrpools</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">rqstp</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_threads</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+					   <span class="k">struct</span> <span class="n">svc_rqst</span><span class="p">,</span>
+					   <span class="n">rq_list</span><span class="p">);</span>
+			<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: daemon %p woken up.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+			<span class="cm">/*</span>
+<span class="cm">			svc_thread_dequeue(pool, rqstp);</span>
+<span class="cm">			rqstp-&gt;rq_xprt = NULL;</span>
+<span class="cm">			 */</span>
+			<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_wait</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_wake_up</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">svc_port_is_privileged</span><span class="p">(</span><span class="k">struct</span> <span class="n">sockaddr</span> <span class="o">*</span><span class="n">sin</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">sin</span><span class="o">-&gt;</span><span class="n">sa_family</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">AF_INET</span>:
+		<span class="k">return</span> <span class="n">ntohs</span><span class="p">(((</span><span class="k">struct</span> <span class="n">sockaddr_in</span> <span class="o">*</span><span class="p">)</span><span class="n">sin</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">sin_port</span><span class="p">)</span>
+			<span class="o">&lt;</span> <span class="n">PROT_SOCK</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">AF_INET6</span>:
+		<span class="k">return</span> <span class="n">ntohs</span><span class="p">(((</span><span class="k">struct</span> <span class="n">sockaddr_in6</span> <span class="o">*</span><span class="p">)</span><span class="n">sin</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">sin6_port</span><span class="p">)</span>
+			<span class="o">&lt;</span> <span class="n">PROT_SOCK</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Make sure that we don&#39;t have too many active connections. If we have,</span>
+<span class="cm"> * something must be dropped. It&#39;s not clear what will happen if we allow</span>
+<span class="cm"> * &quot;too many&quot; connections, but when dealing with network-facing software,</span>
+<span class="cm"> * we have to code defensively. Here we do that by imposing hard limits.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There&#39;s no point in trying to do random drop here for DoS</span>
+<span class="cm"> * prevention. The NFS clients does 1 reconnect in 15 seconds. An</span>
+<span class="cm"> * attacker can easily beat that.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The only somewhat efficient mechanism would be if drop old</span>
+<span class="cm"> * connections from the same IP first. But right now we don&#39;t even</span>
+<span class="cm"> * record the client IP in svc_sock.</span>
+<span class="cm"> *</span>
+<span class="cm"> * single-threaded services that expect a lot of clients will probably</span>
+<span class="cm"> * need to set sv_maxconn to override the default value which is based</span>
+<span class="cm"> * on the number of threads</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_check_conn_limits</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">limit</span> <span class="o">=</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_maxconn</span> <span class="o">?</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_maxconn</span> <span class="o">:</span>
+				<span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_nrthreads</span><span class="o">+</span><span class="mi">3</span><span class="p">)</span> <span class="o">*</span> <span class="mi">20</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tmpcnt</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/* Try to help the admin */</span>
+			<span class="n">net_notice_ratelimited</span><span class="p">(</span><span class="s">&quot;%s: too many open connections, consider increasing the %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					       <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_name</span><span class="p">,</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_maxconn</span> <span class="o">?</span>
+					       <span class="s">&quot;max number of connections&quot;</span> <span class="o">:</span>
+					       <span class="s">&quot;number of threads&quot;</span><span class="p">);</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Always select the oldest connection. It&#39;s not fair,</span>
+<span class="cm">			 * but so is life</span>
+<span class="cm">			 */</span>
+			<span class="n">xprt</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">.</span><span class="n">prev</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">svc_xprt</span><span class="p">,</span>
+					  <span class="n">xpt_list</span><span class="p">);</span>
+			<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_CLOSE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+			<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">svc_xprt_enqueue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+			<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Receive the next request on any transport.  This code is carefully</span>
+<span class="cm"> * organised not to touch any cachelines in the shared svc_serv</span>
+<span class="cm"> * structure, only cachelines in the local svc_pool.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">svc_recv</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="kt">long</span> <span class="n">timeout</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span>		<span class="o">*</span><span class="n">xprt</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span>		<span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_server</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span>		<span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pool</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">len</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">pages</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xdr_buf</span>		<span class="o">*</span><span class="n">arg</span><span class="p">;</span>
+	<span class="n">DECLARE_WAITQUEUE</span><span class="p">(</span><span class="n">wait</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+	<span class="kt">long</span>			<span class="n">time_left</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: server %p waiting for data (to = %ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">rqstp</span><span class="p">,</span> <span class="n">timeout</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+			<span class="s">&quot;svc_recv: service %p, transport not NULL!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			 <span class="n">rqstp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">waitqueue_active</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_wait</span><span class="p">))</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+			<span class="s">&quot;svc_recv: service %p, wait queue active!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			 <span class="n">rqstp</span><span class="p">);</span>
+
+	<span class="cm">/* now allocate needed pages.  If we get a failure, sleep briefly */</span>
+	<span class="n">pages</span> <span class="o">=</span> <span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_max_mesg</span> <span class="o">+</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pages</span> <span class="o">&gt;=</span> <span class="n">RPCSVC_MAXPAGES</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages</span> <span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">signalled</span><span class="p">()</span> <span class="o">||</span> <span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+					<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+					<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+				<span class="p">}</span>
+				<span class="n">schedule_timeout</span><span class="p">(</span><span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="mi">500</span><span class="p">));</span>
+			<span class="p">}</span>
+			<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span><span class="p">[</span><span class="n">i</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span> <span class="cm">/* this might be seen in nfs_read_actor */</span>
+
+	<span class="cm">/* Make arg-&gt;head point to first page and arg-&gt;pages point to rest */</span>
+	<span class="n">arg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_base</span> <span class="o">=</span> <span class="n">page_address</span><span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span> <span class="o">=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">pages</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">page_base</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/* save at least one page for response */</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">page_len</span> <span class="o">=</span> <span class="p">(</span><span class="n">pages</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span><span class="o">*</span><span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="p">(</span><span class="n">pages</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">*</span><span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">arg</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">try_to_freeze</span><span class="p">();</span>
+	<span class="n">cond_resched</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">signalled</span><span class="p">()</span> <span class="o">||</span> <span class="n">kthread_should_stop</span><span class="p">())</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+
+	<span class="cm">/* Normally we will wait up to 5 seconds for any required</span>
+<span class="cm">	 * cache information to be provided.</span>
+<span class="cm">	 */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">.</span><span class="n">thread_wait</span> <span class="o">=</span> <span class="mi">5</span><span class="o">*</span><span class="n">HZ</span><span class="p">;</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+	<span class="n">xprt</span> <span class="o">=</span> <span class="n">svc_xprt_dequeue</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span> <span class="o">=</span> <span class="n">xprt</span><span class="p">;</span>
+		<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span> <span class="o">=</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_max_mesg</span><span class="p">;</span>
+		<span class="n">atomic_add</span><span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_reserved</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_reserved</span><span class="p">);</span>
+
+		<span class="cm">/* As there is a shortage of threads and this request</span>
+<span class="cm">		 * had to be queued, don&#39;t allow the thread to wait so</span>
+<span class="cm">		 * long for cache updates.</span>
+<span class="cm">		 */</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">.</span><span class="n">thread_wait</span> <span class="o">=</span> <span class="mi">1</span><span class="o">*</span><span class="n">HZ</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* No data pending. Go to sleep */</span>
+		<span class="n">svc_thread_enqueue</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * We have to be able to interrupt this wait</span>
+<span class="cm">		 * to bring down the daemons ...</span>
+<span class="cm">		 */</span>
+		<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * checking kthread_should_stop() here allows us to avoid</span>
+<span class="cm">		 * locking and signalling when stopping kthreads that call</span>
+<span class="cm">		 * svc_recv. If the thread has already been woken up, then</span>
+<span class="cm">		 * we can exit here without sleeping. If not, then it</span>
+<span class="cm">		 * it&#39;ll be woken up quickly during the schedule_timeout</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+			<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+			<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">add_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+
+		<span class="n">time_left</span> <span class="o">=</span> <span class="n">schedule_timeout</span><span class="p">(</span><span class="n">timeout</span><span class="p">);</span>
+
+		<span class="n">try_to_freeze</span><span class="p">();</span>
+
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+		<span class="n">remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">time_left</span><span class="p">)</span>
+			<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">threads_timedout</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="n">xprt</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xprt</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">svc_thread_dequeue</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+			<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+			<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: server %p, no data yet</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rqstp</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">signalled</span><span class="p">()</span> <span class="o">||</span> <span class="n">kthread_should_stop</span><span class="p">())</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+			<span class="k">else</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_CLOSE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc_recv: found XPT_CLOSE</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">svc_delete_xprt</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="cm">/* Leave XPT_BUSY set on the dead xprt: */</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_LISTENER</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">newxpt</span><span class="p">;</span>
+		<span class="n">newxpt</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_accept</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">newxpt</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * We know this module_get will succeed because the</span>
+<span class="cm">			 * listener holds a reference too</span>
+<span class="cm">			 */</span>
+			<span class="n">__module_get</span><span class="p">(</span><span class="n">newxpt</span><span class="o">-&gt;</span><span class="n">xpt_class</span><span class="o">-&gt;</span><span class="n">xcl_owner</span><span class="p">);</span>
+			<span class="n">svc_check_conn_limits</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_server</span><span class="p">);</span>
+			<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+			<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_TEMP</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">newxpt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">newxpt</span><span class="o">-&gt;</span><span class="n">xpt_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">);</span>
+			<span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tmpcnt</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_temptimer</span><span class="p">.</span><span class="n">function</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/* setup timer to age temp transports */</span>
+				<span class="n">setup_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_temptimer</span><span class="p">,</span>
+					    <span class="n">svc_age_temp_xprts</span><span class="p">,</span>
+					    <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">serv</span><span class="p">);</span>
+				<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_temptimer</span><span class="p">,</span>
+					  <span class="n">jiffies</span> <span class="o">+</span> <span class="n">svc_conn_age_period</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+			<span class="n">svc_xprt_received</span><span class="p">(</span><span class="n">newxpt</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_has_wspace</span><span class="p">(</span><span class="n">xprt</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: server %p, pool %u, transport %p, inuse=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">rqstp</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_id</span><span class="p">,</span> <span class="n">xprt</span><span class="p">,</span>
+			<span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ref</span><span class="p">.</span><span class="n">refcount</span><span class="p">));</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span> <span class="o">=</span> <span class="n">svc_deferred_dequeue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span><span class="p">)</span>
+			<span class="n">len</span> <span class="o">=</span> <span class="n">svc_deferred_recv</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">len</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_recvfrom</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: got len=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">svc_xprt_received</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+
+	<span class="cm">/* No data, incomplete (TCP) read, or accept() */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">len</span> <span class="o">==</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">XPT_OLD</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_secure</span> <span class="o">=</span> <span class="n">svc_port_is_privileged</span><span class="p">(</span><span class="n">svc_addr</span><span class="p">(</span><span class="n">rqstp</span><span class="p">));</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">.</span><span class="n">defer</span> <span class="o">=</span> <span class="n">svc_defer</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_stats</span><span class="p">)</span>
+		<span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_stats</span><span class="o">-&gt;</span><span class="n">netcnt</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">svc_xprt_release</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_recv</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Drop request</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">svc_drop</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: xprt %p dropped request</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">);</span>
+	<span class="n">svc_xprt_release</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_drop</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return reply to client.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">svc_send</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span>	<span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xdr_buf</span>	<span class="o">*</span><span class="n">xb</span><span class="p">;</span>
+
+	<span class="n">xprt</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xprt</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+	<span class="cm">/* release the receive skb before sending the reply */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_release_rqst</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+
+	<span class="cm">/* calculate over-all length */</span>
+	<span class="n">xb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_res</span><span class="p">;</span>
+	<span class="n">xb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">xb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span> <span class="o">+</span>
+		<span class="n">xb</span><span class="o">-&gt;</span><span class="n">page_len</span> <span class="o">+</span>
+		<span class="n">xb</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span><span class="p">;</span>
+
+	<span class="cm">/* Grab mutex to serialize outgoing data. */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_mutex</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_DEAD</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOTCONN</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_sendto</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_mutex</span><span class="p">);</span>
+	<span class="n">rpc_wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_bc_pending</span><span class="p">);</span>
+	<span class="n">svc_xprt_release</span><span class="p">(</span><span class="n">rqstp</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">==</span> <span class="o">-</span><span class="n">ECONNREFUSED</span> <span class="o">||</span> <span class="n">len</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOTCONN</span> <span class="o">||</span> <span class="n">len</span> <span class="o">==</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Timer function to close old temporary transports, using</span>
+<span class="cm"> * a mark-and-sweep algorithm.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_age_temp_xprts</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">closure</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="p">)</span><span class="n">closure</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">le</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">to_be_aged</span><span class="p">);</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc_age_temp_xprts</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">spin_trylock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* busy, try again 1 sec later */</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc_age_temp_xprts: busy</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_temptimer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">HZ</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_safe</span><span class="p">(</span><span class="n">le</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">xprt</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">le</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xprt</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">);</span>
+
+		<span class="cm">/* First time through, just mark it OLD. Second time</span>
+<span class="cm">		 * through, close it. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">XPT_OLD</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ref</span><span class="p">.</span><span class="n">refcount</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="o">||</span>
+		    <span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="n">list_move</span><span class="p">(</span><span class="n">le</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">to_be_aged</span><span class="p">);</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_CLOSE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_DETACHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">to_be_aged</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">le</span> <span class="o">=</span> <span class="n">to_be_aged</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+		<span class="cm">/* fiddling the xpt_list node is safe &#39;cos we&#39;re XPT_DETACHED */</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="n">le</span><span class="p">);</span>
+		<span class="n">xprt</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">le</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xprt</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">);</span>
+
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;queuing xprt %p for closing</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt</span><span class="p">);</span>
+
+		<span class="cm">/* a thread will dequeue and close it soon */</span>
+		<span class="n">svc_xprt_enqueue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_temptimer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">svc_conn_age_period</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">call_xpt_users</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xpt_user</span> <span class="o">*</span><span class="n">u</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_users</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">u</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_users</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_xpt_user</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">u</span><span class="o">-&gt;</span><span class="n">callback</span><span class="p">(</span><span class="n">u</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Remove a dead transport</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_delete_xprt</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span>	<span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_server</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">dr</span><span class="p">;</span>
+
+	<span class="cm">/* Only do this once */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">XPT_DEAD</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="n">BUG</span><span class="p">();</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc: svc_delete_xprt(%p)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">xprt</span><span class="p">);</span>
+	<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ops</span><span class="o">-&gt;</span><span class="n">xpo_detach</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">XPT_DETACHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_list</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ready</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_TEMP</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tmpcnt</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">dr</span> <span class="o">=</span> <span class="n">svc_deferred_dequeue</span><span class="p">(</span><span class="n">xprt</span><span class="p">))</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">dr</span><span class="p">);</span>
+
+	<span class="n">call_xpt_users</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">svc_close_xprt</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_CLOSE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="cm">/* someone else will have to effect the close */</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * We expect svc_close_xprt() to work even when no threads are</span>
+<span class="cm">	 * running (e.g., while configuring the server before starting</span>
+<span class="cm">	 * any threads), so if the transport isn&#39;t busy, we delete</span>
+<span class="cm">	 * it ourself:</span>
+<span class="cm">	 */</span>
+	<span class="n">svc_delete_xprt</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_close_xprt</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_close_list</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">xprt_list</span><span class="p">,</span> <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="n">xprt_list</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">!=</span> <span class="n">net</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_CLOSE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_clear_pools</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_nrpools</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_sockets</span><span class="p">,</span> <span class="n">xpt_ready</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">!=</span> <span class="n">net</span><span class="p">)</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_ready</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_clear_list</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">xprt_list</span><span class="p">,</span> <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="n">xprt_list</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">!=</span> <span class="n">net</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">svc_delete_xprt</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="n">xprt_list</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">==</span> <span class="n">net</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">svc_close_net</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">svc_close_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">,</span> <span class="n">net</span><span class="p">);</span>
+	<span class="n">svc_close_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_permsocks</span><span class="p">,</span> <span class="n">net</span><span class="p">);</span>
+
+	<span class="n">svc_clear_pools</span><span class="p">(</span><span class="n">serv</span><span class="p">,</span> <span class="n">net</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * At this point the sp_sockets lists will stay empty, since</span>
+<span class="cm">	 * svc_xprt_enqueue will not add new entries without taking the</span>
+<span class="cm">	 * sp_lock and checking XPT_BUSY.</span>
+<span class="cm">	 */</span>
+	<span class="n">svc_clear_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_tempsocks</span><span class="p">,</span> <span class="n">net</span><span class="p">);</span>
+	<span class="n">svc_clear_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_permsocks</span><span class="p">,</span> <span class="n">net</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Handle defer and revisit of requests</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_revisit</span><span class="p">(</span><span class="k">struct</span> <span class="n">cache_deferred_req</span> <span class="o">*</span><span class="n">dreq</span><span class="p">,</span> <span class="kt">int</span> <span class="n">too_many</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">dr</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">dreq</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_deferred_req</span><span class="p">,</span> <span class="n">handle</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span> <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">XPT_DEFERRED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">too_many</span> <span class="o">||</span> <span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_DEAD</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;revisit canceled</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">dr</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;revisit queued</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">handle</span><span class="p">.</span><span class="n">recent</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_deferred</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="n">svc_xprt_enqueue</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+	<span class="n">svc_xprt_put</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Save the request off for later processing. The request buffer looks</span>
+<span class="cm"> * like this:</span>
+<span class="cm"> *</span>
+<span class="cm"> * &lt;xprt-header&gt;&lt;rpc-header&gt;&lt;rpc-pagelist&gt;&lt;rpc-tail&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This code can only handle requests that consist of an xprt-header</span>
+<span class="cm"> * and rpc-header.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cache_deferred_req</span> <span class="o">*</span><span class="nf">svc_defer</span><span class="p">(</span><span class="k">struct</span> <span class="n">cache_req</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="k">struct</span> <span class="n">svc_rqst</span><span class="p">,</span> <span class="n">rq_chandle</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">dr</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">page_len</span> <span class="o">||</span> <span class="o">!</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_usedeferral</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span> <span class="cm">/* if more than a page, give up FIXME */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dr</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span><span class="p">;</span>
+		<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="kt">size_t</span> <span class="n">skip</span><span class="p">;</span>
+		<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+		<span class="cm">/* FIXME maybe discard if size too large */</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_deferred_req</span><span class="p">)</span> <span class="o">+</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+		<span class="n">dr</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dr</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">handle</span><span class="p">.</span><span class="n">owner</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_server</span><span class="p">;</span>
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">prot</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_prot</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addr</span><span class="p">,</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addrlen</span><span class="p">);</span>
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">addrlen</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addrlen</span><span class="p">;</span>
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">daddr</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_daddr</span><span class="p">;</span>
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">argslen</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">len</span> <span class="o">&gt;&gt;</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt_hlen</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt_hlen</span><span class="p">;</span>
+
+		<span class="cm">/* back up head to the start of the buffer and copy */</span>
+		<span class="n">skip</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">len</span> <span class="o">-</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">args</span><span class="p">,</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_base</span> <span class="o">-</span> <span class="n">skip</span><span class="p">,</span>
+		       <span class="n">dr</span><span class="o">-&gt;</span><span class="n">argslen</span> <span class="o">&lt;&lt;</span> <span class="mi">2</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">);</span>
+	<span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_dropme</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="n">dr</span><span class="o">-&gt;</span><span class="n">handle</span><span class="p">.</span><span class="n">revisit</span> <span class="o">=</span> <span class="n">svc_revisit</span><span class="p">;</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">handle</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * recv data from a deferred request into an active one</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">svc_deferred_recv</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">dr</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_deferred</span><span class="p">;</span>
+
+	<span class="cm">/* setup iov_base past transport header */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_base</span> <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">args</span> <span class="o">+</span> <span class="p">(</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt_hlen</span><span class="o">&gt;&gt;</span><span class="mi">2</span><span class="p">);</span>
+	<span class="cm">/* The iov_len does not include the transport header bytes */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">head</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">iov_len</span> <span class="o">=</span> <span class="p">(</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">argslen</span><span class="o">&lt;&lt;</span><span class="mi">2</span><span class="p">)</span> <span class="o">-</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt_hlen</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">page_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/* The rq_arg.len includes the transport header bytes */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_arg</span><span class="p">.</span><span class="n">len</span>     <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">argslen</span><span class="o">&lt;&lt;</span><span class="mi">2</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_prot</span>        <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">prot</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">,</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">addrlen</span><span class="p">);</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_addrlen</span>     <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">addrlen</span><span class="p">;</span>
+	<span class="cm">/* Save off transport header len in case we get deferred again */</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_xprt_hlen</span>   <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt_hlen</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_daddr</span>       <span class="o">=</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">;</span>
+	<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_respages</span>    <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_pages</span><span class="p">;</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">argslen</span><span class="o">&lt;&lt;</span><span class="mi">2</span><span class="p">)</span> <span class="o">-</span> <span class="n">dr</span><span class="o">-&gt;</span><span class="n">xprt_hlen</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="nf">svc_deferred_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_deferred_req</span> <span class="o">*</span><span class="n">dr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">XPT_DEFERRED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_deferred</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dr</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_deferred</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">svc_deferred_req</span><span class="p">,</span>
+				<span class="n">handle</span><span class="p">.</span><span class="n">recent</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dr</span><span class="o">-&gt;</span><span class="n">handle</span><span class="p">.</span><span class="n">recent</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">XPT_DEFERRED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_flags</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">dr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * svc_find_xprt - find an RPC transport instance</span>
+<span class="cm"> * @serv: pointer to svc_serv to search</span>
+<span class="cm"> * @xcl_name: C string containing transport&#39;s class name</span>
+<span class="cm"> * @net: owner net pointer</span>
+<span class="cm"> * @af: Address family of transport&#39;s local address</span>
+<span class="cm"> * @port: transport&#39;s IP port number</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return the transport instance pointer for the endpoint accepting</span>
+<span class="cm"> * connections/peer traffic from the specified transport class,</span>
+<span class="cm"> * address family and port.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Specifying 0 for the address family or port is effectively a</span>
+<span class="cm"> * wild-card, and will result in matching the first transport in the</span>
+<span class="cm"> * service&#39;s list that has a matching class name.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="nf">svc_find_xprt</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">xcl_name</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">,</span> <span class="k">const</span> <span class="n">sa_family_t</span> <span class="n">af</span><span class="p">,</span>
+			       <span class="k">const</span> <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">port</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">found</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* Sanity check the args */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">serv</span> <span class="o">==</span> <span class="nb">NULL</span> <span class="o">||</span> <span class="n">xcl_name</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">found</span><span class="p">;</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_permsocks</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_net</span> <span class="o">!=</span> <span class="n">net</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_class</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">,</span> <span class="n">xcl_name</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">af</span> <span class="o">!=</span> <span class="n">AF_UNSPEC</span> <span class="o">&amp;&amp;</span> <span class="n">af</span> <span class="o">!=</span> <span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_local</span><span class="p">.</span><span class="n">ss_family</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">port</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">port</span> <span class="o">!=</span> <span class="n">svc_xprt_local_port</span><span class="p">(</span><span class="n">xprt</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">found</span> <span class="o">=</span> <span class="n">xprt</span><span class="p">;</span>
+		<span class="n">svc_xprt_get</span><span class="p">(</span><span class="n">xprt</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">found</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_find_xprt</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">svc_one_xprt_name</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">,</span>
+			     <span class="kt">char</span> <span class="o">*</span><span class="n">pos</span><span class="p">,</span> <span class="kt">int</span> <span class="n">remaining</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">snprintf</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="n">remaining</span><span class="p">,</span> <span class="s">&quot;%s %u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">xprt</span><span class="o">-&gt;</span><span class="n">xpt_class</span><span class="o">-&gt;</span><span class="n">xcl_name</span><span class="p">,</span>
+			<span class="n">svc_xprt_local_port</span><span class="p">(</span><span class="n">xprt</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&gt;=</span> <span class="n">remaining</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENAMETOOLONG</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * svc_xprt_names - format a buffer with a list of transport names</span>
+<span class="cm"> * @serv: pointer to an RPC service</span>
+<span class="cm"> * @buf: pointer to a buffer to be filled in</span>
+<span class="cm"> * @buflen: length of buffer to be filled in</span>
+<span class="cm"> *</span>
+<span class="cm"> * Fills in @buf with a string containing a list of transport names,</span>
+<span class="cm"> * each name terminated with &#39;\n&#39;.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns positive length of the filled-in string on success; otherwise</span>
+<span class="cm"> * a negative errno value is returned if an error occurs.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">svc_xprt_names</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="k">const</span> <span class="kt">int</span> <span class="n">buflen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_xprt</span> <span class="o">*</span><span class="n">xprt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="n">totlen</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+
+	<span class="cm">/* Sanity check args */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">serv</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+
+	<span class="n">pos</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+	<span class="n">totlen</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_permsocks</span><span class="p">,</span> <span class="n">xpt_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">svc_one_xprt_name</span><span class="p">(</span><span class="n">xprt</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">buflen</span> <span class="o">-</span> <span class="n">totlen</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">buf</span> <span class="o">=</span> <span class="sc">&#39;\0&#39;</span><span class="p">;</span>
+			<span class="n">totlen</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">pos</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">totlen</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">totlen</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">svc_xprt_names</span><span class="p">);</span>
+
+
+<span class="cm">/*----------------------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">svc_pool_stats_start</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">pos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">pidx</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span><span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="n">m</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc_pool_stats_start, *pidx=%u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pidx</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pidx</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">SEQ_START_TOKEN</span><span class="p">;</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">pidx</span> <span class="o">&gt;</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_nrpools</span> <span class="o">?</span> <span class="nb">NULL</span> <span class="o">:</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="n">pidx</span><span class="o">-</span><span class="mi">1</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">svc_pool_stats_next</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">pos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span> <span class="o">=</span> <span class="n">m</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;svc_pool_stats_next, *pos=%llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">*</span><span class="n">pos</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="n">SEQ_START_TOKEN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">pidx</span> <span class="o">=</span> <span class="p">(</span><span class="n">pool</span> <span class="o">-</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pidx</span> <span class="o">&lt;</span> <span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_nrpools</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+			<span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">serv</span><span class="o">-&gt;</span><span class="n">sv_pools</span><span class="p">[</span><span class="n">pidx</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span>
+		<span class="k">else</span>
+			<span class="n">pool</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="o">++*</span><span class="n">pos</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">pool</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">svc_pool_stats_stop</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">svc_pool_stats_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">svc_pool</span> <span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="n">SEQ_START_TOKEN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">seq_puts</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="s">&quot;# pool packets-arrived sockets-enqueued threads-woken threads-timedout</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">seq_printf</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="s">&quot;%u %lu %lu %lu %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_id</span><span class="p">,</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">packets</span><span class="p">,</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">sockets_queued</span><span class="p">,</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">threads_woken</span><span class="p">,</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">sp_stats</span><span class="p">.</span><span class="n">threads_timedout</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">seq_operations</span> <span class="n">svc_pool_stats_seq_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">start</span>	<span class="o">=</span> <span class="n">svc_pool_stats_start</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">next</span>	<span class="o">=</span> <span class="n">svc_pool_stats_next</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">stop</span>	<span class="o">=</span> <span class="n">svc_pool_stats_stop</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">show</span>	<span class="o">=</span> <span class="n">svc_pool_stats_show</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="nf">svc_pool_stats_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_serv</span> <span class="o">*</span><span class="n">serv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">seq_open</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc_pool_stats_seq_ops</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">err</span><span class="p">)</span>
+		<span class="p">((</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="p">)</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="n">serv</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">svc_pool_stats_open</span><span class="p">);</span>
+
+<span class="cm">/*----------------------------------------------------------------------------*/</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

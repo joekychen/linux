@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › md › dm-thin-metadata.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>dm-thin-metadata.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2011 Red Hat, Inc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPL.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &quot;dm-thin-metadata.h&quot;</span>
+<span class="cp">#include &quot;persistent-data/dm-btree.h&quot;</span>
+<span class="cp">#include &quot;persistent-data/dm-space-map.h&quot;</span>
+<span class="cp">#include &quot;persistent-data/dm-space-map-disk.h&quot;</span>
+<span class="cp">#include &quot;persistent-data/dm-transaction-manager.h&quot;</span>
+
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/device-mapper.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+
+<span class="cm">/*--------------------------------------------------------------------------</span>
+<span class="cm"> * As far as the metadata goes, there is:</span>
+<span class="cm"> *</span>
+<span class="cm"> * - A superblock in block zero, taking up fewer than 512 bytes for</span>
+<span class="cm"> *   atomic writes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - A space map managing the metadata blocks.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - A space map managing the data blocks.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - A btree mapping our internal thin dev ids onto struct disk_device_details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - A hierarchical btree, with 2 levels which effectively maps (thin</span>
+<span class="cm"> *   dev id, virtual block) -&gt; block_time.  Block time is a 64-bit</span>
+<span class="cm"> *   field holding the time in the low 24 bits, and block in the top 48</span>
+<span class="cm"> *   bits.</span>
+<span class="cm"> *</span>
+<span class="cm"> * BTrees consist solely of btree_nodes, that fill a block.  Some are</span>
+<span class="cm"> * internal nodes, as such their values are a __le64 pointing to other</span>
+<span class="cm"> * nodes.  Leaf nodes can store data of any reasonable size (ie. much</span>
+<span class="cm"> * smaller than the block size).  The nodes consist of the header,</span>
+<span class="cm"> * followed by an array of keys, followed by an array of values.  We have</span>
+<span class="cm"> * to binary search on the keys so they&#39;re all held together to help the</span>
+<span class="cm"> * cpu cache.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Space maps have 2 btrees:</span>
+<span class="cm"> *</span>
+<span class="cm"> * - One maps a uint64_t onto a struct index_entry.  Which points to a</span>
+<span class="cm"> *   bitmap block, and has some details about how many free entries there</span>
+<span class="cm"> *   are etc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - The bitmap blocks have a header (for the checksum).  Then the rest</span>
+<span class="cm"> *   of the block is pairs of bits.  With the meaning being:</span>
+<span class="cm"> *</span>
+<span class="cm"> *   0 - ref count is 0</span>
+<span class="cm"> *   1 - ref count is 1</span>
+<span class="cm"> *   2 - ref count is 2</span>
+<span class="cm"> *   3 - ref count is higher than 2</span>
+<span class="cm"> *</span>
+<span class="cm"> * - If the count is higher than 2 then the ref count is entered in a</span>
+<span class="cm"> *   second btree that directly maps the block_address to a uint32_t ref</span>
+<span class="cm"> *   count.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The space map metadata variant doesn&#39;t have a bitmaps btree.  Instead</span>
+<span class="cm"> * it has one single blocks worth of index_entries.  This avoids</span>
+<span class="cm"> * recursive issues with the bitmap btree needing to allocate space in</span>
+<span class="cm"> * order to insert.  With a small data block size such as 64k the</span>
+<span class="cm"> * metadata support data devices that are hundreds of terrabytes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The space maps allocate space linearly from front to back.  Space that</span>
+<span class="cm"> * is freed in a transaction is never recycled within that transaction.</span>
+<span class="cm"> * To try and avoid fragmenting _free_ space the allocator always goes</span>
+<span class="cm"> * back and fills in gaps.</span>
+<span class="cm"> *</span>
+<span class="cm"> * All metadata io is in THIN_METADATA_BLOCK_SIZE sized/aligned chunks</span>
+<span class="cm"> * from the block manager.</span>
+<span class="cm"> *--------------------------------------------------------------------------*/</span>
+
+<span class="cp">#define DM_MSG_PREFIX   &quot;thin metadata&quot;</span>
+
+<span class="cp">#define THIN_SUPERBLOCK_MAGIC 27022010</span>
+<span class="cp">#define THIN_SUPERBLOCK_LOCATION 0</span>
+<span class="cp">#define THIN_VERSION 1</span>
+<span class="cp">#define THIN_METADATA_CACHE_SIZE 64</span>
+<span class="cp">#define SECTOR_TO_BLOCK_SHIFT 3</span>
+
+<span class="cm">/* This should be plenty */</span>
+<span class="cp">#define SPACE_MAP_ROOT_SIZE 128</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Little endian on-disk superblock and device details.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="p">{</span>
+	<span class="n">__le32</span> <span class="n">csum</span><span class="p">;</span>	<span class="cm">/* Checksum of superblock except for this field. */</span>
+	<span class="n">__le32</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">blocknr</span><span class="p">;</span>	<span class="cm">/* This block number, dm_block_t. */</span>
+
+	<span class="n">__u8</span> <span class="n">uuid</span><span class="p">[</span><span class="mi">16</span><span class="p">];</span>
+	<span class="n">__le64</span> <span class="n">magic</span><span class="p">;</span>
+	<span class="n">__le32</span> <span class="n">version</span><span class="p">;</span>
+	<span class="n">__le32</span> <span class="n">time</span><span class="p">;</span>
+
+	<span class="n">__le64</span> <span class="n">trans_id</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Root held by userspace transactions.</span>
+<span class="cm">	 */</span>
+	<span class="n">__le64</span> <span class="n">held_root</span><span class="p">;</span>
+
+	<span class="n">__u8</span> <span class="n">data_space_map_root</span><span class="p">[</span><span class="n">SPACE_MAP_ROOT_SIZE</span><span class="p">];</span>
+	<span class="n">__u8</span> <span class="n">metadata_space_map_root</span><span class="p">[</span><span class="n">SPACE_MAP_ROOT_SIZE</span><span class="p">];</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * 2-level btree mapping (dev_id, (dev block, time)) -&gt; data block</span>
+<span class="cm">	 */</span>
+	<span class="n">__le64</span> <span class="n">data_mapping_root</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Device detail root mapping dev_id -&gt; device_details</span>
+<span class="cm">	 */</span>
+	<span class="n">__le64</span> <span class="n">device_details_root</span><span class="p">;</span>
+
+	<span class="n">__le32</span> <span class="n">data_block_size</span><span class="p">;</span>		<span class="cm">/* In 512-byte sectors. */</span>
+
+	<span class="n">__le32</span> <span class="n">metadata_block_size</span><span class="p">;</span>	<span class="cm">/* In 512-byte sectors. */</span>
+	<span class="n">__le64</span> <span class="n">metadata_nr_blocks</span><span class="p">;</span>
+
+	<span class="n">__le32</span> <span class="n">compat_flags</span><span class="p">;</span>
+	<span class="n">__le32</span> <span class="n">compat_ro_flags</span><span class="p">;</span>
+	<span class="n">__le32</span> <span class="n">incompat_flags</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">__packed</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">disk_device_details</span> <span class="p">{</span>
+	<span class="n">__le64</span> <span class="n">mapped_blocks</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">transaction_id</span><span class="p">;</span>		<span class="cm">/* When created. */</span>
+	<span class="n">__le32</span> <span class="n">creation_time</span><span class="p">;</span>
+	<span class="n">__le32</span> <span class="n">snapshotted_time</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">__packed</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hlist_node</span> <span class="n">hash</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_space_map</span> <span class="o">*</span><span class="n">metadata_sm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_space_map</span> <span class="o">*</span><span class="n">data_sm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_transaction_manager</span> <span class="o">*</span><span class="n">tm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_transaction_manager</span> <span class="o">*</span><span class="n">nb_tm</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Two-level btree.</span>
+<span class="cm">	 * First level holds thin_dev_t.</span>
+<span class="cm">	 * Second level holds mappings.</span>
+<span class="cm">	 */</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="n">info</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Non-blocking version of the above.</span>
+<span class="cm">	 */</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="n">nb_info</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Just the top level for deleting whole devices.</span>
+<span class="cm">	 */</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="n">tl_info</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Just the bottom level for creating new devices.</span>
+<span class="cm">	 */</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="n">bl_info</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Describes the device details btree.</span>
+<span class="cm">	 */</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="n">details_info</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">rw_semaphore</span> <span class="n">root_lock</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">time</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">need_commit</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">root</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">details_root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">thin_devices</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">trans_id</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">sector_t</span> <span class="n">data_block_size</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">dm_thin_id</span> <span class="n">id</span><span class="p">;</span>
+
+	<span class="kt">int</span> <span class="n">open_count</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">changed</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">mapped_blocks</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">transaction_id</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">creation_time</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">snapshotted_time</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * superblock validator</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="cp">#define SUPERBLOCK_CSUM_XOR 160774</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sb_prepare_for_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span>
+				 <span class="kt">size_t</span> <span class="n">block_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">blocknr</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">dm_block_location</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">csum</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">dm_bm_checksum</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span>
+						      <span class="n">block_size</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le32</span><span class="p">),</span>
+						      <span class="n">SUPERBLOCK_CSUM_XOR</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sb_check</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span>
+		    <span class="kt">size_t</span> <span class="n">block_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="n">__le32</span> <span class="n">csum_le</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_block_location</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">!=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">blocknr</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;sb_check failed: blocknr %llu: &quot;</span>
+		      <span class="s">&quot;wanted %llu&quot;</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">blocknr</span><span class="p">),</span>
+		      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dm_block_location</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOTBLK</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">magic</span><span class="p">)</span> <span class="o">!=</span> <span class="n">THIN_SUPERBLOCK_MAGIC</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;sb_check failed: magic %llu: &quot;</span>
+		      <span class="s">&quot;wanted %llu&quot;</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">magic</span><span class="p">),</span>
+		      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">THIN_SUPERBLOCK_MAGIC</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EILSEQ</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">csum_le</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">dm_bm_checksum</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span>
+					     <span class="n">block_size</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le32</span><span class="p">),</span>
+					     <span class="n">SUPERBLOCK_CSUM_XOR</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">csum_le</span> <span class="o">!=</span> <span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">csum</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;sb_check failed: csum %u: wanted %u&quot;</span><span class="p">,</span>
+		      <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">csum_le</span><span class="p">),</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">csum</span><span class="p">));</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EILSEQ</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="n">sb_validator</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;superblock&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">prepare_for_write</span> <span class="o">=</span> <span class="n">sb_prepare_for_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">check</span> <span class="o">=</span> <span class="n">sb_check</span>
+<span class="p">};</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Methods for the btree value types</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="kt">uint64_t</span> <span class="nf">pack_block_time</span><span class="p">(</span><span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">b</span> <span class="o">&lt;&lt;</span> <span class="mi">24</span><span class="p">)</span> <span class="o">|</span> <span class="n">t</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">unpack_block_time</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">v</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">v</span> <span class="o">&gt;&gt;</span> <span class="mi">24</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">t</span> <span class="o">=</span> <span class="n">v</span> <span class="o">&amp;</span> <span class="p">((</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">24</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">data_block_inc</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value_le</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_space_map</span> <span class="o">*</span><span class="n">sm</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">v_le</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">b</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">t</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v_le</span><span class="p">,</span> <span class="n">value_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v_le</span><span class="p">));</span>
+	<span class="n">unpack_block_time</span><span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">v_le</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">b</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="p">);</span>
+	<span class="n">dm_sm_inc_block</span><span class="p">(</span><span class="n">sm</span><span class="p">,</span> <span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">data_block_dec</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value_le</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_space_map</span> <span class="o">*</span><span class="n">sm</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">v_le</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">b</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">t</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v_le</span><span class="p">,</span> <span class="n">value_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v_le</span><span class="p">));</span>
+	<span class="n">unpack_block_time</span><span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">v_le</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">b</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="p">);</span>
+	<span class="n">dm_sm_dec_block</span><span class="p">(</span><span class="n">sm</span><span class="p">,</span> <span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">data_block_equal</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value1_le</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value2_le</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__le64</span> <span class="n">v1_le</span><span class="p">,</span> <span class="n">v2_le</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">b1</span><span class="p">,</span> <span class="n">b2</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="n">t</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v1_le</span><span class="p">,</span> <span class="n">value1_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v1_le</span><span class="p">));</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v2_le</span><span class="p">,</span> <span class="n">value2_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v2_le</span><span class="p">));</span>
+	<span class="n">unpack_block_time</span><span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">v1_le</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">b1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="p">);</span>
+	<span class="n">unpack_block_time</span><span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">v2_le</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">b2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">t</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">b1</span> <span class="o">==</span> <span class="n">b2</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">subtree_inc</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">root_le</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">root</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root_le</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">root_le</span><span class="p">));</span>
+	<span class="n">root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">root_le</span><span class="p">);</span>
+	<span class="n">dm_tm_inc</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">root</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">subtree_dec</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_btree_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">root_le</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">root</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root_le</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">root_le</span><span class="p">));</span>
+	<span class="n">root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">root_le</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_btree_del</span><span class="p">(</span><span class="n">info</span><span class="p">,</span> <span class="n">root</span><span class="p">))</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;btree delete failed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">subtree_equal</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value1_le</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">value2_le</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__le64</span> <span class="n">v1_le</span><span class="p">,</span> <span class="n">v2_le</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v1_le</span><span class="p">,</span> <span class="n">value1_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v1_le</span><span class="p">));</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">v2_le</span><span class="p">,</span> <span class="n">value2_le</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">v2_le</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">v1_le</span> <span class="o">==</span> <span class="n">v2_le</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">superblock_all_zeroes</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span> <span class="kt">int</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="o">*</span><span class="n">data_le</span><span class="p">,</span> <span class="n">zero</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="n">block_size</span> <span class="o">=</span> <span class="n">dm_bm_block_size</span><span class="p">(</span><span class="n">bm</span><span class="p">)</span> <span class="o">/</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le64</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We can&#39;t use a validator here - it may be all zeroes.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_read_lock</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">data_le</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">block_size</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">data_le</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">!=</span> <span class="n">zero</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">init_pmd</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+		    <span class="n">dm_block_t</span> <span class="n">nr_blocks</span><span class="p">,</span> <span class="kt">int</span> <span class="n">create</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_space_map</span> <span class="o">*</span><span class="n">sm</span><span class="p">,</span> <span class="o">*</span><span class="n">data_sm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_transaction_manager</span> <span class="o">*</span><span class="n">tm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">create</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_create_with_sm</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+					 <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;tm_create_with_sm failed&quot;</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">data_sm</span> <span class="o">=</span> <span class="n">dm_sm_disk_create</span><span class="p">(</span><span class="n">tm</span><span class="p">,</span> <span class="n">nr_blocks</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">data_sm</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;sm_disk_create failed&quot;</span><span class="p">);</span>
+			<span class="n">dm_tm_unlock</span><span class="p">(</span><span class="n">tm</span><span class="p">,</span> <span class="n">sblock</span><span class="p">);</span>
+			<span class="n">r</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">data_sm</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="kt">size_t</span> <span class="n">space_map_root_offset</span> <span class="o">=</span>
+			<span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">thin_disk_superblock</span><span class="p">,</span> <span class="n">metadata_space_map_root</span><span class="p">);</span>
+
+		<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_open_with_sm</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+				       <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="n">space_map_root_offset</span><span class="p">,</span>
+				       <span class="n">SPACE_MAP_ROOT_SIZE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;tm_open_with_sm failed&quot;</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+		<span class="n">data_sm</span> <span class="o">=</span> <span class="n">dm_sm_disk_open</span><span class="p">(</span><span class="n">tm</span><span class="p">,</span> <span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_space_map_root</span><span class="p">,</span>
+					  <span class="k">sizeof</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_space_map_root</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">data_sm</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;sm_disk_open failed&quot;</span><span class="p">);</span>
+			<span class="n">r</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">data_sm</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_unlock</span><span class="p">(</span><span class="n">tm</span><span class="p">,</span> <span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;couldn&#39;t unlock superblock&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">bad_data_sm</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span> <span class="o">=</span> <span class="n">bm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span> <span class="o">=</span> <span class="n">sm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span> <span class="o">=</span> <span class="n">data_sm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span> <span class="o">=</span> <span class="n">tm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_tm</span> <span class="o">=</span> <span class="n">dm_tm_create_non_blocking_clone</span><span class="p">(</span><span class="n">tm</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_tm</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;could not create clone tm&quot;</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">bad_data_sm</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">tm</span> <span class="o">=</span> <span class="n">tm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">levels</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le64</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">inc</span> <span class="o">=</span> <span class="n">data_block_inc</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">dec</span> <span class="o">=</span> <span class="n">data_block_dec</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">equal</span> <span class="o">=</span> <span class="n">data_block_equal</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_info</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_info</span><span class="p">));</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_info</span><span class="p">.</span><span class="n">tm</span> <span class="o">=</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_tm</span><span class="p">;</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">tm</span> <span class="o">=</span> <span class="n">tm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">levels</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">context</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le64</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">inc</span> <span class="o">=</span> <span class="n">subtree_inc</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">dec</span> <span class="o">=</span> <span class="n">subtree_dec</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">equal</span> <span class="o">=</span> <span class="n">subtree_equal</span><span class="p">;</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">tm</span> <span class="o">=</span> <span class="n">tm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">levels</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">__le64</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">inc</span> <span class="o">=</span> <span class="n">data_block_inc</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">dec</span> <span class="o">=</span> <span class="n">data_block_dec</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">equal</span> <span class="o">=</span> <span class="n">data_block_equal</span><span class="p">;</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">tm</span> <span class="o">=</span> <span class="n">tm</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">levels</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">context</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">disk_device_details</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">inc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">dec</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">.</span><span class="n">value_type</span><span class="p">.</span><span class="n">equal</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">init_rwsem</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">thin_devices</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">bad_data_sm:</span>
+	<span class="n">dm_sm_destroy</span><span class="p">(</span><span class="n">data_sm</span><span class="p">);</span>
+<span class="nl">bad:</span>
+	<span class="n">dm_tm_destroy</span><span class="p">(</span><span class="n">tm</span><span class="p">);</span>
+	<span class="n">dm_sm_destroy</span><span class="p">(</span><span class="n">sm</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__begin_transaction</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">features</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * __maybe_commit_transaction() resets these</span>
+<span class="cm">	 */</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We re-read the superblock every time.  Shouldn&#39;t need to do this</span>
+<span class="cm">	 * really.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_read_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_mapping_root</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">device_details_root</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">trans_id</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_block_size</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_block_size</span><span class="p">);</span>
+
+	<span class="n">features</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">incompat_flags</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">THIN_FEATURE_INCOMPAT_SUPP</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">features</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;could not access metadata due to &quot;</span>
+		      <span class="s">&quot;unsupported optional features (%lx).&quot;</span><span class="p">,</span>
+		      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">features</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check for read-only metadata to skip the following RDWR checks.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">get_disk_ro</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="o">-&gt;</span><span class="n">bd_disk</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">features</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">compat_ro_flags</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">THIN_FEATURE_COMPAT_RO_SUPP</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">features</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;could not access metadata RDWR due to &quot;</span>
+		      <span class="s">&quot;unsupported optional features (%lx).&quot;</span><span class="p">,</span>
+		      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">features</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__write_changed_details</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">disk_device_details</span> <span class="n">details</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">key</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">thin_devices</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">changed</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">key</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">;</span>
+
+		<span class="n">details</span><span class="p">.</span><span class="n">mapped_blocks</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span><span class="p">);</span>
+		<span class="n">details</span><span class="p">.</span><span class="n">transaction_id</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">transaction_id</span><span class="p">);</span>
+		<span class="n">details</span><span class="p">.</span><span class="n">creation_time</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">creation_time</span><span class="p">);</span>
+		<span class="n">details</span><span class="p">.</span><span class="n">snapshotted_time</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">snapshotted_time</span><span class="p">);</span>
+		<span class="n">__dm_bless_for_disk</span><span class="p">(</span><span class="o">&amp;</span><span class="n">details</span><span class="p">);</span>
+
+		<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+				    <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">details</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">open_count</span><span class="p">)</span>
+			<span class="n">td</span><span class="o">-&gt;</span><span class="n">changed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__commit_transaction</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * FIXME: Associated pool should be made read-only on failure.</span>
+<span class="cm">	 */</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">metadata_len</span><span class="p">,</span> <span class="n">data_len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We need to know if the thin_disk_superblock exceeds a 512-byte sector.</span>
+<span class="cm">	 */</span>
+	<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">thin_disk_superblock</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">512</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__write_changed_details</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_commit</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_pre_commit</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_root_size</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">metadata_len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_root_size</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">data_len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_write_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			     <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">time</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_mapping_root</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">device_details_root</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">trans_id</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_copy_root</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">metadata_space_map_root</span><span class="p">,</span>
+			    <span class="n">metadata_len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_locked</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_copy_root</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_space_map_root</span><span class="p">,</span>
+			    <span class="n">data_len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_locked</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_commit</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+		<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+<span class="nl">out_locked:</span>
+	<span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="nf">dm_pool_metadata_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">,</span>
+					       <span class="n">sector_t</span> <span class="n">data_block_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">sector_t</span> <span class="n">bdev_size</span> <span class="o">=</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">bdev</span><span class="o">-&gt;</span><span class="n">bd_inode</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">create</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+
+	<span class="n">pmd</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">pmd</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pmd</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;could not allocate metadata struct&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Max hex locks:</span>
+<span class="cm">	 *  3 for btree insert +</span>
+<span class="cm">	 *  2 for btree lookup used within space map</span>
+<span class="cm">	 */</span>
+	<span class="n">bm</span> <span class="o">=</span> <span class="n">dm_block_manager_create</span><span class="p">(</span><span class="n">bdev</span><span class="p">,</span> <span class="n">THIN_METADATA_BLOCK_SIZE</span><span class="p">,</span>
+				     <span class="n">THIN_METADATA_CACHE_SIZE</span><span class="p">,</span> <span class="mi">5</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bm</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;could not create block manager&quot;</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">superblock_all_zeroes</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">create</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_block_manager_destroy</span><span class="p">(</span><span class="n">bm</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+	<span class="p">}</span>
+
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">init_pmd</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">bm</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">create</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_block_manager_destroy</span><span class="p">(</span><span class="n">bm</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">bdev</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">create</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">__begin_transaction</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">pmd</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Create.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_write_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			     <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bdev_size</span> <span class="o">&gt;</span> <span class="n">THIN_METADATA_MAX_SECTORS</span><span class="p">)</span>
+		<span class="n">bdev_size</span> <span class="o">=</span> <span class="n">THIN_METADATA_MAX_SECTORS</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">magic</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">THIN_SUPERBLOCK_MAGIC</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">THIN_VERSION</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">time</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">metadata_block_size</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">THIN_METADATA_BLOCK_SIZE</span> <span class="o">&gt;&gt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">metadata_nr_blocks</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">bdev_size</span> <span class="o">&gt;&gt;</span> <span class="n">SECTOR_TO_BLOCK_SHIFT</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_block_size</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">data_block_size</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;couldn&#39;t create devices root&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_pool_commit_metadata</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;%s: dm_pool_commit_metadata() failed, error = %d&quot;</span><span class="p">,</span>
+		      <span class="n">__func__</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">pmd</span><span class="p">;</span>
+
+<span class="nl">bad:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_pool_metadata_close</span><span class="p">(</span><span class="n">pmd</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;%s: dm_pool_metadata_close() failed.&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_metadata_close</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">open_devices</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">thin_devices</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">open_count</span><span class="p">)</span>
+			<span class="n">open_devices</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">open_devices</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;attempt to close pmd when %u device(s) are still open&quot;</span><span class="p">,</span>
+		       <span class="n">open_devices</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__commit_transaction</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;%s: __commit_transaction() failed, error = %d&quot;</span><span class="p">,</span>
+		       <span class="n">__func__</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+
+	<span class="n">dm_tm_destroy</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">);</span>
+	<span class="n">dm_tm_destroy</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_tm</span><span class="p">);</span>
+	<span class="n">dm_block_manager_destroy</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">);</span>
+	<span class="n">dm_sm_destroy</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">);</span>
+	<span class="n">dm_sm_destroy</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * __open_device: Returns @td corresponding to device with id @dev,</span>
+<span class="cm"> * creating it if @create is set and incrementing @td-&gt;open_count.</span>
+<span class="cm"> * On failure, @td is undefined.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__open_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			 <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">,</span> <span class="kt">int</span> <span class="n">create</span><span class="p">,</span>
+			 <span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">**</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">changed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td2</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">key</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">disk_device_details</span> <span class="n">details_le</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If the device is already open, return it.</span>
+<span class="cm">	 */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">td2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">thin_devices</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">td2</span><span class="o">-&gt;</span><span class="n">id</span> <span class="o">==</span> <span class="n">dev</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * May not create an already-open device.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">create</span><span class="p">)</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+			<span class="n">td2</span><span class="o">-&gt;</span><span class="n">open_count</span><span class="o">++</span><span class="p">;</span>
+			<span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">td2</span><span class="p">;</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check the device exists.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">details_le</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ENODATA</span> <span class="o">||</span> <span class="o">!</span><span class="n">create</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Create new device.</span>
+<span class="cm">		 */</span>
+		<span class="n">changed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">details_le</span><span class="p">.</span><span class="n">mapped_blocks</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">details_le</span><span class="p">.</span><span class="n">transaction_id</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span><span class="p">);</span>
+		<span class="n">details_le</span><span class="p">.</span><span class="n">creation_time</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">);</span>
+		<span class="n">details_le</span><span class="p">.</span><span class="n">snapshotted_time</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">**</span><span class="n">td</span><span class="p">),</span> <span class="n">GFP_NOIO</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!*</span><span class="n">td</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">pmd</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">id</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">open_count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">changed</span> <span class="o">=</span> <span class="n">changed</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">details_le</span><span class="p">.</span><span class="n">mapped_blocks</span><span class="p">);</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">transaction_id</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">details_le</span><span class="p">.</span><span class="n">transaction_id</span><span class="p">);</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">creation_time</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">details_le</span><span class="p">.</span><span class="n">creation_time</span><span class="p">);</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">snapshotted_time</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">details_le</span><span class="p">.</span><span class="n">snapshotted_time</span><span class="p">);</span>
+
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">thin_devices</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__close_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="o">--</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">open_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__create_thin</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			 <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">dev_root</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">key</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">disk_device_details</span> <span class="n">details_le</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">value</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">details_le</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Create an empty btree for the mappings.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev_root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Insert it into the main mapping tree.</span>
+<span class="cm">	 */</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">dev_root</span><span class="p">);</span>
+	<span class="n">__dm_bless_for_disk</span><span class="p">(</span><span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_btree_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">,</span> <span class="n">dev_root</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__open_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+		<span class="n">dm_btree_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">,</span> <span class="n">dev_root</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">__close_device</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_create_thin</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__create_thin</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__set_snapshot_details</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+				  <span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">snap</span><span class="p">,</span>
+				  <span class="n">dm_thin_id</span> <span class="n">origin</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">time</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__open_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">origin</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">changed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">snapshotted_time</span> <span class="o">=</span> <span class="n">time</span><span class="p">;</span>
+
+	<span class="n">snap</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span><span class="p">;</span>
+	<span class="n">snap</span><span class="o">-&gt;</span><span class="n">snapshotted_time</span> <span class="o">=</span> <span class="n">time</span><span class="p">;</span>
+	<span class="n">__close_device</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__create_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			 <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">,</span> <span class="n">dm_thin_id</span> <span class="n">origin</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">origin_root</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">key</span> <span class="o">=</span> <span class="n">origin</span><span class="p">,</span> <span class="n">dev_key</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">disk_device_details</span> <span class="n">details_le</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">value</span><span class="p">;</span>
+
+	<span class="cm">/* check this device is unused */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">dev_key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">details_le</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+	<span class="cm">/* find the mapping tree for the origin */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">origin_root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+
+	<span class="cm">/* clone the origin, an inc will do */</span>
+	<span class="n">dm_tm_inc</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">origin_root</span><span class="p">);</span>
+
+	<span class="cm">/* insert into the main mapping tree */</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">origin_root</span><span class="p">);</span>
+	<span class="n">__dm_bless_for_disk</span><span class="p">(</span><span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+	<span class="n">key</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_tm_dec</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">origin_root</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__open_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__set_snapshot_details</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">td</span><span class="p">,</span> <span class="n">origin</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">);</span>
+	<span class="n">__close_device</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">bad</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">bad:</span>
+	<span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+			<span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_create_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+				 <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">,</span>
+				 <span class="n">dm_thin_id</span> <span class="n">origin</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__create_snap</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="n">origin</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__delete_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">key</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+
+	<span class="cm">/* TODO: failure should mark the transaction invalid */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__open_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">open_count</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__close_device</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">details_root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_delete_thin_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			       <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__delete_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_set_metadata_transaction_id</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+					<span class="kt">uint64_t</span> <span class="n">current_id</span><span class="p">,</span>
+					<span class="kt">uint64_t</span> <span class="n">new_id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span> <span class="o">!=</span> <span class="n">current_id</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;mismatched transaction id&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span> <span class="o">=</span> <span class="n">new_id</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_metadata_transaction_id</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+					<span class="kt">uint64_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">trans_id</span><span class="p">;</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__reserve_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">inc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">copy</span><span class="p">,</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">held_root</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Copy the superblock.</span>
+<span class="cm">	 */</span>
+	<span class="n">dm_sm_inc_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_shadow_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			       <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">copy</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">inc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">inc</span><span class="p">);</span>
+
+	<span class="n">held_root</span> <span class="o">=</span> <span class="n">dm_block_location</span><span class="p">(</span><span class="n">copy</span><span class="p">);</span>
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">copy</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">held_root</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;Pool metadata snapshot already exists: release this before taking another.&quot;</span><span class="p">);</span>
+
+		<span class="n">dm_tm_dec</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">held_root</span><span class="p">);</span>
+		<span class="n">dm_tm_unlock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">copy</span><span class="p">);</span>
+		<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Wipe the spacemap since we&#39;re not publishing this.</span>
+<span class="cm">	 */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_space_map_root</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+	       <span class="k">sizeof</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_space_map_root</span><span class="p">));</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">metadata_space_map_root</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+	       <span class="k">sizeof</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">metadata_space_map_root</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Increment the data structures that need to be preserved.</span>
+<span class="cm">	 */</span>
+	<span class="n">dm_tm_inc</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_mapping_root</span><span class="p">));</span>
+	<span class="n">dm_tm_inc</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">device_details_root</span><span class="p">));</span>
+	<span class="n">dm_tm_unlock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">copy</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Write the held root into the superblock.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_write_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			     <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_tm_dec</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">held_root</span><span class="p">);</span>
+		<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">held_root</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">held_root</span><span class="p">);</span>
+	<span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_reserve_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__reserve_metadata_snap</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__release_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">,</span> <span class="o">*</span><span class="n">copy</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">held_root</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_write_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			     <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="n">held_root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">held_root</span><span class="p">);</span>
+	<span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">held_root</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">held_root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMWARN</span><span class="p">(</span><span class="s">&quot;No pool metadata snapshot found: nothing to release.&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_tm_read_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">held_root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">copy</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">copy</span><span class="p">);</span>
+	<span class="n">dm_sm_dec_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">data_mapping_root</span><span class="p">));</span>
+	<span class="n">dm_sm_dec_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">device_details_root</span><span class="p">));</span>
+	<span class="n">dm_sm_dec_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">held_root</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">dm_tm_unlock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tm</span><span class="p">,</span> <span class="n">copy</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_release_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__release_metadata_snap</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__get_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			       <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">thin_disk_superblock</span> <span class="o">*</span><span class="n">disk_super</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">sblock</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_read_lock</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bm</span><span class="p">,</span> <span class="n">THIN_SUPERBLOCK_LOCATION</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">sb_validator</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">disk_super</span> <span class="o">=</span> <span class="n">dm_block_data</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">disk_super</span><span class="o">-&gt;</span><span class="n">held_root</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">sblock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_metadata_snap</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+			      <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__get_metadata_snap</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_open_thin_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_thin_id</span> <span class="n">dev</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">**</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__open_device</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">td</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_close_thin_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">__close_device</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">dm_thin_id</span> <span class="nf">dm_thin_dev_id</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__snapshotted_since</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">time</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">snapshotted_time</span> <span class="o">&gt;</span> <span class="n">time</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_thin_find_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">block</span><span class="p">,</span>
+		       <span class="kt">int</span> <span class="n">can_block</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_thin_lookup_result</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">block_time</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">value</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">keys</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">,</span> <span class="n">block</span> <span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">can_block</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+			<span class="n">block_time</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">down_read_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">nb_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+			<span class="n">block_time</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EWOULDBLOCK</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_block_t</span> <span class="n">exception_block</span><span class="p">;</span>
+		<span class="kt">uint32_t</span> <span class="n">exception_time</span><span class="p">;</span>
+		<span class="n">unpack_block_time</span><span class="p">(</span><span class="n">block_time</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">exception_block</span><span class="p">,</span>
+				  <span class="o">&amp;</span><span class="n">exception_time</span><span class="p">);</span>
+		<span class="n">result</span><span class="o">-&gt;</span><span class="n">block</span> <span class="o">=</span> <span class="n">exception_block</span><span class="p">;</span>
+		<span class="n">result</span><span class="o">-&gt;</span><span class="n">shared</span> <span class="o">=</span> <span class="n">__snapshotted_since</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">exception_time</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__insert</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">block</span><span class="p">,</span>
+		    <span class="n">dm_block_t</span> <span class="n">data_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">,</span> <span class="n">inserted</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">value</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">keys</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">,</span> <span class="n">block</span> <span class="p">};</span>
+
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">pack_block_time</span><span class="p">(</span><span class="n">data_block</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">));</span>
+	<span class="n">__dm_bless_for_disk</span><span class="p">(</span><span class="o">&amp;</span><span class="n">value</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_insert_notify</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value</span><span class="p">,</span>
+				   <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">inserted</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">inserted</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">td</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">td</span><span class="o">-&gt;</span><span class="n">changed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_thin_insert_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">block</span><span class="p">,</span>
+			 <span class="n">dm_block_t</span> <span class="n">data_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__insert</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">data_block</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__remove</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">keys</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">,</span> <span class="n">block</span> <span class="p">};</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">changed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_thin_remove_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__remove</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_alloc_data_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_new_block</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_commit_metadata</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__commit_transaction</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Open the next transaction.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__begin_transaction</span><span class="p">(</span><span class="n">pmd</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_free_block_count</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_get_nr_free</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_free_metadata_block_count</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+					  <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_get_nr_free</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_metadata_dev_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span>
+				  <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_get_nr_blocks</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">metadata_sm</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_data_block_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">sector_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_block_size</span><span class="p">;</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_get_data_dev_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_get_nr_blocks</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_thin_get_mapped_count</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">result</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">mapped_blocks</span><span class="p">;</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__highest_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">__le64</span> <span class="n">value_le</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">thin_root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_btree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">tl_info</span><span class="p">,</span> <span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">value_le</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">thin_root</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">value_le</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">dm_btree_find_highest_key</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">bl_info</span><span class="p">,</span> <span class="n">thin_root</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_thin_get_highest_mapped_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_thin_device</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+				     <span class="n">dm_block_t</span> <span class="o">*</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">pmd</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__highest_block</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__resize_data_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">new_count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">dm_block_t</span> <span class="n">old_count</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_get_nr_blocks</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">old_count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">new_count</span> <span class="o">==</span> <span class="n">old_count</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">new_count</span> <span class="o">&lt;</span> <span class="n">old_count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;cannot reduce size of data device&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_sm_extend</span><span class="p">(</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">data_sm</span><span class="p">,</span> <span class="n">new_count</span> <span class="o">-</span> <span class="n">old_count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">r</span><span class="p">)</span>
+		<span class="n">pmd</span><span class="o">-&gt;</span><span class="n">need_commit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_pool_resize_data_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_pool_metadata</span> <span class="o">*</span><span class="n">pmd</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">new_count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__resize_data_dev</span><span class="p">(</span><span class="n">pmd</span><span class="p">,</span> <span class="n">new_count</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd</span><span class="o">-&gt;</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

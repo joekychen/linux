@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › md › dm-region-hash.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>dm-region-hash.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2003 Sistina Software Limited.</span>
+<span class="cm"> * Copyright (C) 2004-2008 Red Hat, Inc. All rights reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPL.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/dm-dirty-log.h&gt;</span>
+<span class="cp">#include &lt;linux/dm-region-hash.h&gt;</span>
+
+<span class="cp">#include &lt;linux/ctype.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/vmalloc.h&gt;</span>
+
+<span class="cp">#include &quot;dm.h&quot;</span>
+
+<span class="cp">#define	DM_MSG_PREFIX	&quot;region hash&quot;</span>
+
+<span class="cm">/*-----------------------------------------------------------------</span>
+<span class="cm"> * Region hash</span>
+<span class="cm"> *</span>
+<span class="cm"> * The mirror splits itself up into discrete regions.  Each</span>
+<span class="cm"> * region can be in one of three states: clean, dirty,</span>
+<span class="cm"> * nosync.  There is no need to put clean regions in the hash.</span>
+<span class="cm"> *</span>
+<span class="cm"> * In addition to being present in the hash table a region _may_</span>
+<span class="cm"> * be present on one of three lists.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   clean_regions: Regions on this list have no io pending to</span>
+<span class="cm"> *   them, they are in sync, we are no longer interested in them,</span>
+<span class="cm"> *   they are dull.  dm_rh_update_states() will remove them from the</span>
+<span class="cm"> *   hash table.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   quiesced_regions: These regions have been spun down, ready</span>
+<span class="cm"> *   for recovery.  rh_recovery_start() will remove regions from</span>
+<span class="cm"> *   this list and hand them to kmirrord, which will schedule the</span>
+<span class="cm"> *   recovery io with kcopyd.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   recovered_regions: Regions that kcopyd has successfully</span>
+<span class="cm"> *   recovered.  dm_rh_update_states() will now schedule any delayed</span>
+<span class="cm"> *   io, up the recovery_count, and remove the region from the</span>
+<span class="cm"> *   hash.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There are 2 locks:</span>
+<span class="cm"> *   A rw spin lock &#39;hash_lock&#39; protects just the hash table,</span>
+<span class="cm"> *   this is never held in write mode from interrupt context,</span>
+<span class="cm"> *   which I believe means that we only have to disable irqs when</span>
+<span class="cm"> *   doing a write lock.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   An ordinary spin lock &#39;region_lock&#39; that protects the three</span>
+<span class="cm"> *   lists in the region_hash, with the &#39;state&#39;, &#39;list&#39; and</span>
+<span class="cm"> *   &#39;delayed_bios&#39; fields of the regions.  This is used from irq</span>
+<span class="cm"> *   context, so all other uses will have to suspend local irqs.</span>
+<span class="cm"> *---------------------------------------------------------------*/</span>
+<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="p">{</span>
+	<span class="kt">uint32_t</span> <span class="n">region_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">region_shift</span><span class="p">;</span>
+
+	<span class="cm">/* holds persistent region state */</span>
+	<span class="k">struct</span> <span class="n">dm_dirty_log</span> <span class="o">*</span><span class="n">log</span><span class="p">;</span>
+
+	<span class="cm">/* hash table */</span>
+	<span class="n">rwlock_t</span> <span class="n">hash_lock</span><span class="p">;</span>
+	<span class="n">mempool_t</span> <span class="o">*</span><span class="n">region_pool</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">nr_buckets</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">prime</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">shift</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">buckets</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="n">max_recovery</span><span class="p">;</span> <span class="cm">/* Max # of regions to recover in parallel */</span>
+
+	<span class="n">spinlock_t</span> <span class="n">region_lock</span><span class="p">;</span>
+	<span class="n">atomic_t</span> <span class="n">recovery_in_flight</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">semaphore</span> <span class="n">recovery_count</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">clean_regions</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">quiesced_regions</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">recovered_regions</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">failed_recovered_regions</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If there was a flush failure no regions can be marked clean.</span>
+<span class="cm">	 */</span>
+	<span class="kt">int</span> <span class="n">flush_failure</span><span class="p">;</span>
+
+	<span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">;</span>
+	<span class="n">sector_t</span> <span class="n">target_begin</span><span class="p">;</span>
+
+	<span class="cm">/* Callback function to schedule bios writes */</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">dispatch_bios</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bios</span><span class="p">);</span>
+
+	<span class="cm">/* Callback function to wakeup callers worker thread. */</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">wakeup_workers</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">);</span>
+
+	<span class="cm">/* Callback function to wakeup callers recovery waiters. */</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">wakeup_all_recovery_waiters</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">);</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">dm_region</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">;</span>	<span class="cm">/* FIXME: can we get rid of this ? */</span>
+	<span class="n">region_t</span> <span class="n">key</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">state</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">hash_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+
+	<span class="n">atomic_t</span> <span class="n">pending</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio_list</span> <span class="n">delayed_bios</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Conversion fns</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">region_t</span> <span class="nf">dm_rh_sector_to_region</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">sector</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">sector</span> <span class="o">&gt;&gt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_shift</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">sector_t</span> <span class="nf">dm_rh_region_to_sector</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">region</span> <span class="o">&lt;&lt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_shift</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_region_to_sector</span><span class="p">);</span>
+
+<span class="n">region_t</span> <span class="nf">dm_rh_bio_to_region</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_rh_sector_to_region</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_sector</span> <span class="o">-</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">target_begin</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_bio_to_region</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_rh_region_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_region_context</span><span class="p">);</span>
+
+<span class="n">region_t</span> <span class="nf">dm_rh_get_region_key</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_get_region_key</span><span class="p">);</span>
+
+<span class="n">sector_t</span> <span class="nf">dm_rh_get_region_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_get_region_size</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * FIXME: shall we pass in a structure instead of all these args to</span>
+<span class="cm"> * dm_region_hash_create()????</span>
+<span class="cm"> */</span>
+<span class="cp">#define RH_HASH_MULT 2654435387U</span>
+<span class="cp">#define RH_HASH_SHIFT 12</span>
+
+<span class="cp">#define MIN_REGIONS 64</span>
+<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="nf">dm_region_hash_create</span><span class="p">(</span>
+		<span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span> <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">dispatch_bios</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">,</span>
+						     <span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bios</span><span class="p">),</span>
+		<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">wakeup_workers</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">),</span>
+		<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">wakeup_all_recovery_waiters</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">),</span>
+		<span class="n">sector_t</span> <span class="n">target_begin</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">max_recovery</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">dm_dirty_log</span> <span class="o">*</span><span class="n">log</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">region_size</span><span class="p">,</span>
+		<span class="n">region_t</span> <span class="n">nr_regions</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">nr_buckets</span><span class="p">,</span> <span class="n">max_buckets</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Calculate a suitable number of buckets for our hash</span>
+<span class="cm">	 * table.</span>
+<span class="cm">	 */</span>
+	<span class="n">max_buckets</span> <span class="o">=</span> <span class="n">nr_regions</span> <span class="o">&gt;&gt;</span> <span class="mi">6</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">nr_buckets</span> <span class="o">=</span> <span class="mi">128u</span><span class="p">;</span> <span class="n">nr_buckets</span> <span class="o">&lt;</span> <span class="n">max_buckets</span><span class="p">;</span> <span class="n">nr_buckets</span> <span class="o">&lt;&lt;=</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="p">;</span>
+	<span class="n">nr_buckets</span> <span class="o">&gt;&gt;=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">rh</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rh</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rh</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;unable to allocate region hash memory&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">dispatch_bios</span> <span class="o">=</span> <span class="n">dispatch_bios</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_workers</span> <span class="o">=</span> <span class="n">wakeup_workers</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_all_recovery_waiters</span> <span class="o">=</span> <span class="n">wakeup_all_recovery_waiters</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">target_begin</span> <span class="o">=</span> <span class="n">target_begin</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">max_recovery</span> <span class="o">=</span> <span class="n">max_recovery</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span> <span class="o">=</span> <span class="n">log</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_size</span> <span class="o">=</span> <span class="n">region_size</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_shift</span> <span class="o">=</span> <span class="n">ffs</span><span class="p">(</span><span class="n">region_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">rwlock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">mask</span> <span class="o">=</span> <span class="n">nr_buckets</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">nr_buckets</span> <span class="o">=</span> <span class="n">nr_buckets</span><span class="p">;</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">shift</span> <span class="o">=</span> <span class="n">RH_HASH_SHIFT</span><span class="p">;</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">prime</span> <span class="o">=</span> <span class="n">RH_HASH_MULT</span><span class="p">;</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span> <span class="o">=</span> <span class="n">vmalloc</span><span class="p">(</span><span class="n">nr_buckets</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;unable to allocate region hash bucket memory&quot;</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">rh</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nr_buckets</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="n">sema_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">clean_regions</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovered_regions</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">failed_recovered_regions</span><span class="p">);</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">flush_failure</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span> <span class="o">=</span> <span class="n">mempool_create_kmalloc_pool</span><span class="p">(</span><span class="n">MIN_REGIONS</span><span class="p">,</span>
+						      <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">vfree</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">rh</span><span class="p">);</span>
+		<span class="n">rh</span> <span class="o">=</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">rh</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_region_hash_create</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_region_hash_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">h</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">,</span> <span class="o">*</span><span class="n">nreg</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">));</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">h</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">h</span> <span class="o">&lt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">nr_buckets</span><span class="p">;</span> <span class="n">h</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">nreg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span> <span class="o">+</span> <span class="n">h</span><span class="p">,</span>
+					 <span class="n">hash_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">));</span>
+			<span class="n">mempool_free</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">)</span>
+		<span class="n">dm_dirty_log_destroy</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">)</span>
+		<span class="n">mempool_destroy</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+
+	<span class="n">vfree</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rh</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_region_hash_destroy</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">dm_dirty_log</span> <span class="o">*</span><span class="nf">dm_rh_dirty_log</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_dirty_log</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">rh_hash</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span> <span class="p">((</span><span class="n">region</span> <span class="o">*</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">prime</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">shift</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">mask</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="nf">__rh_lookup</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">bucket</span> <span class="o">=</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span> <span class="o">+</span> <span class="n">rh_hash</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">bucket</span><span class="p">,</span> <span class="n">hash_list</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span> <span class="o">==</span> <span class="n">region</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">reg</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__rh_insert</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">buckets</span> <span class="o">+</span> <span class="n">rh_hash</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="nf">__rh_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">,</span> <span class="o">*</span><span class="n">nreg</span><span class="p">;</span>
+
+	<span class="n">nreg</span> <span class="o">=</span> <span class="n">mempool_alloc</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">nreg</span><span class="p">))</span>
+		<span class="n">nreg</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">nreg</span><span class="p">),</span> <span class="n">GFP_NOIO</span> <span class="o">|</span> <span class="n">__GFP_NOFAIL</span><span class="p">);</span>
+
+	<span class="n">nreg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">in_sync</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">region</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">?</span>
+		      <span class="n">DM_RH_CLEAN</span> <span class="o">:</span> <span class="n">DM_RH_NOSYNC</span><span class="p">;</span>
+	<span class="n">nreg</span><span class="o">-&gt;</span><span class="n">rh</span> <span class="o">=</span> <span class="n">rh</span><span class="p">;</span>
+	<span class="n">nreg</span><span class="o">-&gt;</span><span class="n">key</span> <span class="o">=</span> <span class="n">region</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nreg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nreg</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">bio_list_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nreg</span><span class="o">-&gt;</span><span class="n">delayed_bios</span><span class="p">);</span>
+
+	<span class="n">write_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_lookup</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="p">)</span>
+		<span class="cm">/* We lost the race. */</span>
+		<span class="n">mempool_free</span><span class="p">(</span><span class="n">nreg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+	<span class="k">else</span> <span class="p">{</span>
+		<span class="n">__rh_insert</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">nreg</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">nreg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">DM_RH_CLEAN</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nreg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">clean_regions</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">reg</span> <span class="o">=</span> <span class="n">nreg</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">write_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">reg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="nf">__rh_find</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_lookup</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">reg</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+		<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_alloc</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+		<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">reg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_rh_get_state</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">,</span> <span class="kt">int</span> <span class="n">may_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_lookup</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The region wasn&#39;t in the hash, so we fall back to the</span>
+<span class="cm">	 * dirty log.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">in_sync</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">region</span><span class="p">,</span> <span class="n">may_block</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Any error from the dirty log (eg. -EWOULDBLOCK) gets</span>
+<span class="cm">	 * taken as a DM_RH_NOSYNC</span>
+<span class="cm">	 */</span>
+	<span class="k">return</span> <span class="n">r</span> <span class="o">==</span> <span class="mi">1</span> <span class="o">?</span> <span class="n">DM_RH_CLEAN</span> <span class="o">:</span> <span class="n">DM_RH_NOSYNC</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_get_state</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">complete_resync_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">success</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span> <span class="o">=</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">rh</span><span class="p">;</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">set_region_sync</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">,</span> <span class="n">success</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Dispatch the bios before we call &#39;wake_up_all&#39;.</span>
+<span class="cm">	 * This is important because if we are suspending,</span>
+<span class="cm">	 * we want to know that recovery is complete and</span>
+<span class="cm">	 * the work queue is flushed.  If we wake_up_all</span>
+<span class="cm">	 * before we dispatch_bios (queue bios and call wake()),</span>
+<span class="cm">	 * then we risk suspending before the work queue</span>
+<span class="cm">	 * has been properly flushed.</span>
+<span class="cm">	 */</span>
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">dispatch_bios</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">delayed_bios</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">))</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_all_recovery_waiters</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+	<span class="n">up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* dm_rh_mark_nosync</span>
+<span class="cm"> * @ms</span>
+<span class="cm"> * @bio</span>
+<span class="cm"> *</span>
+<span class="cm"> * The bio was written on some mirror(s) but failed on other mirror(s).</span>
+<span class="cm"> * We can successfully endio the bio but should avoid the region being</span>
+<span class="cm"> * marked clean by setting the state DM_RH_NOSYNC.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function is _not_ safe in interrupt context!</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dm_rh_mark_nosync</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_dirty_log</span> <span class="o">*</span><span class="n">log</span> <span class="o">=</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+	<span class="n">region_t</span> <span class="n">region</span> <span class="o">=</span> <span class="n">dm_rh_bio_to_region</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">recovering</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span> <span class="o">&amp;</span> <span class="n">REQ_FLUSH</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">flush_failure</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* We must inform the log that the sync count has changed. */</span>
+	<span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">set_region_sync</span><span class="p">(</span><span class="n">log</span><span class="p">,</span> <span class="n">region</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_find</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="cm">/* region hash entry should exist because write was in-flight */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">reg</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">));</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Possible cases:</span>
+<span class="cm">	 *   1) DM_RH_DIRTY</span>
+<span class="cm">	 *   2) DM_RH_NOSYNC: was dirty, other preceding writes failed</span>
+<span class="cm">	 *   3) DM_RH_RECOVERING: flushing pending writes</span>
+<span class="cm">	 * Either case, the region should have not been connected to list.</span>
+<span class="cm">	 */</span>
+	<span class="n">recovering</span> <span class="o">=</span> <span class="p">(</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">DM_RH_RECOVERING</span><span class="p">);</span>
+	<span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">DM_RH_NOSYNC</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">));</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">recovering</span><span class="p">)</span>
+		<span class="n">complete_resync_work</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_mark_nosync</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_update_states</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="kt">int</span> <span class="n">errors_handled</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">clean</span><span class="p">);</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">recovered</span><span class="p">);</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">failed_recovered</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Quickly grab the lists.</span>
+<span class="cm">	 */</span>
+	<span class="n">write_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">clean_regions</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">list_splice_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">clean_regions</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">clean</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">clean</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovered_regions</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">list_splice_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovered_regions</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">recovered</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">recovered</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">failed_recovered_regions</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">list_splice_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">failed_recovered_regions</span><span class="p">,</span>
+				 <span class="o">&amp;</span><span class="n">failed_recovered</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">failed_recovered</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="n">write_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * All the regions on the recovered and clean lists have</span>
+<span class="cm">	 * now been pulled out of the system, so no need to do</span>
+<span class="cm">	 * any more locking.</span>
+<span class="cm">	 */</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">recovered</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">clear_region</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">);</span>
+		<span class="n">complete_resync_work</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">mempool_free</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">failed_recovered</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">complete_resync_work</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">errors_handled</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">mempool_free</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">clean</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">clear_region</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">);</span>
+		<span class="n">mempool_free</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_pool</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_update_states</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rh_inc</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_find</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">DM_RH_CLEAN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">DM_RH_DIRTY</span><span class="p">;</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>	<span class="cm">/* take off the clean list */</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">mark_region</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+
+
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_inc_pending</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bios</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bios</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">;</span> <span class="n">bio</span><span class="p">;</span> <span class="n">bio</span> <span class="o">=</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_next</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span> <span class="o">&amp;</span> <span class="n">REQ_FLUSH</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">rh_inc</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">dm_rh_bio_to_region</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">bio</span><span class="p">));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_inc_pending</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_dec</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="n">region_t</span> <span class="n">region</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">should_wake</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_lookup</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * There is no pending I/O for this region.</span>
+<span class="cm">		 * We can move the region to corresponding list for next action.</span>
+<span class="cm">		 * At this point, the region is not yet connected to any list.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * If the state is DM_RH_NOSYNC, the region should be kept off</span>
+<span class="cm">		 * from clean list.</span>
+<span class="cm">		 * The hash entry for DM_RH_NOSYNC will remain in memory</span>
+<span class="cm">		 * until the region is recovered or the map is reloaded.</span>
+<span class="cm">		 */</span>
+
+		<span class="cm">/* do nothing for DM_RH_NOSYNC */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">flush_failure</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * If a write flush failed some time ago, we</span>
+<span class="cm">			 * don&#39;t know whether or not this write made it</span>
+<span class="cm">			 * to the disk, so we must resync the device.</span>
+<span class="cm">			 */</span>
+			<span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">DM_RH_NOSYNC</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">DM_RH_RECOVERING</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">DM_RH_DIRTY</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">DM_RH_CLEAN</span><span class="p">;</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">clean_regions</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">should_wake</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">should_wake</span><span class="p">)</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_workers</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_dec</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Starts quiescing a region in preparation for recovery.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__rh_recovery_prepare</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">region_t</span> <span class="n">region</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ask the dirty log what&#39;s next.</span>
+<span class="cm">	 */</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">get_resync_work</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">region</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Get this region, and start it quiescing by setting the</span>
+<span class="cm">	 * recovering flag.</span>
+<span class="cm">	 */</span>
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_find</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">region</span><span class="p">);</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="n">reg</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">DM_RH_RECOVERING</span><span class="p">;</span>
+
+	<span class="cm">/* Already quiesced ? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">))</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">);</span>
+
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_recovery_prepare</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Extra reference to avoid race with dm_rh_stop_recovery */</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">down_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">__rh_recovery_prepare</span><span class="p">(</span><span class="n">rh</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">);</span>
+			<span class="n">up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Drop the extra reference */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">))</span>
+		<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_all_recovery_waiters</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_recovery_prepare</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Returns any quiesced regions.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="nf">dm_rh_recovery_start</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">reg</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">quiesced_regions</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">dm_region</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>  <span class="cm">/* remove from the quiesced list */</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">reg</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_recovery_start</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_recovery_end</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">success</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span> <span class="o">=</span> <span class="n">reg</span><span class="o">-&gt;</span><span class="n">rh</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">success</span><span class="p">)</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovered_regions</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">failed_recovered_regions</span><span class="p">);</span>
+
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">region_lock</span><span class="p">);</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_workers</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_recovery_end</span><span class="p">);</span>
+
+<span class="cm">/* Return recovery in flight count. */</span>
+<span class="kt">int</span> <span class="nf">dm_rh_recovery_in_flight</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_in_flight</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_recovery_in_flight</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">dm_rh_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">flush</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_flush</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_delay</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_region</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+	<span class="n">reg</span> <span class="o">=</span> <span class="n">__rh_find</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">dm_rh_bio_to_region</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">bio</span><span class="p">));</span>
+	<span class="n">bio_list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">reg</span><span class="o">-&gt;</span><span class="n">delayed_bios</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">hash_lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_delay</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_stop_recovery</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/* wait for any recovering regions */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">max_recovery</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">down</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_stop_recovery</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_rh_start_recovery</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_region_hash</span> <span class="o">*</span><span class="n">rh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">rh</span><span class="o">-&gt;</span><span class="n">max_recovery</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">recovery_count</span><span class="p">);</span>
+
+	<span class="n">rh</span><span class="o">-&gt;</span><span class="n">wakeup_workers</span><span class="p">(</span><span class="n">rh</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_rh_start_recovery</span><span class="p">);</span>
+
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="n">DM_NAME</span> <span class="s">&quot; region hash&quot;</span><span class="p">);</span>
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Joe Thornber/Heinz Mauelshagen &lt;dm-devel@redhat.com&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

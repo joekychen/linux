@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › sched › sch_sfq.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>sch_sfq.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * net/sched/sch_sfq.c	Stochastic Fairness Queueing discipline.</span>
+<span class="cm"> *</span>
+<span class="cm"> *		This program is free software; you can redistribute it and/or</span>
+<span class="cm"> *		modify it under the terms of the GNU General Public License</span>
+<span class="cm"> *		as published by the Free Software Foundation; either version</span>
+<span class="cm"> *		2 of the License, or (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Authors:	Alexey Kuznetsov, &lt;kuznet@ms2.inr.ac.ru&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/jiffies.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/in.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;linux/jhash.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/vmalloc.h&gt;</span>
+<span class="cp">#include &lt;net/netlink.h&gt;</span>
+<span class="cp">#include &lt;net/pkt_sched.h&gt;</span>
+<span class="cp">#include &lt;net/flow_keys.h&gt;</span>
+<span class="cp">#include &lt;net/red.h&gt;</span>
+
+
+<span class="cm">/*	Stochastic Fairness Queuing algorithm.</span>
+<span class="cm">	=======================================</span>
+
+<span class="cm">	Source:</span>
+<span class="cm">	Paul E. McKenney &quot;Stochastic Fairness Queuing&quot;,</span>
+<span class="cm">	IEEE INFOCOMM&#39;90 Proceedings, San Francisco, 1990.</span>
+
+<span class="cm">	Paul E. McKenney &quot;Stochastic Fairness Queuing&quot;,</span>
+<span class="cm">	&quot;Interworking: Research and Experience&quot;, v.2, 1991, p.113-131.</span>
+
+
+<span class="cm">	See also:</span>
+<span class="cm">	M. Shreedhar and George Varghese &quot;Efficient Fair</span>
+<span class="cm">	Queuing using Deficit Round Robin&quot;, Proc. SIGCOMM 95.</span>
+
+
+<span class="cm">	This is not the thing that is usually called (W)FQ nowadays.</span>
+<span class="cm">	It does not use any timestamp mechanism, but instead</span>
+<span class="cm">	processes queues in round-robin order.</span>
+
+<span class="cm">	ADVANTAGE:</span>
+
+<span class="cm">	- It is very cheap. Both CPU and memory requirements are minimal.</span>
+
+<span class="cm">	DRAWBACKS:</span>
+
+<span class="cm">	- &quot;Stochastic&quot; -&gt; It is not 100% fair.</span>
+<span class="cm">	When hash collisions occur, several flows are considered as one.</span>
+
+<span class="cm">	- &quot;Round-robin&quot; -&gt; It introduces larger delays than virtual clock</span>
+<span class="cm">	based schemes, and should not be used for isolating interactive</span>
+<span class="cm">	traffic	from non-interactive. It means, that this scheduler</span>
+<span class="cm">	should be used as leaf of CBQ or P3, which put interactive traffic</span>
+<span class="cm">	to higher priority band.</span>
+
+<span class="cm">	We still need true WFQ for top level CSZ, but using WFQ</span>
+<span class="cm">	for the best effort traffic is absolutely pointless:</span>
+<span class="cm">	SFQ is superior for this purpose.</span>
+
+<span class="cm">	IMPLEMENTATION:</span>
+<span class="cm">	This implementation limits :</span>
+<span class="cm">	- maximal queue length per flow to 127 packets.</span>
+<span class="cm">	- max mtu to 2^18-1;</span>
+<span class="cm">	- max 65408 flows,</span>
+<span class="cm">	- number of hash buckets to 65536.</span>
+
+<span class="cm">	It is easy to increase these values, but not in flight.  */</span>
+
+<span class="cp">#define SFQ_MAX_DEPTH		127 </span><span class="cm">/* max number of packets per flow */</span><span class="cp"></span>
+<span class="cp">#define SFQ_DEFAULT_FLOWS	128</span>
+<span class="cp">#define SFQ_MAX_FLOWS		(0x10000 - SFQ_MAX_DEPTH - 1) </span><span class="cm">/* max number of flows */</span><span class="cp"></span>
+<span class="cp">#define SFQ_EMPTY_SLOT		0xffff</span>
+<span class="cp">#define SFQ_DEFAULT_HASH_DIVISOR 1024</span>
+
+<span class="cm">/* We use 16 bits to store allot, and want to handle packets up to 64K</span>
+<span class="cm"> * Scale allot by 8 (1&lt;&lt;3) so that no overflow occurs.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SFQ_ALLOT_SHIFT		3</span>
+<span class="cp">#define SFQ_ALLOT_SIZE(X)	DIV_ROUND_UP(X, 1 &lt;&lt; SFQ_ALLOT_SHIFT)</span>
+
+<span class="cm">/* This type should contain at least SFQ_MAX_DEPTH + 1 + SFQ_MAX_FLOWS values */</span>
+<span class="k">typedef</span> <span class="n">u16</span> <span class="n">sfq_index</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We dont use pointers to save space.</span>
+<span class="cm"> * Small indexes [0 ... SFQ_MAX_FLOWS - 1] are &#39;pointers&#39; to slots[] array</span>
+<span class="cm"> * while following values [SFQ_MAX_FLOWS ... SFQ_MAX_FLOWS + SFQ_MAX_DEPTH]</span>
+<span class="cm"> * are &#39;pointers&#39; to dep[] array</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">sfq_head</span> <span class="p">{</span>
+	<span class="n">sfq_index</span>	<span class="n">next</span><span class="p">;</span>
+	<span class="n">sfq_index</span>	<span class="n">prev</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span>	<span class="o">*</span><span class="n">skblist_next</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span>	<span class="o">*</span><span class="n">skblist_prev</span><span class="p">;</span>
+	<span class="n">sfq_index</span>	<span class="n">qlen</span><span class="p">;</span> <span class="cm">/* number of skbs in skblist */</span>
+	<span class="n">sfq_index</span>	<span class="n">next</span><span class="p">;</span> <span class="cm">/* next slot in sfq RR chain */</span>
+	<span class="k">struct</span> <span class="n">sfq_head</span> <span class="n">dep</span><span class="p">;</span> <span class="cm">/* anchor in dep[] chains */</span>
+	<span class="kt">unsigned</span> <span class="kt">short</span>	<span class="n">hash</span><span class="p">;</span> <span class="cm">/* hash value (index in ht[]) */</span>
+	<span class="kt">short</span>		<span class="n">allot</span><span class="p">;</span> <span class="cm">/* credit for this slot */</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>    <span class="n">backlog</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">red_vars</span> <span class="n">vars</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="p">{</span>
+<span class="cm">/* frequently used fields */</span>
+	<span class="kt">int</span>		<span class="n">limit</span><span class="p">;</span>		<span class="cm">/* limit of total number of packets in this qdisc */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">divisor</span><span class="p">;</span>	<span class="cm">/* number of slots in hash table */</span>
+	<span class="n">u8</span>		<span class="n">headdrop</span><span class="p">;</span>
+	<span class="n">u8</span>		<span class="n">maxdepth</span><span class="p">;</span>	<span class="cm">/* limit of packets per flow */</span>
+
+	<span class="n">u32</span>		<span class="n">perturbation</span><span class="p">;</span>
+	<span class="n">u8</span>		<span class="n">cur_depth</span><span class="p">;</span>	<span class="cm">/* depth of longest slot */</span>
+	<span class="n">u8</span>		<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">short</span>  <span class="n">scaled_quantum</span><span class="p">;</span> <span class="cm">/* SFQ_ALLOT_SIZE(quantum) */</span>
+	<span class="k">struct</span> <span class="n">tcf_proto</span> <span class="o">*</span><span class="n">filter_list</span><span class="p">;</span>
+	<span class="n">sfq_index</span>	<span class="o">*</span><span class="n">ht</span><span class="p">;</span>		<span class="cm">/* Hash table (&#39;divisor&#39; slots) */</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span>	<span class="o">*</span><span class="n">slots</span><span class="p">;</span>		<span class="cm">/* Flows table (&#39;maxflows&#39; entries) */</span>
+
+	<span class="k">struct</span> <span class="n">red_parms</span> <span class="o">*</span><span class="n">red_parms</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tc_sfqred_stats</span> <span class="n">stats</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">tail</span><span class="p">;</span>		<span class="cm">/* current slot in round */</span>
+
+	<span class="k">struct</span> <span class="n">sfq_head</span>	<span class="n">dep</span><span class="p">[</span><span class="n">SFQ_MAX_DEPTH</span> <span class="o">+</span> <span class="mi">1</span><span class="p">];</span>
+					<span class="cm">/* Linked lists of slots, indexed by depth</span>
+<span class="cm">					 * dep[0] : list of unused flows</span>
+<span class="cm">					 * dep[1] : list of flows with 1 packet</span>
+<span class="cm">					 * dep[X] : list of flows with X packets</span>
+<span class="cm">					 */</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">maxflows</span><span class="p">;</span>	<span class="cm">/* number of flows in flows array */</span>
+	<span class="kt">int</span>		<span class="n">perturb_period</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">quantum</span><span class="p">;</span>	<span class="cm">/* Allotment per round: MUST BE &gt;= MTU */</span>
+	<span class="k">struct</span> <span class="n">timer_list</span> <span class="n">perturb_timer</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * sfq_head are either in a sfq_slot or in dep[] array</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">sfq_head</span> <span class="o">*</span><span class="nf">sfq_dep_head</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="n">sfq_index</span> <span class="n">val</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">val</span> <span class="o">&lt;</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">val</span><span class="p">].</span><span class="n">dep</span><span class="p">;</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">val</span> <span class="o">-</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * In order to be able to quickly rehash our queue when timer changes</span>
+<span class="cm"> * q-&gt;perturbation, we store flow_keys in skb-&gt;cb[]</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">sfq_skb_cb</span> <span class="p">{</span>
+       <span class="k">struct</span> <span class="n">flow_keys</span>        <span class="n">keys</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">sfq_skb_cb</span> <span class="o">*</span><span class="nf">sfq_skb_cb</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">qdisc_cb_private_validate</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_skb_cb</span><span class="p">));</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sfq_skb_cb</span> <span class="o">*</span><span class="p">)</span><span class="n">qdisc_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">sfq_hash</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span>
+			     <span class="k">const</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">flow_keys</span> <span class="o">*</span><span class="n">keys</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sfq_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hash</span><span class="p">;</span>
+
+	<span class="n">hash</span> <span class="o">=</span> <span class="n">jhash_3words</span><span class="p">((</span><span class="n">__force</span> <span class="n">u32</span><span class="p">)</span><span class="n">keys</span><span class="o">-&gt;</span><span class="n">dst</span><span class="p">,</span>
+			    <span class="p">(</span><span class="n">__force</span> <span class="n">u32</span><span class="p">)</span><span class="n">keys</span><span class="o">-&gt;</span><span class="n">src</span> <span class="o">^</span> <span class="n">keys</span><span class="o">-&gt;</span><span class="n">ip_proto</span><span class="p">,</span>
+			    <span class="p">(</span><span class="n">__force</span> <span class="n">u32</span><span class="p">)</span><span class="n">keys</span><span class="o">-&gt;</span><span class="n">ports</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">perturbation</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">hash</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">sfq_classify</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span>
+				 <span class="kt">int</span> <span class="o">*</span><span class="n">qerr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tcf_result</span> <span class="n">res</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">TC_H_MAJ</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">priority</span><span class="p">)</span> <span class="o">==</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">handle</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">priority</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">priority</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">priority</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">skb_flow_dissect</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sfq_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">sfq_hash</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">skb</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">qerr</span> <span class="o">=</span> <span class="n">NET_XMIT_SUCCESS</span> <span class="o">|</span> <span class="n">__NET_XMIT_BYPASS</span><span class="p">;</span>
+	<span class="n">result</span> <span class="o">=</span> <span class="n">tc_classify</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">res</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_NET_CLS_ACT</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">result</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">TC_ACT_STOLEN</span>:
+		<span class="k">case</span> <span class="n">TC_ACT_QUEUED</span>:
+			<span class="o">*</span><span class="n">qerr</span> <span class="o">=</span> <span class="n">NET_XMIT_SUCCESS</span> <span class="o">|</span> <span class="n">__NET_XMIT_STOLEN</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">TC_ACT_SHOT</span>:
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="cp">#endif</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">classid</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">classid</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * x : slot number [0 .. SFQ_MAX_FLOWS - 1]</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">sfq_link</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="n">sfq_index</span> <span class="n">x</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">sfq_index</span> <span class="n">p</span><span class="p">,</span> <span class="n">n</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">qlen</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">qlen</span> <span class="o">+</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">;</span>
+	<span class="n">n</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">qlen</span><span class="p">].</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">.</span><span class="n">next</span> <span class="o">=</span> <span class="n">n</span><span class="p">;</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">.</span><span class="n">prev</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">qlen</span><span class="p">].</span><span class="n">next</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>		<span class="cm">/* sfq_dep_head(q, p)-&gt;next = x */</span>
+	<span class="n">sfq_dep_head</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define sfq_unlink(q, x, n, p)			\</span>
+<span class="cp">	n = q-&gt;slots[x].dep.next;		\</span>
+<span class="cp">	p = q-&gt;slots[x].dep.prev;		\</span>
+<span class="cp">	sfq_dep_head(q, p)-&gt;next = n;		\</span>
+<span class="cp">	sfq_dep_head(q, n)-&gt;prev = p</span>
+
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">sfq_dec</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="n">sfq_index</span> <span class="n">x</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">sfq_index</span> <span class="n">p</span><span class="p">,</span> <span class="n">n</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">d</span><span class="p">;</span>
+
+	<span class="n">sfq_unlink</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+
+	<span class="n">d</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">].</span><span class="n">qlen</span><span class="o">--</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">n</span> <span class="o">==</span> <span class="n">p</span> <span class="o">&amp;&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span> <span class="o">==</span> <span class="n">d</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">sfq_link</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">sfq_inc</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="n">sfq_index</span> <span class="n">x</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">sfq_index</span> <span class="n">p</span><span class="p">,</span> <span class="n">n</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">d</span><span class="p">;</span>
+
+	<span class="n">sfq_unlink</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+
+	<span class="n">d</span> <span class="o">=</span> <span class="o">++</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">].</span><span class="n">qlen</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span> <span class="o">&lt;</span> <span class="n">d</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span> <span class="o">=</span> <span class="n">d</span><span class="p">;</span>
+	<span class="n">sfq_link</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* helper functions : might be changed when/if skb use a standard list_head */</span>
+
+<span class="cm">/* remove one skb from tail of slot queue */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">slot_dequeue_tail</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span><span class="p">;</span>
+
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">prev</span><span class="p">;</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">prev</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">)</span><span class="n">slot</span><span class="p">;</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* remove one skb from head of slot queue */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">slot_dequeue_head</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_next</span><span class="p">;</span>
+
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_next</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">next</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">)</span><span class="n">slot</span><span class="p">;</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">slot_queue_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">slot</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">slot</span><span class="p">));</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_next</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">)</span><span class="n">slot</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* add skb to slot queue (tail add) */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">slot_queue_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span><span class="p">;</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">)</span><span class="n">slot</span><span class="p">;</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">skb</span><span class="p">;</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_prev</span> <span class="o">=</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define	slot_queue_walk(slot, skb)		\</span>
+<span class="cp">	for (skb = slot-&gt;skblist_next;		\</span>
+<span class="cp">	     skb != (struct sk_buff *)slot;	\</span>
+<span class="cp">	     skb = skb-&gt;next)</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">sfq_drop</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">sfq_index</span> <span class="n">x</span><span class="p">,</span> <span class="n">d</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+
+	<span class="cm">/* Queue is full! Find the longest slot and drop tail packet from it */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">d</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">d</span><span class="p">].</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+<span class="nl">drop:</span>
+		<span class="n">skb</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">headdrop</span> <span class="o">?</span> <span class="n">slot_dequeue_head</span><span class="p">(</span><span class="n">slot</span><span class="p">)</span> <span class="o">:</span> <span class="n">slot_dequeue_tail</span><span class="p">(</span><span class="n">slot</span><span class="p">);</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">sfq_dec</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">);</span>
+		<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="o">--</span><span class="p">;</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">drops</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">d</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* It is difficult to believe, but ALL THE SLOTS HAVE LENGTH 1. */</span>
+		<span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">drop</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Is ECN parameter configured */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_prob_mark</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">TC_RED_ECN</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Should packets over max threshold just be marked */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_hard_mark</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">TC_RED_ECN</span> <span class="o">|</span> <span class="n">TC_RED_HARDDROP</span><span class="p">))</span> <span class="o">==</span> <span class="n">TC_RED_ECN</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_headdrop</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">headdrop</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">sfq_enqueue</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hash</span><span class="p">;</span>
+	<span class="n">sfq_index</span> <span class="n">x</span><span class="p">,</span> <span class="n">qlen</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">uninitialized_var</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">head</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">delta</span><span class="p">;</span>
+
+	<span class="n">hash</span> <span class="o">=</span> <span class="n">sfq_classify</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ret</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hash</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&amp;</span> <span class="n">__NET_XMIT_BYPASS</span><span class="p">)</span>
+			<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">drops</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">hash</span><span class="o">--</span><span class="p">;</span>
+
+	<span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">hash</span><span class="p">];</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">x</span> <span class="o">==</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">next</span><span class="p">;</span> <span class="cm">/* get a free slot */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">x</span> <span class="o">&gt;=</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">hash</span> <span class="o">=</span> <span class="n">hash</span><span class="p">;</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* should already be 0 anyway... */</span>
+		<span class="n">red_set_vars</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">enqueue</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span> <span class="o">=</span> <span class="n">red_calc_qavg_no_idle_time</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">,</span>
+							<span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">,</span>
+							<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span><span class="p">);</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">red_action</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">,</span>
+				   <span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">,</span>
+				   <span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">RED_DONT_MARK</span>:
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="n">RED_PROB_MARK</span>:
+			<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">overlimits</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">sfq_prob_mark</span><span class="p">(</span><span class="n">q</span><span class="p">))</span> <span class="p">{</span>
+				<span class="cm">/* We know we have at least one packet in queue */</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">sfq_headdrop</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+				    <span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_next</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_mark_head</span><span class="o">++</span><span class="p">;</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_mark</span><span class="o">++</span><span class="p">;</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_drop</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">congestion_drop</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="n">RED_HARD_MARK</span>:
+			<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">overlimits</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">sfq_hard_mark</span><span class="p">(</span><span class="n">q</span><span class="p">))</span> <span class="p">{</span>
+				<span class="cm">/* We know we have at least one packet in queue */</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">sfq_headdrop</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+				    <span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">skblist_next</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_mark_head</span><span class="o">++</span><span class="p">;</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_mark</span><span class="o">++</span><span class="p">;</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_drop</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">congestion_drop</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span> <span class="o">&gt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span><span class="p">)</span> <span class="p">{</span>
+<span class="nl">congestion_drop:</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sfq_headdrop</span><span class="p">(</span><span class="n">q</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+
+		<span class="cm">/* We know we have at least one packet in queue */</span>
+		<span class="n">head</span> <span class="o">=</span> <span class="n">slot_dequeue_head</span><span class="p">(</span><span class="n">slot</span><span class="p">);</span>
+		<span class="n">delta</span> <span class="o">=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">head</span><span class="p">)</span> <span class="o">-</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">delta</span><span class="p">;</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">delta</span><span class="p">;</span>
+		<span class="n">qdisc_drop</span><span class="p">(</span><span class="n">head</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+
+		<span class="n">slot_queue_add</span><span class="p">(</span><span class="n">slot</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">NET_XMIT_CN</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">enqueue:</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">+=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">+=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">slot_queue_add</span><span class="p">(</span><span class="n">slot</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+	<span class="n">sfq_inc</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>		<span class="cm">/* The flow is new */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>	<span class="cm">/* It is the first flow */</span>
+			<span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="cm">/* We put this flow at the end of our flow list.</span>
+<span class="cm">		 * This might sound unfair for a new flow to wait after old ones,</span>
+<span class="cm">		 * but we could endup servicing new flows only, and freeze old ones.</span>
+<span class="cm">		 */</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+		<span class="cm">/* We could use a bigger initial quantum for new flows */</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">scaled_quantum</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span> <span class="o">&lt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">NET_XMIT_SUCCESS</span><span class="p">;</span>
+
+	<span class="n">qlen</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">;</span>
+	<span class="n">sfq_drop</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="cm">/* Return Congestion Notification only if we dropped a packet</span>
+<span class="cm">	 * from this flow.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">qlen</span> <span class="o">!=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">NET_XMIT_CN</span><span class="p">;</span>
+
+	<span class="cm">/* As we dropped a packet, better let upper stack know this */</span>
+	<span class="n">qdisc_tree_decrease_qlen</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">NET_XMIT_SUCCESS</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span>
+<span class="nf">sfq_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="n">sfq_index</span> <span class="n">a</span><span class="p">,</span> <span class="n">next_a</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+
+	<span class="cm">/* No active slots */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="nl">next_slot:</span>
+	<span class="n">a</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">a</span><span class="p">];</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">+=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">scaled_quantum</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">next_slot</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">slot_dequeue_head</span><span class="p">(</span><span class="n">slot</span><span class="p">);</span>
+	<span class="n">sfq_dec</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">a</span><span class="p">);</span>
+	<span class="n">qdisc_bstats_update</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="cm">/* Is the slot empty? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">;</span>
+		<span class="n">next_a</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">a</span> <span class="o">==</span> <span class="n">next_a</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span> <span class="cm">/* no more active slots */</span>
+			<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">next_a</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">-=</span> <span class="n">SFQ_ALLOT_SIZE</span><span class="p">(</span><span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">));</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">sfq_reset</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">skb</span> <span class="o">=</span> <span class="n">sfq_dequeue</span><span class="p">(</span><span class="n">sch</span><span class="p">))</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When q-&gt;perturbation is changed, we rehash all queued skbs</span>
+<span class="cm"> * to avoid OOO (Out Of Order) effects.</span>
+<span class="cm"> * We dont use sfq_dequeue()/sfq_enqueue() because we dont want to change</span>
+<span class="cm"> * counters.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_rehash</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">dropped</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">__skb_queue_head_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">skb</span> <span class="o">=</span> <span class="n">slot_dequeue_head</span><span class="p">(</span><span class="n">slot</span><span class="p">);</span>
+			<span class="n">sfq_dec</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+			<span class="n">__skb_queue_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">red_set_vars</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">skb</span> <span class="o">=</span> <span class="n">__skb_dequeue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">))</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hash</span> <span class="o">=</span> <span class="n">sfq_hash</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="n">sfq_index</span> <span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">hash</span><span class="p">];</span>
+
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">x</span> <span class="o">==</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">x</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">next</span><span class="p">;</span> <span class="cm">/* get a free slot */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">x</span> <span class="o">&gt;=</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">)</span> <span class="p">{</span>
+<span class="nl">drop:</span>				<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+				<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+				<span class="n">dropped</span><span class="o">++</span><span class="p">;</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+			<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+			<span class="n">slot</span><span class="o">-&gt;</span><span class="n">hash</span> <span class="o">=</span> <span class="n">hash</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span> <span class="o">&gt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">drop</span><span class="p">;</span>
+		<span class="n">slot_queue_add</span><span class="p">(</span><span class="n">slot</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">)</span>
+			<span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span> <span class="o">=</span> <span class="n">red_calc_qavg</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">,</span>
+							<span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">,</span>
+							<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span><span class="p">);</span>
+		<span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span> <span class="o">+=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">sfq_inc</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">x</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>		<span class="cm">/* The flow is new */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>	<span class="cm">/* It is the first flow */</span>
+				<span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">slot</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+			<span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">scaled_quantum</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span> <span class="o">-=</span> <span class="n">dropped</span><span class="p">;</span>
+	<span class="n">qdisc_tree_decrease_qlen</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">dropped</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_perturbation</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">spinlock_t</span> <span class="o">*</span><span class="n">root_lock</span> <span class="o">=</span> <span class="n">qdisc_lock</span><span class="p">(</span><span class="n">qdisc_root_sleeping</span><span class="p">(</span><span class="n">sch</span><span class="p">));</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="n">root_lock</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturbation</span> <span class="o">=</span> <span class="n">net_random</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span> <span class="o">&amp;&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="n">sfq_rehash</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="n">root_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span><span class="p">)</span>
+		<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_change</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tc_sfq_qopt</span> <span class="o">*</span><span class="n">ctl</span> <span class="o">=</span> <span class="n">nla_data</span><span class="p">(</span><span class="n">opt</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tc_sfq_qopt_v1</span> <span class="o">*</span><span class="n">ctl_v1</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">qlen</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">red_parms</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span><span class="o">-&gt;</span><span class="n">nla_len</span> <span class="o">&lt;</span> <span class="n">nla_attr_size</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ctl</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span><span class="o">-&gt;</span><span class="n">nla_len</span> <span class="o">&gt;=</span> <span class="n">nla_attr_size</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ctl_v1</span><span class="p">)))</span>
+		<span class="n">ctl_v1</span> <span class="o">=</span> <span class="n">nla_data</span><span class="p">(</span><span class="n">opt</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">divisor</span> <span class="o">&amp;&amp;</span>
+	    <span class="p">(</span><span class="o">!</span><span class="n">is_power_of_2</span><span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">)</span> <span class="o">||</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">divisor</span> <span class="o">&gt;</span> <span class="mi">65536</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl_v1</span> <span class="o">&amp;&amp;</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">qth_min</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">p</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">p</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">sch_tree_lock</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">quantum</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">quantum</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">quantum</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">scaled_quantum</span> <span class="o">=</span> <span class="n">SFQ_ALLOT_SIZE</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">quantum</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">perturb_period</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">flows</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="n">u32</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">flows</span><span class="p">,</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="n">u32</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl_v1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">)</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="n">u32</span><span class="p">,</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">,</span> <span class="n">SFQ_MAX_DEPTH</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">swap</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+			<span class="n">red_set_parms</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">,</span>
+				      <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">qth_min</span><span class="p">,</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">qth_max</span><span class="p">,</span>
+				      <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">Wlog</span><span class="p">,</span>
+				      <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">Plog</span><span class="p">,</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">Scell_log</span><span class="p">,</span>
+				      <span class="nb">NULL</span><span class="p">,</span>
+				      <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">max_P</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">headdrop</span> <span class="o">=</span> <span class="n">ctl_v1</span><span class="o">-&gt;</span><span class="n">headdrop</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="n">u32</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span> <span class="o">*</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="n">u32</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">qlen</span> <span class="o">=</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span> <span class="o">&gt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">)</span>
+		<span class="n">sfq_drop</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">qdisc_tree_decrease_qlen</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">qlen</span> <span class="o">-</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">);</span>
+
+	<span class="n">del_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturbation</span> <span class="o">=</span> <span class="n">net_random</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">sch_tree_unlock</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">sfq_alloc</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">sz</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">ptr</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">sz</span><span class="p">,</span> <span class="n">GFP_KERNEL</span> <span class="o">|</span> <span class="n">__GFP_NOWARN</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ptr</span><span class="p">)</span>
+		<span class="n">ptr</span> <span class="o">=</span> <span class="n">vmalloc</span><span class="p">(</span><span class="n">sz</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ptr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">addr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_vmalloc_addr</span><span class="p">(</span><span class="n">addr</span><span class="p">))</span>
+			<span class="n">vfree</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="n">tcf_destroy_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">del_timer_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">);</span>
+	<span class="n">sfq_free</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">);</span>
+	<span class="n">sfq_free</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">.</span><span class="n">function</span> <span class="o">=</span> <span class="n">sfq_perturbation</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">sch</span><span class="p">;</span>
+	<span class="n">init_timer_deferrable</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_timer</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">SFQ_MAX_DEPTH</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">next</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">dep</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">prev</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="n">SFQ_MAX_FLOWS</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">SFQ_MAX_DEPTH</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span> <span class="o">=</span> <span class="n">SFQ_MAX_DEPTH</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">cur_depth</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span> <span class="o">=</span> <span class="n">SFQ_DEFAULT_HASH_DIVISOR</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span> <span class="o">=</span> <span class="n">SFQ_DEFAULT_FLOWS</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">quantum</span> <span class="o">=</span> <span class="n">psched_mtu</span><span class="p">(</span><span class="n">qdisc_dev</span><span class="p">(</span><span class="n">sch</span><span class="p">));</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">scaled_quantum</span> <span class="o">=</span> <span class="n">SFQ_ALLOT_SIZE</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">quantum</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">perturbation</span> <span class="o">=</span> <span class="n">net_random</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="n">sfq_change</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">opt</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span> <span class="o">=</span> <span class="n">sfq_alloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">);</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span> <span class="o">=</span> <span class="n">sfq_alloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span> <span class="o">||</span> <span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sfq_destroy</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">slot_queue_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">sfq_link</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">TCQ_F_CAN_BYPASS</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TCQ_F_CAN_BYPASS</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_dump</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tc_sfq_qopt_v1</span> <span class="n">opt</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">red_parms</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">red_parms</span><span class="p">;</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">opt</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">opt</span><span class="p">));</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">v0</span><span class="p">.</span><span class="n">quantum</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">quantum</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">v0</span><span class="p">.</span><span class="n">perturb_period</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">perturb_period</span> <span class="o">/</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">v0</span><span class="p">.</span><span class="n">limit</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">v0</span><span class="p">.</span><span class="n">divisor</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">v0</span><span class="p">.</span><span class="n">flows</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxflows</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">depth</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">maxdepth</span><span class="p">;</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">headdrop</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">headdrop</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">qth_min</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">qth_min</span> <span class="o">&gt;&gt;</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">Wlog</span><span class="p">;</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">qth_max</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">qth_max</span> <span class="o">&gt;&gt;</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">Wlog</span><span class="p">;</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">Wlog</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">Wlog</span><span class="p">;</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">Plog</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">Plog</span><span class="p">;</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">Scell_log</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">Scell_log</span><span class="p">;</span>
+		<span class="n">opt</span><span class="p">.</span><span class="n">max_P</span>	<span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">max_P</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">opt</span><span class="p">.</span><span class="n">stats</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">opt</span><span class="p">.</span><span class="n">stats</span><span class="p">));</span>
+	<span class="n">opt</span><span class="p">.</span><span class="n">flags</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nla_put</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">TCA_OPTIONS</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">opt</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">opt</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">nla_put_failure</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+
+<span class="nl">nla_put_failure:</span>
+	<span class="n">nlmsg_trim</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">b</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="nf">sfq_leaf</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">sfq_get</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="n">u32</span> <span class="n">classid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">sfq_bind</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">parent</span><span class="p">,</span>
+			      <span class="n">u32</span> <span class="n">classid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* we cannot bypass queue discipline anymore */</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TCQ_F_CAN_BYPASS</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tcf_proto</span> <span class="o">**</span><span class="nf">sfq_find_tcf</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cl</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_dump_class</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tcmsg</span> <span class="o">*</span><span class="n">tcm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tcm</span><span class="o">-&gt;</span><span class="n">tcm_handle</span> <span class="o">|=</span> <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">cl</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sfq_dump_class_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">gnet_dump</span> <span class="o">*</span><span class="n">d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">sfq_index</span> <span class="n">idx</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">cl</span> <span class="o">-</span> <span class="mi">1</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">gnet_stats_queue</span> <span class="n">qs</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+	<span class="k">struct</span> <span class="n">tc_sfq_xstats</span> <span class="n">xstats</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">idx</span> <span class="o">!=</span> <span class="n">SFQ_EMPTY_SLOT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">const</span> <span class="k">struct</span> <span class="n">sfq_slot</span> <span class="o">*</span><span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">idx</span><span class="p">];</span>
+
+		<span class="n">xstats</span><span class="p">.</span><span class="n">allot</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">allot</span> <span class="o">&lt;&lt;</span> <span class="n">SFQ_ALLOT_SHIFT</span><span class="p">;</span>
+		<span class="n">qs</span><span class="p">.</span><span class="n">qlen</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">qlen</span><span class="p">;</span>
+		<span class="n">qs</span><span class="p">.</span><span class="n">backlog</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">backlog</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gnet_stats_copy_queue</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">qs</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">gnet_stats_copy_app</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">xstats</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">xstats</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sfq_walk</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">qdisc_walker</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sfq_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">stop</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">divisor</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">SFQ_EMPTY_SLOT</span> <span class="o">||</span>
+		    <span class="n">arg</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">skip</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">arg</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">fn</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">arg</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">arg</span><span class="o">-&gt;</span><span class="n">stop</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">arg</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">Qdisc_class_ops</span> <span class="n">sfq_class_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">leaf</span>		<span class="o">=</span>	<span class="n">sfq_leaf</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">get</span>		<span class="o">=</span>	<span class="n">sfq_get</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">put</span>		<span class="o">=</span>	<span class="n">sfq_put</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">tcf_chain</span>	<span class="o">=</span>	<span class="n">sfq_find_tcf</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">bind_tcf</span>	<span class="o">=</span>	<span class="n">sfq_bind</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unbind_tcf</span>	<span class="o">=</span>	<span class="n">sfq_put</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump</span>		<span class="o">=</span>	<span class="n">sfq_dump_class</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump_stats</span>	<span class="o">=</span>	<span class="n">sfq_dump_class_stats</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">walk</span>		<span class="o">=</span>	<span class="n">sfq_walk</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">Qdisc_ops</span> <span class="n">sfq_qdisc_ops</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">cl_ops</span>		<span class="o">=</span>	<span class="o">&amp;</span><span class="n">sfq_class_ops</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">id</span>		<span class="o">=</span>	<span class="s">&quot;sfq&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">priv_size</span>	<span class="o">=</span>	<span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sfq_sched_data</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">enqueue</span>	<span class="o">=</span>	<span class="n">sfq_enqueue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dequeue</span>	<span class="o">=</span>	<span class="n">sfq_dequeue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">peek</span>		<span class="o">=</span>	<span class="n">qdisc_peek_dequeued</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">drop</span>		<span class="o">=</span>	<span class="n">sfq_drop</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">init</span>		<span class="o">=</span>	<span class="n">sfq_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">reset</span>		<span class="o">=</span>	<span class="n">sfq_reset</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">destroy</span>	<span class="o">=</span>	<span class="n">sfq_destroy</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">change</span>		<span class="o">=</span>	<span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump</span>		<span class="o">=</span>	<span class="n">sfq_dump</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span>	<span class="n">THIS_MODULE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">sfq_module_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">register_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sfq_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">sfq_module_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unregister_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sfq_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">module_init</span><span class="p">(</span><span class="n">sfq_module_init</span><span class="p">)</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">sfq_module_exit</span><span class="p">)</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

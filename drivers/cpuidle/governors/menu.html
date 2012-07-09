@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › cpuidle › governors › menu.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>menu.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * menu.c - the menu idle governor</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2006-2007 Adam Belay &lt;abelay@novell.com&gt;</span>
+<span class="cm"> * Copyright (C) 2009 Intel Corporation</span>
+<span class="cm"> * Author:</span>
+<span class="cm"> *        Arjan van de Ven &lt;arjan@linux.intel.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This code is licenced under the GPL version 2 as described</span>
+<span class="cm"> * in the COPYING file that acompanies the Linux Kernel.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/cpuidle.h&gt;</span>
+<span class="cp">#include &lt;linux/pm_qos.h&gt;</span>
+<span class="cp">#include &lt;linux/time.h&gt;</span>
+<span class="cp">#include &lt;linux/ktime.h&gt;</span>
+<span class="cp">#include &lt;linux/hrtimer.h&gt;</span>
+<span class="cp">#include &lt;linux/tick.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/math64.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+
+<span class="cp">#define BUCKETS 12</span>
+<span class="cp">#define INTERVALS 8</span>
+<span class="cp">#define RESOLUTION 1024</span>
+<span class="cp">#define DECAY 8</span>
+<span class="cp">#define MAX_INTERESTING 50000</span>
+<span class="cp">#define STDDEV_THRESH 400</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Concepts and ideas behind the menu governor</span>
+<span class="cm"> *</span>
+<span class="cm"> * For the menu governor, there are 3 decision factors for picking a C</span>
+<span class="cm"> * state:</span>
+<span class="cm"> * 1) Energy break even point</span>
+<span class="cm"> * 2) Performance impact</span>
+<span class="cm"> * 3) Latency tolerance (from pmqos infrastructure)</span>
+<span class="cm"> * These these three factors are treated independently.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Energy break even point</span>
+<span class="cm"> * -----------------------</span>
+<span class="cm"> * C state entry and exit have an energy cost, and a certain amount of time in</span>
+<span class="cm"> * the  C state is required to actually break even on this cost. CPUIDLE</span>
+<span class="cm"> * provides us this duration in the &quot;target_residency&quot; field. So all that we</span>
+<span class="cm"> * need is a good prediction of how long we&#39;ll be idle. Like the traditional</span>
+<span class="cm"> * menu governor, we start with the actual known &quot;next timer event&quot; time.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Since there are other source of wakeups (interrupts for example) than</span>
+<span class="cm"> * the next timer event, this estimation is rather optimistic. To get a</span>
+<span class="cm"> * more realistic estimate, a correction factor is applied to the estimate,</span>
+<span class="cm"> * that is based on historic behavior. For example, if in the past the actual</span>
+<span class="cm"> * duration always was 50% of the next timer tick, the correction factor will</span>
+<span class="cm"> * be 0.5.</span>
+<span class="cm"> *</span>
+<span class="cm"> * menu uses a running average for this correction factor, however it uses a</span>
+<span class="cm"> * set of factors, not just a single factor. This stems from the realization</span>
+<span class="cm"> * that the ratio is dependent on the order of magnitude of the expected</span>
+<span class="cm"> * duration; if we expect 500 milliseconds of idle time the likelihood of</span>
+<span class="cm"> * getting an interrupt very early is much higher than if we expect 50 micro</span>
+<span class="cm"> * seconds of idle time. A second independent factor that has big impact on</span>
+<span class="cm"> * the actual factor is if there is (disk) IO outstanding or not.</span>
+<span class="cm"> * (as a special twist, we consider every sleep longer than 50 milliseconds</span>
+<span class="cm"> * as perfect; there are no power gains for sleeping longer than this)</span>
+<span class="cm"> *</span>
+<span class="cm"> * For these two reasons we keep an array of 12 independent factors, that gets</span>
+<span class="cm"> * indexed based on the magnitude of the expected duration as well as the</span>
+<span class="cm"> * &quot;is IO outstanding&quot; property.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Repeatable-interval-detector</span>
+<span class="cm"> * ----------------------------</span>
+<span class="cm"> * There are some cases where &quot;next timer&quot; is a completely unusable predictor:</span>
+<span class="cm"> * Those cases where the interval is fixed, for example due to hardware</span>
+<span class="cm"> * interrupt mitigation, but also due to fixed transfer rate devices such as</span>
+<span class="cm"> * mice.</span>
+<span class="cm"> * For this, we use a different predictor: We track the duration of the last 8</span>
+<span class="cm"> * intervals and if the stand deviation of these 8 intervals is below a</span>
+<span class="cm"> * threshold value, we use the average of these intervals as prediction.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Limiting Performance Impact</span>
+<span class="cm"> * ---------------------------</span>
+<span class="cm"> * C states, especially those with large exit latencies, can have a real</span>
+<span class="cm"> * noticeable impact on workloads, which is not acceptable for most sysadmins,</span>
+<span class="cm"> * and in addition, less performance has a power price of its own.</span>
+<span class="cm"> *</span>
+<span class="cm"> * As a general rule of thumb, menu assumes that the following heuristic</span>
+<span class="cm"> * holds:</span>
+<span class="cm"> *     The busier the system, the less impact of C states is acceptable</span>
+<span class="cm"> *</span>
+<span class="cm"> * This rule-of-thumb is implemented using a performance-multiplier:</span>
+<span class="cm"> * If the exit latency times the performance multiplier is longer than</span>
+<span class="cm"> * the predicted duration, the C state is not considered a candidate</span>
+<span class="cm"> * for selection due to a too high performance impact. So the higher</span>
+<span class="cm"> * this multiplier is, the longer we need to be idle to pick a deep C</span>
+<span class="cm"> * state, and thus the less likely a busy CPU will hit such a deep</span>
+<span class="cm"> * C state.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Two factors are used in determing this multiplier:</span>
+<span class="cm"> * a value of 10 is added for each point of &quot;per cpu load average&quot; we have.</span>
+<span class="cm"> * a value of 5 points is added for each process that is waiting for</span>
+<span class="cm"> * IO on this CPU.</span>
+<span class="cm"> * (these values are experimentally determined)</span>
+<span class="cm"> *</span>
+<span class="cm"> * The load average factor gives a longer term (few seconds) input to the</span>
+<span class="cm"> * decision, while the iowait value gives a cpu local instantanious input.</span>
+<span class="cm"> * The iowait factor may look low, but realize that this is also already</span>
+<span class="cm"> * represented in the system load average.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">menu_device</span> <span class="p">{</span>
+	<span class="kt">int</span>		<span class="n">last_state_idx</span><span class="p">;</span>
+	<span class="kt">int</span>             <span class="n">needs_update</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">expected_us</span><span class="p">;</span>
+	<span class="n">u64</span>		<span class="n">predicted_us</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">exit_us</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>	<span class="n">bucket</span><span class="p">;</span>
+	<span class="n">u64</span>		<span class="n">correction_factor</span><span class="p">[</span><span class="n">BUCKETS</span><span class="p">];</span>
+	<span class="n">u32</span>		<span class="n">intervals</span><span class="p">[</span><span class="n">INTERVALS</span><span class="p">];</span>
+	<span class="kt">int</span>		<span class="n">interval_ptr</span><span class="p">;</span>
+<span class="p">};</span>
+
+
+<span class="cp">#define LOAD_INT(x) ((x) &gt;&gt; FSHIFT)</span>
+<span class="cp">#define LOAD_FRAC(x) LOAD_INT(((x) &amp; (FIXED_1-1)) * 100)</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">get_loadavg</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">this</span> <span class="o">=</span> <span class="n">this_cpu_load</span><span class="p">();</span>
+
+
+	<span class="k">return</span> <span class="n">LOAD_INT</span><span class="p">(</span><span class="n">this</span><span class="p">)</span> <span class="o">*</span> <span class="mi">10</span> <span class="o">+</span> <span class="n">LOAD_FRAC</span><span class="p">(</span><span class="n">this</span><span class="p">)</span> <span class="o">/</span> <span class="mi">10</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">which_bucket</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">duration</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">bucket</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We keep two groups of stats; one with no</span>
+<span class="cm">	 * IO pending, one without.</span>
+<span class="cm">	 * This allows us to calculate</span>
+<span class="cm">	 * E(duration)|iowait</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_iowait_cpu</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">()))</span>
+		<span class="n">bucket</span> <span class="o">=</span> <span class="n">BUCKETS</span><span class="o">/</span><span class="mi">2</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;</span> <span class="mi">10</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">bucket</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;</span> <span class="mi">100</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">bucket</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;</span> <span class="mi">1000</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">bucket</span> <span class="o">+</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;</span> <span class="mi">10000</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">bucket</span> <span class="o">+</span> <span class="mi">3</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;</span> <span class="mi">100000</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">bucket</span> <span class="o">+</span> <span class="mi">4</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">bucket</span> <span class="o">+</span> <span class="mi">5</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return a multiplier for the exit latency that is intended</span>
+<span class="cm"> * to take performance requirements into account.</span>
+<span class="cm"> * The more performance critical we estimate the system</span>
+<span class="cm"> * to be, the higher this multiplier, and thus the higher</span>
+<span class="cm"> * the barrier to go to an expensive C state.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">performance_multiplier</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">mult</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/* for higher loadavg, we are more reluctant */</span>
+
+	<span class="n">mult</span> <span class="o">+=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">get_loadavg</span><span class="p">();</span>
+
+	<span class="cm">/* for IO wait tasks (per cpu!) we add 5x each */</span>
+	<span class="n">mult</span> <span class="o">+=</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">nr_iowait_cpu</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">());</span>
+
+	<span class="k">return</span> <span class="n">mult</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">menu_device</span><span class="p">,</span> <span class="n">menu_devices</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">menu_update</span><span class="p">(</span><span class="k">struct</span> <span class="n">cpuidle_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cpuidle_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">);</span>
+
+<span class="cm">/* This implements DIV_ROUND_CLOSEST but avoids 64 bit division */</span>
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">div_round64</span><span class="p">(</span><span class="n">u64</span> <span class="n">dividend</span><span class="p">,</span> <span class="n">u32</span> <span class="n">divisor</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">div_u64</span><span class="p">(</span><span class="n">dividend</span> <span class="o">+</span> <span class="p">(</span><span class="n">divisor</span> <span class="o">/</span> <span class="mi">2</span><span class="p">),</span> <span class="n">divisor</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Try detecting repeating patterns by keeping track of the last 8</span>
+<span class="cm"> * intervals, and checking if the standard deviation of that set</span>
+<span class="cm"> * of points is below a threshold. If it is... then use the</span>
+<span class="cm"> * average of these 8 points as the estimated value.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">detect_repeating_patterns</span><span class="p">(</span><span class="k">struct</span> <span class="n">menu_device</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">avg</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">stddev</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* contains the square of the std deviation */</span>
+
+	<span class="cm">/* first calculate average and standard deviation of the past */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">INTERVALS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">avg</span> <span class="o">+=</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">intervals</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+	<span class="n">avg</span> <span class="o">=</span> <span class="n">avg</span> <span class="o">/</span> <span class="n">INTERVALS</span><span class="p">;</span>
+
+	<span class="cm">/* if the avg is beyond the known next tick, it&#39;s worthless */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">avg</span> <span class="o">&gt;</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">INTERVALS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">stddev</span> <span class="o">+=</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">intervals</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="n">avg</span><span class="p">)</span> <span class="o">*</span>
+			  <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">intervals</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="n">avg</span><span class="p">);</span>
+
+	<span class="n">stddev</span> <span class="o">=</span> <span class="n">stddev</span> <span class="o">/</span> <span class="n">INTERVALS</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * now.. if stddev is small.. then assume we have a</span>
+<span class="cm">	 * repeating pattern and predict we keep doing this.</span>
+<span class="cm">	 */</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">avg</span> <span class="o">&amp;&amp;</span> <span class="n">stddev</span> <span class="o">&lt;</span> <span class="n">STDDEV_THRESH</span><span class="p">)</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">predicted_us</span> <span class="o">=</span> <span class="n">avg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * menu_select - selects the next idle state to enter</span>
+<span class="cm"> * @drv: cpuidle driver containing state data</span>
+<span class="cm"> * @dev: the CPU</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">menu_select</span><span class="p">(</span><span class="k">struct</span> <span class="n">cpuidle_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cpuidle_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">menu_device</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">menu_devices</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">latency_req</span> <span class="o">=</span> <span class="n">pm_qos_request</span><span class="p">(</span><span class="n">PM_QOS_CPU_DMA_LATENCY</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">power_usage</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">multiplier</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timespec</span> <span class="n">t</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">needs_update</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">menu_update</span><span class="p">(</span><span class="n">drv</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">needs_update</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">exit_us</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* Special case when user has set very strict latency requirement */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">latency_req</span> <span class="o">==</span> <span class="mi">0</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* determine the expected residency time, round up */</span>
+	<span class="n">t</span> <span class="o">=</span> <span class="n">ktime_to_timespec</span><span class="p">(</span><span class="n">tick_nohz_get_sleep_length</span><span class="p">());</span>
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span> <span class="o">=</span>
+		<span class="n">t</span><span class="p">.</span><span class="n">tv_sec</span> <span class="o">*</span> <span class="n">USEC_PER_SEC</span> <span class="o">+</span> <span class="n">t</span><span class="p">.</span><span class="n">tv_nsec</span> <span class="o">/</span> <span class="n">NSEC_PER_USEC</span><span class="p">;</span>
+
+
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span> <span class="o">=</span> <span class="n">which_bucket</span><span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span><span class="p">);</span>
+
+	<span class="n">multiplier</span> <span class="o">=</span> <span class="n">performance_multiplier</span><span class="p">();</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * if the correction factor is 0 (eg first time init or cpu hotplug</span>
+<span class="cm">	 * etc), we actually want to start out with a unity factor.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">correction_factor</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">correction_factor</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">RESOLUTION</span> <span class="o">*</span> <span class="n">DECAY</span><span class="p">;</span>
+
+	<span class="cm">/* Make sure to round up for half microseconds */</span>
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">predicted_us</span> <span class="o">=</span> <span class="n">div_round64</span><span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span> <span class="o">*</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">correction_factor</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">],</span>
+					 <span class="n">RESOLUTION</span> <span class="o">*</span> <span class="n">DECAY</span><span class="p">);</span>
+
+	<span class="n">detect_repeating_patterns</span><span class="p">(</span><span class="n">data</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We want to default to C1 (hlt), not to busy polling</span>
+<span class="cm">	 * unless the timer is happening really really soon.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span> <span class="o">&gt;</span> <span class="mi">5</span> <span class="o">&amp;&amp;</span>
+		<span class="n">drv</span><span class="o">-&gt;</span><span class="n">states</span><span class="p">[</span><span class="n">CPUIDLE_DRIVER_STATE_START</span><span class="p">].</span><span class="n">disable</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span> <span class="o">=</span> <span class="n">CPUIDLE_DRIVER_STATE_START</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Find the idle state with the lowest power while satisfying</span>
+<span class="cm">	 * our constraints.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">CPUIDLE_DRIVER_STATE_START</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">state_count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">cpuidle_state</span> <span class="o">*</span><span class="n">s</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">states</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">disable</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">target_residency</span> <span class="o">&gt;</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">predicted_us</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">exit_latency</span> <span class="o">&gt;</span> <span class="n">latency_req</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">exit_latency</span> <span class="o">*</span> <span class="n">multiplier</span> <span class="o">&gt;</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">predicted_us</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">power_usage</span> <span class="o">&lt;</span> <span class="n">power_usage</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">power_usage</span> <span class="o">=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">power_usage</span><span class="p">;</span>
+			<span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="n">data</span><span class="o">-&gt;</span><span class="n">exit_us</span> <span class="o">=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">exit_latency</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * menu_reflect - records that data structures need update</span>
+<span class="cm"> * @dev: the CPU</span>
+<span class="cm"> * @index: the index of actual entered state</span>
+<span class="cm"> *</span>
+<span class="cm"> * NOTE: it&#39;s important to be fast here because this operation will add to</span>
+<span class="cm"> *       the overall exit latency.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">menu_reflect</span><span class="p">(</span><span class="k">struct</span> <span class="n">cpuidle_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">int</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">menu_device</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">menu_devices</span><span class="p">);</span>
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">needs_update</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * menu_update - attempts to guess what happened after entry</span>
+<span class="cm"> * @drv: cpuidle driver containing state data</span>
+<span class="cm"> * @dev: the CPU</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">menu_update</span><span class="p">(</span><span class="k">struct</span> <span class="n">cpuidle_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cpuidle_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">menu_device</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">menu_devices</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">last_idx</span> <span class="o">=</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">last_state_idx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">last_idle_us</span> <span class="o">=</span> <span class="n">cpuidle_get_last_residency</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">cpuidle_state</span> <span class="o">*</span><span class="n">target</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">states</span><span class="p">[</span><span class="n">last_idx</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">measured_us</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">new_factor</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ugh, this idle state doesn&#39;t support residency measurements, so we</span>
+<span class="cm">	 * are basically lost in the dark.  As a compromise, assume we slept</span>
+<span class="cm">	 * for the whole expected time.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">target</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">CPUIDLE_FLAG_TIME_VALID</span><span class="p">)))</span>
+		<span class="n">last_idle_us</span> <span class="o">=</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span><span class="p">;</span>
+
+
+	<span class="n">measured_us</span> <span class="o">=</span> <span class="n">last_idle_us</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We correct for the exit latency; we are assuming here that the</span>
+<span class="cm">	 * exit latency happens after the event that we&#39;re interested in.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">measured_us</span> <span class="o">&gt;</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">exit_us</span><span class="p">)</span>
+		<span class="n">measured_us</span> <span class="o">-=</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">exit_us</span><span class="p">;</span>
+
+
+	<span class="cm">/* update our correction ratio */</span>
+
+	<span class="n">new_factor</span> <span class="o">=</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">correction_factor</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">]</span>
+			<span class="o">*</span> <span class="p">(</span><span class="n">DECAY</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="n">DECAY</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">measured_us</span> <span class="o">&lt;</span> <span class="n">MAX_INTERESTING</span><span class="p">)</span>
+		<span class="n">new_factor</span> <span class="o">+=</span> <span class="n">RESOLUTION</span> <span class="o">*</span> <span class="n">measured_us</span> <span class="o">/</span> <span class="n">data</span><span class="o">-&gt;</span><span class="n">expected_us</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * we were idle so long that we count it as a perfect</span>
+<span class="cm">		 * prediction</span>
+<span class="cm">		 */</span>
+		<span class="n">new_factor</span> <span class="o">+=</span> <span class="n">RESOLUTION</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We don&#39;t want 0 as factor; we always want at least</span>
+<span class="cm">	 * a tiny bit of estimated time.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">new_factor</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">new_factor</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">correction_factor</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">new_factor</span><span class="p">;</span>
+
+	<span class="cm">/* update the repeating-pattern data */</span>
+	<span class="n">data</span><span class="o">-&gt;</span><span class="n">intervals</span><span class="p">[</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">interval_ptr</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="n">last_idle_us</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">interval_ptr</span> <span class="o">&gt;=</span> <span class="n">INTERVALS</span><span class="p">)</span>
+		<span class="n">data</span><span class="o">-&gt;</span><span class="n">interval_ptr</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * menu_enable_device - scans a CPU&#39;s states and does setup</span>
+<span class="cm"> * @drv: cpuidle driver</span>
+<span class="cm"> * @dev: the CPU</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">menu_enable_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">cpuidle_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">cpuidle_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">menu_device</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">menu_devices</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">cpu</span><span class="p">);</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">menu_device</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cpuidle_governor</span> <span class="n">menu_governor</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span>		<span class="s">&quot;menu&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rating</span> <span class="o">=</span>	<span class="mi">20</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">enable</span> <span class="o">=</span>	<span class="n">menu_enable_device</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">select</span> <span class="o">=</span>	<span class="n">menu_select</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">reflect</span> <span class="o">=</span>	<span class="n">menu_reflect</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">owner</span> <span class="o">=</span>	<span class="n">THIS_MODULE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * init_menu - initializes the governor</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">init_menu</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">cpuidle_register_governor</span><span class="p">(</span><span class="o">&amp;</span><span class="n">menu_governor</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * exit_menu - exits the governor</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">exit_menu</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cpuidle_unregister_governor</span><span class="p">(</span><span class="o">&amp;</span><span class="n">menu_governor</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+<span class="n">module_init</span><span class="p">(</span><span class="n">init_menu</span><span class="p">);</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">exit_menu</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

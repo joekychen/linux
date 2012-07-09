@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › kmod.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>kmod.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm">	kmod, the new module loader (replaces kerneld)</span>
+<span class="cm">	Kirk Petersen</span>
+
+<span class="cm">	Reorganized not to be a daemon by Adam Richter, with guidance</span>
+<span class="cm">	from Greg Zornetzer.</span>
+
+<span class="cm">	Modified to avoid chroot and file sharing problems.</span>
+<span class="cm">	Mikael Pettersson</span>
+
+<span class="cm">	Limit the concurrent number of kmod modprobes to catch loops from</span>
+<span class="cm">	&quot;modprobe needs a service that is in a module&quot;.</span>
+<span class="cm">	Keith Owens &lt;kaos@ocs.com.au&gt; December 1999</span>
+
+<span class="cm">	Unblock all signals when we exec a usermode process.</span>
+<span class="cm">	Shuu Yamaguchi &lt;shuu@wondernetworkresources.com&gt; December 2000</span>
+
+<span class="cm">	call_usermodehelper wait flag, and remove exec_usermodehelper.</span>
+<span class="cm">	Rusty Russell &lt;rusty@rustcorp.com.au&gt;  Jan 2003</span>
+<span class="cm">*/</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/syscalls.h&gt;</span>
+<span class="cp">#include &lt;linux/unistd.h&gt;</span>
+<span class="cp">#include &lt;linux/kmod.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/completion.h&gt;</span>
+<span class="cp">#include &lt;linux/cred.h&gt;</span>
+<span class="cp">#include &lt;linux/file.h&gt;</span>
+<span class="cp">#include &lt;linux/fdtable.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+<span class="cp">#include &lt;linux/security.h&gt;</span>
+<span class="cp">#include &lt;linux/mount.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/resource.h&gt;</span>
+<span class="cp">#include &lt;linux/notifier.h&gt;</span>
+<span class="cp">#include &lt;linux/suspend.h&gt;</span>
+<span class="cp">#include &lt;linux/rwsem.h&gt;</span>
+<span class="cp">#include &lt;asm/uaccess.h&gt;</span>
+
+<span class="cp">#include &lt;trace/events/module.h&gt;</span>
+
+<span class="k">extern</span> <span class="kt">int</span> <span class="n">max_threads</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">khelper_wq</span><span class="p">;</span>
+
+<span class="cp">#define CAP_BSET	(void *)1</span>
+<span class="cp">#define CAP_PI		(void *)2</span>
+
+<span class="k">static</span> <span class="n">kernel_cap_t</span> <span class="n">usermodehelper_bset</span> <span class="o">=</span> <span class="n">CAP_FULL_SET</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">kernel_cap_t</span> <span class="n">usermodehelper_inheritable</span> <span class="o">=</span> <span class="n">CAP_FULL_SET</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_RWSEM</span><span class="p">(</span><span class="n">umhelper_sem</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_MODULES</span>
+
+<span class="cm">/*</span>
+<span class="cm">	modprobe_path is set via /proc/sys.</span>
+<span class="cm">*/</span>
+<span class="kt">char</span> <span class="n">modprobe_path</span><span class="p">[</span><span class="n">KMOD_PATH_LEN</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;/sbin/modprobe&quot;</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_modprobe_argv</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">argv</span><span class="p">[</span><span class="mi">3</span><span class="p">]);</span> <span class="cm">/* check call_modprobe() */</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">argv</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">call_modprobe</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">module_name</span><span class="p">,</span> <span class="kt">int</span> <span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">static</span> <span class="kt">char</span> <span class="o">*</span><span class="n">envp</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="s">&quot;HOME=/&quot;</span><span class="p">,</span>
+		<span class="s">&quot;TERM=linux&quot;</span><span class="p">,</span>
+		<span class="s">&quot;PATH=/sbin:/usr/sbin:/bin:/usr/bin&quot;</span><span class="p">,</span>
+		<span class="nb">NULL</span>
+	<span class="p">};</span>
+
+	<span class="kt">char</span> <span class="o">**</span><span class="n">argv</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">[</span><span class="mi">5</span><span class="p">]),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">argv</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">module_name</span> <span class="o">=</span> <span class="n">kstrdup</span><span class="p">(</span><span class="n">module_name</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">module_name</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">free_argv</span><span class="p">;</span>
+
+	<span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">modprobe_path</span><span class="p">;</span>
+	<span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;-q&quot;</span><span class="p">;</span>
+	<span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;--&quot;</span><span class="p">;</span>
+	<span class="n">argv</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">module_name</span><span class="p">;</span>	<span class="cm">/* check free_modprobe_argv() */</span>
+	<span class="n">argv</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">call_usermodehelper_fns</span><span class="p">(</span><span class="n">modprobe_path</span><span class="p">,</span> <span class="n">argv</span><span class="p">,</span> <span class="n">envp</span><span class="p">,</span>
+		<span class="n">wait</span> <span class="o">|</span> <span class="n">UMH_KILLABLE</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">free_modprobe_argv</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="nl">free_argv:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">argv</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __request_module - try to load a kernel module</span>
+<span class="cm"> * @wait: wait (or not) for the operation to complete</span>
+<span class="cm"> * @fmt: printf style format string for the name of the module</span>
+<span class="cm"> * @...: arguments as specified in the format string</span>
+<span class="cm"> *</span>
+<span class="cm"> * Load a module using the user mode module loader. The function returns</span>
+<span class="cm"> * zero on success or a negative errno code on failure. Note that a</span>
+<span class="cm"> * successful module load does not mean the module did not then unload</span>
+<span class="cm"> * and exit on an error of its own. Callers must check that the service</span>
+<span class="cm"> * they requested is now available not blindly invoke it.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If module auto-loading support is disabled then this function</span>
+<span class="cm"> * becomes a no-operation.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">__request_module</span><span class="p">(</span><span class="n">bool</span> <span class="n">wait</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">fmt</span><span class="p">,</span> <span class="p">...)</span>
+<span class="p">{</span>
+	<span class="kt">va_list</span> <span class="n">args</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">module_name</span><span class="p">[</span><span class="n">MODULE_NAME_LEN</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max_modprobes</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">kmod_concurrent</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="cp">#define MAX_KMOD_CONCURRENT 50	</span><span class="cm">/* Completely arbitrary value - KAO */</span><span class="cp"></span>
+	<span class="k">static</span> <span class="kt">int</span> <span class="n">kmod_loop_msg</span><span class="p">;</span>
+
+	<span class="n">va_start</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">fmt</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">vsnprintf</span><span class="p">(</span><span class="n">module_name</span><span class="p">,</span> <span class="n">MODULE_NAME_LEN</span><span class="p">,</span> <span class="n">fmt</span><span class="p">,</span> <span class="n">args</span><span class="p">);</span>
+	<span class="n">va_end</span><span class="p">(</span><span class="n">args</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="n">MODULE_NAME_LEN</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENAMETOOLONG</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">security_kernel_module_request</span><span class="p">(</span><span class="n">module_name</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="cm">/* If modprobe needs a service that is in a module, we get a recursive</span>
+<span class="cm">	 * loop.  Limit the number of running kmod threads to max_threads/2 or</span>
+<span class="cm">	 * MAX_KMOD_CONCURRENT, whichever is the smaller.  A cleaner method</span>
+<span class="cm">	 * would be to run the parents of this process, counting how many times</span>
+<span class="cm">	 * kmod was invoked.  That would mean accessing the internals of the</span>
+<span class="cm">	 * process tables to get the command line, proc_pid_cmdline is static</span>
+<span class="cm">	 * and it is not worth changing the proc code just to handle this case. </span>
+<span class="cm">	 * KAO.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * &quot;trace the ppid&quot; is simple, but will fail if someone&#39;s</span>
+<span class="cm">	 * parent exits.  I think this is as good as it gets. --RR</span>
+<span class="cm">	 */</span>
+	<span class="n">max_modprobes</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">max_threads</span><span class="o">/</span><span class="mi">2</span><span class="p">,</span> <span class="n">MAX_KMOD_CONCURRENT</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kmod_concurrent</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kmod_concurrent</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_modprobes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* We may be blaming an innocent here, but unlikely */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">kmod_loop_msg</span> <span class="o">&lt;</span> <span class="mi">5</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+			       <span class="s">&quot;request_module: runaway loop modprobe %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">module_name</span><span class="p">);</span>
+			<span class="n">kmod_loop_msg</span><span class="o">++</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kmod_concurrent</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">trace_module_request</span><span class="p">(</span><span class="n">module_name</span><span class="p">,</span> <span class="n">wait</span><span class="p">,</span> <span class="n">_RET_IP_</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">call_modprobe</span><span class="p">(</span><span class="n">module_name</span><span class="p">,</span> <span class="n">wait</span> <span class="o">?</span> <span class="n">UMH_WAIT_PROC</span> <span class="o">:</span> <span class="n">UMH_WAIT_EXEC</span><span class="p">);</span>
+
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">kmod_concurrent</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__request_module</span><span class="p">);</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_MODULES */</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the task which runs the usermode application</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">____call_usermodehelper</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cred</span> <span class="o">*</span><span class="n">new</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">retval</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+	<span class="n">flush_signal_handlers</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+
+	<span class="cm">/* We can run anywhere, unlike our parent keventd(). */</span>
+	<span class="n">set_cpus_allowed_ptr</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">cpu_all_mask</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Our parent is keventd, which runs with elevated scheduling priority.</span>
+<span class="cm">	 * Avoid propagating that into the userspace child.</span>
+<span class="cm">	 */</span>
+	<span class="n">set_user_nice</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">retval</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">new</span> <span class="o">=</span> <span class="n">prepare_kernel_cred</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">new</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+	<span class="n">new</span><span class="o">-&gt;</span><span class="n">cap_bset</span> <span class="o">=</span> <span class="n">cap_intersect</span><span class="p">(</span><span class="n">usermodehelper_bset</span><span class="p">,</span> <span class="n">new</span><span class="o">-&gt;</span><span class="n">cap_bset</span><span class="p">);</span>
+	<span class="n">new</span><span class="o">-&gt;</span><span class="n">cap_inheritable</span> <span class="o">=</span> <span class="n">cap_intersect</span><span class="p">(</span><span class="n">usermodehelper_inheritable</span><span class="p">,</span>
+					     <span class="n">new</span><span class="o">-&gt;</span><span class="n">cap_inheritable</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">init</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">retval</span> <span class="o">=</span> <span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">init</span><span class="p">(</span><span class="n">sub_info</span><span class="p">,</span> <span class="n">new</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">retval</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">abort_creds</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">commit_creds</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+
+	<span class="n">retval</span> <span class="o">=</span> <span class="n">kernel_execve</span><span class="p">(</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">,</span>
+			       <span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="p">)</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">argv</span><span class="p">,</span>
+			       <span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="p">)</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">envp</span><span class="p">);</span>
+
+	<span class="cm">/* Exec failed? */</span>
+<span class="nl">fail:</span>
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">retval</span> <span class="o">=</span> <span class="n">retval</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">call_usermodehelper_freeinfo</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">cleanup</span><span class="p">)</span>
+		<span class="p">(</span><span class="o">*</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">cleanup</span><span class="p">)(</span><span class="n">info</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">info</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">umh_complete</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">completion</span> <span class="o">*</span><span class="n">comp</span> <span class="o">=</span> <span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">complete</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * See call_usermodehelper_exec(). If xchg() returns NULL</span>
+<span class="cm">	 * we own sub_info, the UMH_KILLABLE caller has gone away.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">comp</span><span class="p">)</span>
+		<span class="n">complete</span><span class="p">(</span><span class="n">comp</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">call_usermodehelper_freeinfo</span><span class="p">(</span><span class="n">sub_info</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Keventd can&#39;t block, but this (a child) can. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">wait_for_helper</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">pid_t</span> <span class="n">pid</span><span class="p">;</span>
+
+	<span class="cm">/* If SIGCLD is ignored sys_wait4 won&#39;t populate the status. */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">action</span><span class="p">[</span><span class="n">SIGCHLD</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="n">sa</span><span class="p">.</span><span class="n">sa_handler</span> <span class="o">=</span> <span class="n">SIG_DFL</span><span class="p">;</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+
+	<span class="n">pid</span> <span class="o">=</span> <span class="n">kernel_thread</span><span class="p">(</span><span class="n">____call_usermodehelper</span><span class="p">,</span> <span class="n">sub_info</span><span class="p">,</span> <span class="n">SIGCHLD</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pid</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">retval</span> <span class="o">=</span> <span class="n">pid</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ECHILD</span><span class="p">;</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Normally it is bogus to call wait4() from in-kernel because</span>
+<span class="cm">		 * wait4() wants to write the exit code to a userspace address.</span>
+<span class="cm">		 * But wait_for_helper() always runs as keventd, and put_user()</span>
+<span class="cm">		 * to a kernel address works OK for kernel threads, due to their</span>
+<span class="cm">		 * having an mm_segment_t which spans the entire address space.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * Thus the __user pointer cast is valid here.</span>
+<span class="cm">		 */</span>
+		<span class="n">sys_wait4</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">ret</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * If ret is 0, either ____call_usermodehelper failed and the</span>
+<span class="cm">		 * real error code is already in sub_info-&gt;retval or</span>
+<span class="cm">		 * sub_info-&gt;retval is 0 anyway, so don&#39;t mess with it then.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">retval</span> <span class="o">=</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">umh_complete</span><span class="p">(</span><span class="n">sub_info</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* This is run by khelper thread  */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__call_usermodehelper</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">subprocess_info</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">wait</span> <span class="o">=</span> <span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">wait</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">UMH_KILLABLE</span><span class="p">;</span>
+	<span class="n">pid_t</span> <span class="n">pid</span><span class="p">;</span>
+
+	<span class="cm">/* CLONE_VFORK: wait until the usermode helper has execve&#39;d</span>
+<span class="cm">	 * successfully We need the data structures to stay around</span>
+<span class="cm">	 * until that is done.  */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span> <span class="o">==</span> <span class="n">UMH_WAIT_PROC</span><span class="p">)</span>
+		<span class="n">pid</span> <span class="o">=</span> <span class="n">kernel_thread</span><span class="p">(</span><span class="n">wait_for_helper</span><span class="p">,</span> <span class="n">sub_info</span><span class="p">,</span>
+				    <span class="n">CLONE_FS</span> <span class="o">|</span> <span class="n">CLONE_FILES</span> <span class="o">|</span> <span class="n">SIGCHLD</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">pid</span> <span class="o">=</span> <span class="n">kernel_thread</span><span class="p">(</span><span class="n">____call_usermodehelper</span><span class="p">,</span> <span class="n">sub_info</span><span class="p">,</span>
+				    <span class="n">CLONE_VFORK</span> <span class="o">|</span> <span class="n">SIGCHLD</span><span class="p">);</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">UMH_NO_WAIT</span>:
+		<span class="n">call_usermodehelper_freeinfo</span><span class="p">(</span><span class="n">sub_info</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">UMH_WAIT_PROC</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">pid</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="cm">/* FALLTHROUGH */</span>
+	<span class="k">case</span> <span class="n">UMH_WAIT_EXEC</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">pid</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">retval</span> <span class="o">=</span> <span class="n">pid</span><span class="p">;</span>
+		<span class="n">umh_complete</span><span class="p">(</span><span class="n">sub_info</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If set, call_usermodehelper_exec() will exit immediately returning -EBUSY</span>
+<span class="cm"> * (used for preventing user land processes from being created after the user</span>
+<span class="cm"> * land has been frozen during a system-wide hibernation or suspend operation).</span>
+<span class="cm"> * Should always be manipulated under umhelper_sem acquired for write.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">enum</span> <span class="n">umh_disable_depth</span> <span class="n">usermodehelper_disabled</span> <span class="o">=</span> <span class="n">UMH_DISABLED</span><span class="p">;</span>
+
+<span class="cm">/* Number of helpers running */</span>
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">running_helpers</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wait queue head used by usermodehelper_disable() to wait for all running</span>
+<span class="cm"> * helpers to finish.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">running_helpers_waitq</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Used by usermodehelper_read_lock_wait() to wait for usermodehelper_disabled</span>
+<span class="cm"> * to become &#39;false&#39;.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Time to wait for running_helpers to become zero before the setting of</span>
+<span class="cm"> * usermodehelper_disabled in usermodehelper_disable() fails</span>
+<span class="cm"> */</span>
+<span class="cp">#define RUNNING_HELPERS_TIMEOUT	(5 * HZ)</span>
+
+<span class="kt">int</span> <span class="nf">usermodehelper_read_trylock</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DEFINE_WAIT</span><span class="p">(</span><span class="n">wait</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">prepare_to_wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">,</span>
+				<span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">usermodehelper_disabled</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">usermodehelper_disabled</span> <span class="o">==</span> <span class="n">UMH_DISABLED</span><span class="p">)</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">schedule</span><span class="p">();</span>
+		<span class="n">try_to_freeze</span><span class="p">();</span>
+
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">finish_wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">usermodehelper_read_trylock</span><span class="p">);</span>
+
+<span class="kt">long</span> <span class="nf">usermodehelper_read_lock_wait</span><span class="p">(</span><span class="kt">long</span> <span class="n">timeout</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DEFINE_WAIT</span><span class="p">(</span><span class="n">wait</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">prepare_to_wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">,</span>
+				<span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">usermodehelper_disabled</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+
+		<span class="n">timeout</span> <span class="o">=</span> <span class="n">schedule_timeout</span><span class="p">(</span><span class="n">timeout</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">timeout</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">finish_wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">timeout</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">usermodehelper_read_lock_wait</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">usermodehelper_read_unlock</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">usermodehelper_read_unlock</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __usermodehelper_set_disable_depth - Modify usermodehelper_disabled.</span>
+<span class="cm"> * @depth: New value to assign to usermodehelper_disabled.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Change the value of usermodehelper_disabled (under umhelper_sem locked for</span>
+<span class="cm"> * writing) and wakeup tasks waiting for it to change.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">__usermodehelper_set_disable_depth</span><span class="p">(</span><span class="k">enum</span> <span class="n">umh_disable_depth</span> <span class="n">depth</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="n">usermodehelper_disabled</span> <span class="o">=</span> <span class="n">depth</span><span class="p">;</span>
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">usermodehelper_disabled_waitq</span><span class="p">);</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __usermodehelper_disable - Prevent new helpers from being started.</span>
+<span class="cm"> * @depth: New value to assign to usermodehelper_disabled.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Set usermodehelper_disabled to @depth and wait for running helpers to exit.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">__usermodehelper_disable</span><span class="p">(</span><span class="k">enum</span> <span class="n">umh_disable_depth</span> <span class="n">depth</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">long</span> <span class="n">retval</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">depth</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+	<span class="n">usermodehelper_disabled</span> <span class="o">=</span> <span class="n">depth</span><span class="p">;</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umhelper_sem</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * From now on call_usermodehelper_exec() won&#39;t start any new</span>
+<span class="cm">	 * helpers, so it is sufficient if running_helpers turns out to</span>
+<span class="cm">	 * be zero at one point (it may be increased later, but that</span>
+<span class="cm">	 * doesn&#39;t matter).</span>
+<span class="cm">	 */</span>
+	<span class="n">retval</span> <span class="o">=</span> <span class="n">wait_event_timeout</span><span class="p">(</span><span class="n">running_helpers_waitq</span><span class="p">,</span>
+					<span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">running_helpers</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span>
+					<span class="n">RUNNING_HELPERS_TIMEOUT</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">retval</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">__usermodehelper_set_disable_depth</span><span class="p">(</span><span class="n">UMH_ENABLED</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">helper_lock</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">running_helpers</span><span class="p">);</span>
+	<span class="n">smp_mb__after_atomic_inc</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">helper_unlock</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">running_helpers</span><span class="p">))</span>
+		<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">running_helpers_waitq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * call_usermodehelper_setup - prepare to call a usermode helper</span>
+<span class="cm"> * @path: path to usermode executable</span>
+<span class="cm"> * @argv: arg vector for process</span>
+<span class="cm"> * @envp: environment for process</span>
+<span class="cm"> * @gfp_mask: gfp mask for memory allocation</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns either %NULL on allocation failure, or a subprocess_info</span>
+<span class="cm"> * structure.  This should be passed to call_usermodehelper_exec to</span>
+<span class="cm"> * exec the process and free the structure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span>
+<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="nf">call_usermodehelper_setup</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">path</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">argv</span><span class="p">,</span>
+						  <span class="kt">char</span> <span class="o">**</span><span class="n">envp</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span><span class="p">;</span>
+	<span class="n">sub_info</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span><span class="p">),</span> <span class="n">gfp_mask</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sub_info</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">,</span> <span class="n">__call_usermodehelper</span><span class="p">);</span>
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">path</span> <span class="o">=</span> <span class="n">path</span><span class="p">;</span>
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">argv</span> <span class="o">=</span> <span class="n">argv</span><span class="p">;</span>
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">envp</span> <span class="o">=</span> <span class="n">envp</span><span class="p">;</span>
+  <span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">sub_info</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * call_usermodehelper_setfns - set a cleanup/init function</span>
+<span class="cm"> * @info: a subprocess_info returned by call_usermodehelper_setup</span>
+<span class="cm"> * @cleanup: a cleanup function</span>
+<span class="cm"> * @init: an init function</span>
+<span class="cm"> * @data: arbitrary context sensitive data</span>
+<span class="cm"> *</span>
+<span class="cm"> * The init function is used to customize the helper process prior to</span>
+<span class="cm"> * exec.  A non-zero return code causes the process to error out, exit,</span>
+<span class="cm"> * and return the failure to the calling process</span>
+<span class="cm"> *</span>
+<span class="cm"> * The cleanup function is just before ethe subprocess_info is about to</span>
+<span class="cm"> * be freed.  This can be used for freeing the argv and envp.  The</span>
+<span class="cm"> * Function must be runnable in either a process context or the</span>
+<span class="cm"> * context in which call_usermodehelper_exec is called.</span>
+<span class="cm"> */</span>
+<span class="k">static</span>
+<span class="kt">void</span> <span class="nf">call_usermodehelper_setfns</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">,</span>
+		    <span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">init</span><span class="p">)(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cred</span> <span class="o">*</span><span class="n">new</span><span class="p">),</span>
+		    <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">cleanup</span><span class="p">)(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">),</span>
+		    <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">cleanup</span> <span class="o">=</span> <span class="n">cleanup</span><span class="p">;</span>
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">init</span> <span class="o">=</span> <span class="n">init</span><span class="p">;</span>
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * call_usermodehelper_exec - start a usermode application</span>
+<span class="cm"> * @sub_info: information about the subprocessa</span>
+<span class="cm"> * @wait: wait for the application to finish and return status.</span>
+<span class="cm"> *        when -1 don&#39;t wait at all, but you get no useful error back when</span>
+<span class="cm"> *        the program couldn&#39;t be exec&#39;ed. This makes it safe to call</span>
+<span class="cm"> *        from interrupt context.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Runs a user-space application.  The application is started</span>
+<span class="cm"> * asynchronously if wait is not set, and runs as a child of keventd.</span>
+<span class="cm"> * (ie. it runs with full root capabilities).</span>
+<span class="cm"> */</span>
+<span class="k">static</span>
+<span class="kt">int</span> <span class="nf">call_usermodehelper_exec</span><span class="p">(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">sub_info</span><span class="p">,</span> <span class="kt">int</span> <span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DECLARE_COMPLETION_ONSTACK</span><span class="p">(</span><span class="n">done</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">retval</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">helper_lock</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="sc">&#39;\0&#39;</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">khelper_wq</span> <span class="o">||</span> <span class="n">usermodehelper_disabled</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">retval</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">complete</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">done</span><span class="p">;</span>
+	<span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">wait</span> <span class="o">=</span> <span class="n">wait</span><span class="p">;</span>
+
+	<span class="n">queue_work</span><span class="p">(</span><span class="n">khelper_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span> <span class="o">==</span> <span class="n">UMH_NO_WAIT</span><span class="p">)</span>	<span class="cm">/* task has freed sub_info */</span>
+		<span class="k">goto</span> <span class="n">unlock</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span> <span class="o">&amp;</span> <span class="n">UMH_KILLABLE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">retval</span> <span class="o">=</span> <span class="n">wait_for_completion_killable</span><span class="p">(</span><span class="o">&amp;</span><span class="n">done</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">retval</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">wait_done</span><span class="p">;</span>
+
+		<span class="cm">/* umh_complete() will see NULL and free sub_info */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">complete</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">unlock</span><span class="p">;</span>
+		<span class="cm">/* fallthrough, umh_complete() was already called */</span>
+	<span class="p">}</span>
+
+	<span class="n">wait_for_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">done</span><span class="p">);</span>
+<span class="nl">wait_done:</span>
+	<span class="n">retval</span> <span class="o">=</span> <span class="n">sub_info</span><span class="o">-&gt;</span><span class="n">retval</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="n">call_usermodehelper_freeinfo</span><span class="p">(</span><span class="n">sub_info</span><span class="p">);</span>
+<span class="nl">unlock:</span>
+	<span class="n">helper_unlock</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">retval</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">call_usermodehelper_fns</span><span class="p">(</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">path</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">argv</span><span class="p">,</span> <span class="kt">char</span> <span class="o">**</span><span class="n">envp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">wait</span><span class="p">,</span>
+	<span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">init</span><span class="p">)(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cred</span> <span class="o">*</span><span class="n">new</span><span class="p">),</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">cleanup</span><span class="p">)(</span><span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="p">),</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">subprocess_info</span> <span class="o">*</span><span class="n">info</span><span class="p">;</span>
+	<span class="n">gfp_t</span> <span class="n">gfp_mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">wait</span> <span class="o">==</span> <span class="n">UMH_NO_WAIT</span><span class="p">)</span> <span class="o">?</span> <span class="n">GFP_ATOMIC</span> <span class="o">:</span> <span class="n">GFP_KERNEL</span><span class="p">;</span>
+
+	<span class="n">info</span> <span class="o">=</span> <span class="n">call_usermodehelper_setup</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">argv</span><span class="p">,</span> <span class="n">envp</span><span class="p">,</span> <span class="n">gfp_mask</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">info</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">call_usermodehelper_setfns</span><span class="p">(</span><span class="n">info</span><span class="p">,</span> <span class="n">init</span><span class="p">,</span> <span class="n">cleanup</span><span class="p">,</span> <span class="n">data</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">call_usermodehelper_exec</span><span class="p">(</span><span class="n">info</span><span class="p">,</span> <span class="n">wait</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">call_usermodehelper_fns</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">proc_cap_handler</span><span class="p">(</span><span class="k">struct</span> <span class="n">ctl_table</span> <span class="o">*</span><span class="n">table</span><span class="p">,</span> <span class="kt">int</span> <span class="n">write</span><span class="p">,</span>
+			 <span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buffer</span><span class="p">,</span> <span class="kt">size_t</span> <span class="o">*</span><span class="n">lenp</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ctl_table</span> <span class="n">t</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cap_array</span><span class="p">[</span><span class="n">_KERNEL_CAPABILITY_U32S</span><span class="p">];</span>
+	<span class="n">kernel_cap_t</span> <span class="n">new_cap</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">write</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">capable</span><span class="p">(</span><span class="n">CAP_SETPCAP</span><span class="p">)</span> <span class="o">||</span>
+		      <span class="o">!</span><span class="n">capable</span><span class="p">(</span><span class="n">CAP_SYS_MODULE</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EPERM</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * convert from the global kernel_cap_t to the ulong array to print to</span>
+<span class="cm">	 * userspace if this is a read.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">_KERNEL_CAPABILITY_U32S</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>  <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">table</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">==</span> <span class="n">CAP_BSET</span><span class="p">)</span>
+			<span class="n">cap_array</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">usermodehelper_bset</span><span class="p">.</span><span class="n">cap</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">table</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">==</span> <span class="n">CAP_PI</span><span class="p">)</span>
+			<span class="n">cap_array</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">usermodehelper_inheritable</span><span class="p">.</span><span class="n">cap</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="k">else</span>
+			<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+
+	<span class="n">t</span> <span class="o">=</span> <span class="o">*</span><span class="n">table</span><span class="p">;</span>
+	<span class="n">t</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cap_array</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * actually read or write and array of ulongs from userspace.  Remember</span>
+<span class="cm">	 * these are least significant 32 bits first</span>
+<span class="cm">	 */</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">proc_doulongvec_minmax</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="p">,</span> <span class="n">write</span><span class="p">,</span> <span class="n">buffer</span><span class="p">,</span> <span class="n">lenp</span><span class="p">,</span> <span class="n">ppos</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * convert from the sysctl array of ulongs to the kernel_cap_t</span>
+<span class="cm">	 * internal representation</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">_KERNEL_CAPABILITY_U32S</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">new_cap</span><span class="p">.</span><span class="n">cap</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">cap_array</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Drop everything not in the new_cap (but don&#39;t add things)</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">write</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">table</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">==</span> <span class="n">CAP_BSET</span><span class="p">)</span>
+			<span class="n">usermodehelper_bset</span> <span class="o">=</span> <span class="n">cap_intersect</span><span class="p">(</span><span class="n">usermodehelper_bset</span><span class="p">,</span> <span class="n">new_cap</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">table</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">==</span> <span class="n">CAP_PI</span><span class="p">)</span>
+			<span class="n">usermodehelper_inheritable</span> <span class="o">=</span> <span class="n">cap_intersect</span><span class="p">(</span><span class="n">usermodehelper_inheritable</span><span class="p">,</span> <span class="n">new_cap</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">umh_sysctl_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">ctl_table</span> <span class="n">usermodehelper_table</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">procname</span>	<span class="o">=</span> <span class="s">&quot;bset&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">data</span>		<span class="o">=</span> <span class="n">CAP_BSET</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">maxlen</span>		<span class="o">=</span> <span class="n">_KERNEL_CAPABILITY_U32S</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">mode</span>		<span class="o">=</span> <span class="mo">0600</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">proc_handler</span>	<span class="o">=</span> <span class="n">proc_cap_handler</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">procname</span>	<span class="o">=</span> <span class="s">&quot;inheritable&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">data</span>		<span class="o">=</span> <span class="n">CAP_PI</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">maxlen</span>		<span class="o">=</span> <span class="n">_KERNEL_CAPABILITY_U32S</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">mode</span>		<span class="o">=</span> <span class="mo">0600</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">proc_handler</span>	<span class="o">=</span> <span class="n">proc_cap_handler</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span> <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">usermodehelper_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">khelper_wq</span> <span class="o">=</span> <span class="n">create_singlethread_workqueue</span><span class="p">(</span><span class="s">&quot;khelper&quot;</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">khelper_wq</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

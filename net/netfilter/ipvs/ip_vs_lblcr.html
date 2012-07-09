@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › netfilter › ipvs › ip_vs_lblcr.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>ip_vs_lblcr.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * IPVS:        Locality-Based Least-Connection with Replication scheduler</span>
+<span class="cm"> *</span>
+<span class="cm"> * Authors:     Wensong Zhang &lt;wensong@gnuchina.org&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> *              This program is free software; you can redistribute it and/or</span>
+<span class="cm"> *              modify it under the terms of the GNU General Public License</span>
+<span class="cm"> *              as published by the Free Software Foundation; either version</span>
+<span class="cm"> *              2 of the License, or (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Changes:</span>
+<span class="cm"> *     Julian Anastasov        :    Added the missing (dest-&gt;weight&gt;0)</span>
+<span class="cm"> *                                  condition in the ip_vs_dest_set_max.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The lblc/r algorithm is as follows (pseudo code):</span>
+<span class="cm"> *</span>
+<span class="cm"> *       if serverSet[dest_ip] is null then</span>
+<span class="cm"> *               n, serverSet[dest_ip] &lt;- {weighted least-conn node};</span>
+<span class="cm"> *       else</span>
+<span class="cm"> *               n &lt;- {least-conn (alive) node in serverSet[dest_ip]};</span>
+<span class="cm"> *               if (n is null) OR</span>
+<span class="cm"> *                  (n.conns&gt;n.weight AND</span>
+<span class="cm"> *                   there is a node m with m.conns&lt;m.weight/2) then</span>
+<span class="cm"> *                   n &lt;- {weighted least-conn node};</span>
+<span class="cm"> *                   add n to serverSet[dest_ip];</span>
+<span class="cm"> *               if |serverSet[dest_ip]| &gt; 1 AND</span>
+<span class="cm"> *                   now - serverSet[dest_ip].lastMod &gt; T then</span>
+<span class="cm"> *                   m &lt;- {most conn node in serverSet[dest_ip]};</span>
+<span class="cm"> *                   remove m from serverSet[dest_ip];</span>
+<span class="cm"> *       if serverSet[dest_ip] changed then</span>
+<span class="cm"> *               serverSet[dest_ip].lastMod &lt;- now;</span>
+<span class="cm"> *</span>
+<span class="cm"> *       return n;</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define KMSG_COMPONENT &quot;IPVS&quot;</span>
+<span class="cp">#define pr_fmt(fmt) KMSG_COMPONENT &quot;: &quot; fmt</span>
+
+<span class="cp">#include &lt;linux/ip.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;linux/jiffies.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="cm">/* for sysctl */</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/sysctl.h&gt;</span>
+<span class="cp">#include &lt;net/net_namespace.h&gt;</span>
+
+<span class="cp">#include &lt;net/ip_vs.h&gt;</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *    It is for garbage collection of stale IPVS lblcr entries,</span>
+<span class="cm"> *    when the table is full.</span>
+<span class="cm"> */</span>
+<span class="cp">#define CHECK_EXPIRE_INTERVAL   (60*HZ)</span>
+<span class="cp">#define ENTRY_TIMEOUT           (6*60*HZ)</span>
+
+<span class="cp">#define DEFAULT_EXPIRATION	(24*60*60*HZ)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *    It is for full expiration check.</span>
+<span class="cm"> *    When there is no partial expiration check (garbage collection)</span>
+<span class="cm"> *    in a half hour, do a full expiration check to collect stale</span>
+<span class="cm"> *    entries that haven&#39;t been touched for a day.</span>
+<span class="cm"> */</span>
+<span class="cp">#define COUNT_FOR_FULL_EXPIRATION   30</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *     for IPVS lblcr entry hash table</span>
+<span class="cm"> */</span>
+<span class="cp">#ifndef CONFIG_IP_VS_LBLCR_TAB_BITS</span>
+<span class="cp">#define CONFIG_IP_VS_LBLCR_TAB_BITS      10</span>
+<span class="cp">#endif</span>
+<span class="cp">#define IP_VS_LBLCR_TAB_BITS     CONFIG_IP_VS_LBLCR_TAB_BITS</span>
+<span class="cp">#define IP_VS_LBLCR_TAB_SIZE     (1 &lt;&lt; IP_VS_LBLCR_TAB_BITS)</span>
+<span class="cp">#define IP_VS_LBLCR_TAB_MASK     (IP_VS_LBLCR_TAB_SIZE - 1)</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      IPVS destination set structure and operations</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>          <span class="cm">/* list link */</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest</span>       <span class="o">*</span><span class="n">dest</span><span class="p">;</span>          <span class="cm">/* destination server */</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="p">{</span>
+	<span class="n">atomic_t</span>                <span class="n">size</span><span class="p">;</span>           <span class="cm">/* set size */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>           <span class="n">lastmod</span><span class="p">;</span>        <span class="cm">/* last modified time */</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>           <span class="cm">/* destination list */</span>
+	<span class="n">rwlock_t</span>	        <span class="n">lock</span><span class="p">;</span>           <span class="cm">/* lock for this list */</span>
+<span class="p">};</span>
+
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span>
+<span class="nf">ip_vs_dest_set_insert</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="o">*</span><span class="n">set</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span> <span class="o">==</span> <span class="n">dest</span><span class="p">)</span>
+			<span class="cm">/* already existed */</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">e</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">e</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">e</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span> <span class="o">=</span> <span class="n">dest</span><span class="p">;</span>
+
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="n">set</span><span class="o">-&gt;</span><span class="n">lastmod</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">e</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">ip_vs_dest_set_erase</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="o">*</span><span class="n">set</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span> <span class="o">==</span> <span class="n">dest</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* HIT */</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+			<span class="n">set</span><span class="o">-&gt;</span><span class="n">lastmod</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">e</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ip_vs_dest_set_eraseall</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="o">*</span><span class="n">set</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span><span class="n">e</span><span class="p">,</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+
+	<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="n">ep</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * We don&#39;t kfree dest because it is referred either</span>
+<span class="cm">		 * by its service or by the trash dest list.</span>
+<span class="cm">		 */</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">e</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* get weighted least-connection node in the destination set */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="nf">ip_vs_dest_set_min</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="o">*</span><span class="n">set</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">register</span> <span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">,</span> <span class="o">*</span><span class="n">least</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">loh</span><span class="p">,</span> <span class="n">doh</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">set</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* select the first destination server, whose weight &gt; 0 */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">least</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_OVERLOAD</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+		    <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_AVAILABLE</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">loh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">least</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">nextstage</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* find the destination with the weighted least load */</span>
+  <span class="nl">nextstage:</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dest</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_OVERLOAD</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">doh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">dest</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">loh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span>
+		     <span class="n">doh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">))</span>
+		    <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_AVAILABLE</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">least</span> <span class="o">=</span> <span class="n">dest</span><span class="p">;</span>
+			<span class="n">loh</span> <span class="o">=</span> <span class="n">doh</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">IP_VS_DBG_BUF</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;%s(): server %s:%d &quot;</span>
+		      <span class="s">&quot;activeconns %d refcnt %d weight %d overhead %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		      <span class="n">__func__</span><span class="p">,</span>
+		      <span class="n">IP_VS_DBG_ADDR</span><span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">),</span>
+		      <span class="n">ntohs</span><span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">activeconns</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">),</span> <span class="n">loh</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">least</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/* get weighted most-connection node in the destination set */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="nf">ip_vs_dest_set_max</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest_set</span> <span class="o">*</span><span class="n">set</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">register</span> <span class="k">struct</span> <span class="n">ip_vs_dest_set_elem</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">,</span> <span class="o">*</span><span class="n">most</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">moh</span><span class="p">,</span> <span class="n">doh</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">set</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* select the first destination server, whose weight &gt; 0 */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">most</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">moh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">most</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">nextstage</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* find the destination with the weighted most load */</span>
+  <span class="nl">nextstage:</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">set</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dest</span> <span class="o">=</span> <span class="n">e</span><span class="o">-&gt;</span><span class="n">dest</span><span class="p">;</span>
+		<span class="n">doh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">dest</span><span class="p">);</span>
+		<span class="cm">/* moh/mw &lt; doh/dw ==&gt; moh*dw &lt; doh*mw, where mw,dw&gt;0 */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">moh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&lt;</span>
+		     <span class="n">doh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">))</span>
+		    <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">most</span> <span class="o">=</span> <span class="n">dest</span><span class="p">;</span>
+			<span class="n">moh</span> <span class="o">=</span> <span class="n">doh</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">IP_VS_DBG_BUF</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;%s(): server %s:%d &quot;</span>
+		      <span class="s">&quot;activeconns %d refcnt %d weight %d overhead %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		      <span class="n">__func__</span><span class="p">,</span>
+		      <span class="n">IP_VS_DBG_ADDR</span><span class="p">(</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">),</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">activeconns</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">most</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">),</span> <span class="n">moh</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">most</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      IPVS lblcr entry represents an association between destination</span>
+<span class="cm"> *      IP address and its destination server set</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>        <span class="n">list</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">af</span><span class="p">;</span>		<span class="cm">/* address family */</span>
+	<span class="k">union</span> <span class="n">nf_inet_addr</span>      <span class="n">addr</span><span class="p">;</span>           <span class="cm">/* destination IP address */</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest_set</span>   <span class="n">set</span><span class="p">;</span>            <span class="cm">/* destination server set */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>           <span class="n">lastuse</span><span class="p">;</span>        <span class="cm">/* last used time */</span>
+<span class="p">};</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      IPVS lblcr hash table</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>        <span class="n">bucket</span><span class="p">[</span><span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="p">];</span>  <span class="cm">/* hash bucket */</span>
+	<span class="n">atomic_t</span>                <span class="n">entries</span><span class="p">;</span>        <span class="cm">/* number of entries */</span>
+	<span class="kt">int</span>                     <span class="n">max_size</span><span class="p">;</span>       <span class="cm">/* maximum size of entries */</span>
+	<span class="k">struct</span> <span class="n">timer_list</span>       <span class="n">periodic_timer</span><span class="p">;</span> <span class="cm">/* collect stale entries */</span>
+	<span class="kt">int</span>                     <span class="n">rover</span><span class="p">;</span>          <span class="cm">/* rover for expire check */</span>
+	<span class="kt">int</span>                     <span class="n">counter</span><span class="p">;</span>        <span class="cm">/* counter for no expire */</span>
+<span class="p">};</span>
+
+
+<span class="cp">#ifdef CONFIG_SYSCTL</span>
+<span class="cm">/*</span>
+<span class="cm"> *      IPVS LBLCR sysctl table</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="n">ctl_table</span> <span class="n">vs_vars_table</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">procname</span>	<span class="o">=</span> <span class="s">&quot;lblcr_expiration&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">data</span>		<span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">maxlen</span>		<span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">mode</span>		<span class="o">=</span> <span class="mo">0644</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">proc_handler</span>	<span class="o">=</span> <span class="n">proc_dointvec_jiffies</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span> <span class="p">}</span>
+<span class="p">};</span>
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">ip_vs_lblcr_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">ip_vs_dest_set_eraseall</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">en</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *	Returns hash value for IPVS LBLCR entry</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">unsigned</span> <span class="kt">int</span>
+<span class="nf">ip_vs_lblcr_hashkey</span><span class="p">(</span><span class="kt">int</span> <span class="n">af</span><span class="p">,</span> <span class="k">const</span> <span class="k">union</span> <span class="n">nf_inet_addr</span> <span class="o">*</span><span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__be32</span> <span class="n">addr_fold</span> <span class="o">=</span> <span class="n">addr</span><span class="o">-&gt;</span><span class="n">ip</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_IP_VS_IPV6</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">af</span> <span class="o">==</span> <span class="n">AF_INET6</span><span class="p">)</span>
+		<span class="n">addr_fold</span> <span class="o">=</span> <span class="n">addr</span><span class="o">-&gt;</span><span class="n">ip6</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">^</span><span class="n">addr</span><span class="o">-&gt;</span><span class="n">ip6</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">^</span>
+			    <span class="n">addr</span><span class="o">-&gt;</span><span class="n">ip6</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="o">^</span><span class="n">addr</span><span class="o">-&gt;</span><span class="n">ip6</span><span class="p">[</span><span class="mi">3</span><span class="p">];</span>
+<span class="cp">#endif</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">ntohl</span><span class="p">(</span><span class="n">addr_fold</span><span class="p">)</span><span class="o">*</span><span class="mi">2654435761UL</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">IP_VS_LBLCR_TAB_MASK</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *	Hash an entry in the ip_vs_lblcr_table.</span>
+<span class="cm"> *	returns bool success.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">ip_vs_lblcr_hash</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hash</span> <span class="o">=</span> <span class="n">ip_vs_lblcr_hashkey</span><span class="p">(</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">);</span>
+
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">hash</span><span class="p">]);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *  Get ip_vs_lblcr_entry associated with supplied parameters. Called under</span>
+<span class="cm"> *  read lock.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span>
+<span class="nf">ip_vs_lblcr_get</span><span class="p">(</span><span class="kt">int</span> <span class="n">af</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span><span class="p">,</span>
+		<span class="k">const</span> <span class="k">union</span> <span class="n">nf_inet_addr</span> <span class="o">*</span><span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hash</span> <span class="o">=</span> <span class="n">ip_vs_lblcr_hashkey</span><span class="p">(</span><span class="n">af</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">en</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">hash</span><span class="p">],</span> <span class="n">list</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ip_vs_addr_equal</span><span class="p">(</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">,</span> <span class="n">addr</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">en</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Create or update an ip_vs_lblcr_entry, which is a mapping of a destination</span>
+<span class="cm"> * IP address to a server. Called under write lock.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span>
+<span class="nf">ip_vs_lblcr_new</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span><span class="p">,</span> <span class="k">const</span> <span class="k">union</span> <span class="n">nf_inet_addr</span> <span class="o">*</span><span class="n">daddr</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">;</span>
+
+	<span class="n">en</span> <span class="o">=</span> <span class="n">ip_vs_lblcr_get</span><span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="n">tbl</span><span class="p">,</span> <span class="n">daddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">en</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">en</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">en</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">en</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="n">en</span><span class="o">-&gt;</span><span class="n">af</span> <span class="o">=</span> <span class="n">dest</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">;</span>
+		<span class="n">ip_vs_addr_copy</span><span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">,</span> <span class="n">daddr</span><span class="p">);</span>
+		<span class="n">en</span><span class="o">-&gt;</span><span class="n">lastuse</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+
+		<span class="cm">/* initialize its dest set */</span>
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="p">(</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">size</span><span class="p">),</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">rwlock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="n">ip_vs_lblcr_hash</span><span class="p">(</span><span class="n">tbl</span><span class="p">,</span> <span class="n">en</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">ip_vs_dest_set_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">,</span> <span class="n">dest</span><span class="p">);</span>
+	<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">en</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      Flush all the entries of the specified table.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ip_vs_lblcr_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">,</span> <span class="o">*</span><span class="n">nxt</span><span class="p">;</span>
+
+	<span class="cm">/* No locking required, only called during cleanup. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span><span class="o">=</span><span class="mi">0</span><span class="p">;</span> <span class="n">i</span><span class="o">&lt;</span><span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">en</span><span class="p">,</span> <span class="n">nxt</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ip_vs_lblcr_free</span><span class="p">(</span><span class="n">en</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sysctl_lblcr_expiration</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#ifdef CONFIG_SYSCTL</span>
+	<span class="k">struct</span> <span class="n">netns_ipvs</span> <span class="o">*</span><span class="n">ipvs</span> <span class="o">=</span> <span class="n">net_ipvs</span><span class="p">(</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">net</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">sysctl_lblcr_expiration</span><span class="p">;</span>
+<span class="cp">#else</span>
+	<span class="k">return</span> <span class="n">DEFAULT_EXPIRATION</span><span class="p">;</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">ip_vs_lblcr_full_check</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span> <span class="o">=</span> <span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">now</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">,</span> <span class="o">*</span><span class="n">nxt</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">j</span><span class="o">=</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">rover</span><span class="p">;</span> <span class="n">i</span><span class="o">&lt;</span><span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">j</span> <span class="o">=</span> <span class="p">(</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">IP_VS_LBLCR_TAB_MASK</span><span class="p">;</span>
+
+		<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">en</span><span class="p">,</span> <span class="n">nxt</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">lastuse</span> <span class="o">+</span>
+				       <span class="n">sysctl_lblcr_expiration</span><span class="p">(</span><span class="n">svc</span><span class="p">),</span> <span class="n">now</span><span class="p">))</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="n">ip_vs_lblcr_free</span><span class="p">(</span><span class="n">en</span><span class="p">);</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">rover</span> <span class="o">=</span> <span class="n">j</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      Periodical timer handler for IPVS lblcr table</span>
+<span class="cm"> *      It is used to collect stale entries when the number of entries</span>
+<span class="cm"> *      exceeds the maximum size of the table.</span>
+<span class="cm"> *</span>
+<span class="cm"> *      Fixme: we probably need more complicated algorithm to collect</span>
+<span class="cm"> *             entries that have not been used for a long time even</span>
+<span class="cm"> *             if the number of entries doesn&#39;t exceed the maximum size</span>
+<span class="cm"> *             of the table.</span>
+<span class="cm"> *      The full expiration check is for this purpose now.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ip_vs_lblcr_check_expire</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="p">)</span> <span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span> <span class="o">=</span> <span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">now</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">goal</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">,</span> <span class="o">*</span><span class="n">nxt</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">counter</span> <span class="o">%</span> <span class="n">COUNT_FOR_FULL_EXPIRATION</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* do full expiration check */</span>
+		<span class="n">ip_vs_lblcr_full_check</span><span class="p">(</span><span class="n">svc</span><span class="p">);</span>
+		<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">counter</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">tbl</span><span class="o">-&gt;</span><span class="n">max_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">counter</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">goal</span> <span class="o">=</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">)</span> <span class="o">-</span> <span class="n">tbl</span><span class="o">-&gt;</span><span class="n">max_size</span><span class="p">)</span><span class="o">*</span><span class="mi">4</span><span class="o">/</span><span class="mi">3</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">goal</span> <span class="o">&gt;</span> <span class="n">tbl</span><span class="o">-&gt;</span><span class="n">max_size</span><span class="o">/</span><span class="mi">2</span><span class="p">)</span>
+		<span class="n">goal</span> <span class="o">=</span> <span class="n">tbl</span><span class="o">-&gt;</span><span class="n">max_size</span><span class="o">/</span><span class="mi">2</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">j</span><span class="o">=</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">rover</span><span class="p">;</span> <span class="n">i</span><span class="o">&lt;</span><span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">j</span> <span class="o">=</span> <span class="p">(</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">IP_VS_LBLCR_TAB_MASK</span><span class="p">;</span>
+
+		<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">en</span><span class="p">,</span> <span class="n">nxt</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">now</span><span class="p">,</span> <span class="n">en</span><span class="o">-&gt;</span><span class="n">lastuse</span><span class="o">+</span><span class="n">ENTRY_TIMEOUT</span><span class="p">))</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="n">ip_vs_lblcr_free</span><span class="p">(</span><span class="n">en</span><span class="p">);</span>
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">);</span>
+			<span class="n">goal</span><span class="o">--</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">goal</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">rover</span> <span class="o">=</span> <span class="n">j</span><span class="p">;</span>
+
+  <span class="nl">out:</span>
+	<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">periodic_timer</span><span class="p">,</span> <span class="n">jiffies</span><span class="o">+</span><span class="n">CHECK_EXPIRE_INTERVAL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ip_vs_lblcr_init_svc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 *    Allocate the ip_vs_lblcr_table for this service</span>
+<span class="cm">	 */</span>
+	<span class="n">tbl</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">tbl</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tbl</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_data</span> <span class="o">=</span> <span class="n">tbl</span><span class="p">;</span>
+	<span class="n">IP_VS_DBG</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;LBLCR hash table (memory=%Zdbytes) allocated for &quot;</span>
+		  <span class="s">&quot;current service</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">tbl</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 *    Initialize the hash buckets</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span><span class="o">=</span><span class="mi">0</span><span class="p">;</span> <span class="n">i</span><span class="o">&lt;</span><span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">bucket</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+	<span class="p">}</span>
+	<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">max_size</span> <span class="o">=</span> <span class="n">IP_VS_LBLCR_TAB_SIZE</span><span class="o">*</span><span class="mi">16</span><span class="p">;</span>
+	<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">rover</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">tbl</span><span class="o">-&gt;</span><span class="n">counter</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 *    Hook periodic timer for garbage collection</span>
+<span class="cm">	 */</span>
+	<span class="n">setup_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">periodic_timer</span><span class="p">,</span> <span class="n">ip_vs_lblcr_check_expire</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">svc</span><span class="p">);</span>
+	<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">periodic_timer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">CHECK_EXPIRE_INTERVAL</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ip_vs_lblcr_done_svc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span> <span class="o">=</span> <span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_data</span><span class="p">;</span>
+
+	<span class="cm">/* remove periodic timer */</span>
+	<span class="n">del_timer_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tbl</span><span class="o">-&gt;</span><span class="n">periodic_timer</span><span class="p">);</span>
+
+	<span class="cm">/* got to clean up table entries here */</span>
+	<span class="n">ip_vs_lblcr_flush</span><span class="p">(</span><span class="n">tbl</span><span class="p">);</span>
+
+	<span class="cm">/* release the table itself */</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">tbl</span><span class="p">);</span>
+	<span class="n">IP_VS_DBG</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;LBLCR hash table (memory=%Zdbytes) released</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		  <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">tbl</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span>
+<span class="nf">__ip_vs_lblcr_schedule</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">,</span> <span class="o">*</span><span class="n">least</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">loh</span><span class="p">,</span> <span class="n">doh</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We use the following formula to estimate the load:</span>
+<span class="cm">	 *                (dest overhead) / dest-&gt;weight</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Remember -- no floats in kernel mode!!!</span>
+<span class="cm">	 * The comparison of h1*w2 &gt; h2*w1 is equivalent to that of</span>
+<span class="cm">	 *                h1/w1 &gt; h2/w2</span>
+<span class="cm">	 * if every weight is larger than zero.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * The server with weight=0 is quiesced and will not receive any</span>
+<span class="cm">	 * new connection.</span>
+<span class="cm">	 */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">dest</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">destinations</span><span class="p">,</span> <span class="n">n_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_OVERLOAD</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">least</span> <span class="o">=</span> <span class="n">dest</span><span class="p">;</span>
+			<span class="n">loh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">least</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">nextstage</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 *    Find the destination with the least load.</span>
+<span class="cm">	 */</span>
+  <span class="nl">nextstage:</span>
+	<span class="n">list_for_each_entry_continue</span><span class="p">(</span><span class="n">dest</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">destinations</span><span class="p">,</span> <span class="n">n_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IP_VS_DEST_F_OVERLOAD</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">doh</span> <span class="o">=</span> <span class="n">ip_vs_dest_conn_overhead</span><span class="p">(</span><span class="n">dest</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">loh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">)</span> <span class="o">&gt;</span>
+		    <span class="n">doh</span> <span class="o">*</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">least</span> <span class="o">=</span> <span class="n">dest</span><span class="p">;</span>
+			<span class="n">loh</span> <span class="o">=</span> <span class="n">doh</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">IP_VS_DBG_BUF</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;LBLCR: server %s:%d &quot;</span>
+		      <span class="s">&quot;activeconns %d refcnt %d weight %d overhead %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		      <span class="n">IP_VS_DBG_ADDR</span><span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">),</span>
+		      <span class="n">ntohs</span><span class="p">(</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">activeconns</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">),</span>
+		      <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">least</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">),</span> <span class="n">loh</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">least</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *   If this destination server is overloaded and there is a less loaded</span>
+<span class="cm"> *   server, then return true.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span>
+<span class="nf">is_overloaded</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">activeconns</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">d</span><span class="p">;</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">destinations</span><span class="p">,</span> <span class="n">n_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">d</span><span class="o">-&gt;</span><span class="n">activeconns</span><span class="p">)</span><span class="o">*</span><span class="mi">2</span>
+			    <span class="o">&lt;</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">d</span><span class="o">-&gt;</span><span class="n">weight</span><span class="p">))</span> <span class="p">{</span>
+				<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *    Locality-Based (weighted) Least-Connection scheduling</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span>
+<span class="nf">ip_vs_lblcr_schedule</span><span class="p">(</span><span class="k">struct</span> <span class="n">ip_vs_service</span> <span class="o">*</span><span class="n">svc</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_table</span> <span class="o">*</span><span class="n">tbl</span> <span class="o">=</span> <span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_iphdr</span> <span class="n">iph</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">dest</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ip_vs_lblcr_entry</span> <span class="o">*</span><span class="n">en</span><span class="p">;</span>
+
+	<span class="n">ip_vs_fill_iphdr</span><span class="p">(</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="n">skb_network_header</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">iph</span><span class="p">);</span>
+
+	<span class="n">IP_VS_DBG</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;%s(): Scheduling...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+
+	<span class="cm">/* First look in our cache */</span>
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+	<span class="n">en</span> <span class="o">=</span> <span class="n">ip_vs_lblcr_get</span><span class="p">(</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="n">tbl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iph</span><span class="p">.</span><span class="n">daddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">en</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* We only hold a read lock, but this is atomic */</span>
+		<span class="n">en</span><span class="o">-&gt;</span><span class="n">lastuse</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+
+		<span class="cm">/* Get the least loaded destination */</span>
+		<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">dest</span> <span class="o">=</span> <span class="n">ip_vs_dest_set_min</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">);</span>
+		<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="cm">/* More than one destination + enough time passed by, cleanup */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="o">&amp;&amp;</span>
+				<span class="n">time_after</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lastmod</span> <span class="o">+</span>
+				<span class="n">sysctl_lblcr_expiration</span><span class="p">(</span><span class="n">svc</span><span class="p">)))</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">ip_vs_dest</span> <span class="o">*</span><span class="n">m</span><span class="p">;</span>
+
+			<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+			<span class="n">m</span> <span class="o">=</span> <span class="n">ip_vs_dest_set_max</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">m</span><span class="p">)</span>
+				<span class="n">ip_vs_dest_set_erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">,</span> <span class="n">m</span><span class="p">);</span>
+			<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* If the destination is not overloaded, use it */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dest</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">is_overloaded</span><span class="p">(</span><span class="n">dest</span><span class="p">,</span> <span class="n">svc</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* The cache entry is invalid, time to schedule */</span>
+		<span class="n">dest</span> <span class="o">=</span> <span class="n">__ip_vs_lblcr_schedule</span><span class="p">(</span><span class="n">svc</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dest</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ip_vs_scheduler_err</span><span class="p">(</span><span class="n">svc</span><span class="p">,</span> <span class="s">&quot;no destination available&quot;</span><span class="p">);</span>
+			<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* Update our cache entry */</span>
+		<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">ip_vs_dest_set_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">,</span> <span class="n">dest</span><span class="p">);</span>
+		<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">en</span><span class="o">-&gt;</span><span class="n">set</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dest</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* No cache entry, time to schedule */</span>
+	<span class="n">dest</span> <span class="o">=</span> <span class="n">__ip_vs_lblcr_schedule</span><span class="p">(</span><span class="n">svc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dest</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">IP_VS_DBG</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="s">&quot;no destination available</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* If we fail to create a cache entry, we&#39;ll just use the valid dest */</span>
+	<span class="n">write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+	<span class="n">ip_vs_lblcr_new</span><span class="p">(</span><span class="n">tbl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iph</span><span class="p">.</span><span class="n">daddr</span><span class="p">,</span> <span class="n">dest</span><span class="p">);</span>
+	<span class="n">write_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">sched_lock</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">IP_VS_DBG_BUF</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="s">&quot;LBLCR: destination IP address %s --&gt; server %s:%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		      <span class="n">IP_VS_DBG_ADDR</span><span class="p">(</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iph</span><span class="p">.</span><span class="n">daddr</span><span class="p">),</span>
+		      <span class="n">IP_VS_DBG_ADDR</span><span class="p">(</span><span class="n">svc</span><span class="o">-&gt;</span><span class="n">af</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">),</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">dest</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">dest</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> *      IPVS LBLCR Scheduler structure</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">ip_vs_scheduler</span> <span class="n">ip_vs_lblcr_scheduler</span> <span class="o">=</span>
+<span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span>			<span class="s">&quot;lblcr&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">refcnt</span> <span class="o">=</span>		<span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">module</span> <span class="o">=</span>		<span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">n_list</span> <span class="o">=</span>		<span class="n">LIST_HEAD_INIT</span><span class="p">(</span><span class="n">ip_vs_lblcr_scheduler</span><span class="p">.</span><span class="n">n_list</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">init_service</span> <span class="o">=</span>		<span class="n">ip_vs_lblcr_init_svc</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">done_service</span> <span class="o">=</span>		<span class="n">ip_vs_lblcr_done_svc</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">schedule</span> <span class="o">=</span>		<span class="n">ip_vs_lblcr_schedule</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *  per netns init.</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_SYSCTL</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__net_init</span> <span class="nf">__ip_vs_lblcr_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">netns_ipvs</span> <span class="o">*</span><span class="n">ipvs</span> <span class="o">=</span> <span class="n">net_ipvs</span><span class="p">(</span><span class="n">net</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ipvs</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">net_eq</span><span class="p">(</span><span class="n">net</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">init_net</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span> <span class="o">=</span> <span class="n">kmemdup</span><span class="p">(</span><span class="n">vs_vars_table</span><span class="p">,</span>
+						<span class="k">sizeof</span><span class="p">(</span><span class="n">vs_vars_table</span><span class="p">),</span>
+						<span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span> <span class="o">=</span> <span class="n">vs_vars_table</span><span class="p">;</span>
+	<span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">sysctl_lblcr_expiration</span> <span class="o">=</span> <span class="n">DEFAULT_EXPIRATION</span><span class="p">;</span>
+	<span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">sysctl_lblcr_expiration</span><span class="p">;</span>
+
+	<span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_header</span> <span class="o">=</span>
+		<span class="n">register_net_sysctl</span><span class="p">(</span><span class="n">net</span><span class="p">,</span> <span class="s">&quot;net/ipv4/vs&quot;</span><span class="p">,</span> <span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_header</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">net_eq</span><span class="p">(</span><span class="n">net</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">init_net</span><span class="p">))</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__net_exit</span> <span class="nf">__ip_vs_lblcr_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">netns_ipvs</span> <span class="o">*</span><span class="n">ipvs</span> <span class="o">=</span> <span class="n">net_ipvs</span><span class="p">(</span><span class="n">net</span><span class="p">);</span>
+
+	<span class="n">unregister_net_sysctl_table</span><span class="p">(</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_header</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">net_eq</span><span class="p">(</span><span class="n">net</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">init_net</span><span class="p">))</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">ipvs</span><span class="o">-&gt;</span><span class="n">lblcr_ctl_table</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#else</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__net_init</span> <span class="nf">__ip_vs_lblcr_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="mi">0</span><span class="p">;</span> <span class="p">}</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__net_exit</span> <span class="nf">__ip_vs_lblcr_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">net</span> <span class="o">*</span><span class="n">net</span><span class="p">)</span> <span class="p">{</span> <span class="p">}</span>
+
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">pernet_operations</span> <span class="n">ip_vs_lblcr_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">init</span> <span class="o">=</span> <span class="n">__ip_vs_lblcr_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">exit</span> <span class="o">=</span> <span class="n">__ip_vs_lblcr_exit</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">ip_vs_lblcr_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">register_pernet_subsys</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ip_vs_lblcr_ops</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">register_ip_vs_scheduler</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ip_vs_lblcr_scheduler</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">unregister_pernet_subsys</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ip_vs_lblcr_ops</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">ip_vs_lblcr_cleanup</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unregister_ip_vs_scheduler</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ip_vs_lblcr_scheduler</span><span class="p">);</span>
+	<span class="n">unregister_pernet_subsys</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ip_vs_lblcr_ops</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">ip_vs_lblcr_init</span><span class="p">);</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">ip_vs_lblcr_cleanup</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

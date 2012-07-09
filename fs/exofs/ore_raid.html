@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › exofs › ore_raid.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>ore_raid.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2011</span>
+<span class="cm"> * Boaz Harrosh &lt;bharrosh@panasas.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is part of the objects raid engine (ore).</span>
+<span class="cm"> *</span>
+<span class="cm"> * It is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License version 2 as published</span>
+<span class="cm"> * by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License</span>
+<span class="cm"> * along with &quot;ore&quot;. If not, write to the Free Software Foundation, Inc:</span>
+<span class="cm"> *	&quot;Free Software Foundation &lt;info@fsf.org&gt;&quot;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+<span class="cp">#include &lt;linux/async_tx.h&gt;</span>
+
+<span class="cp">#include &quot;ore_raid.h&quot;</span>
+
+<span class="cp">#undef ORE_DBGMSG2</span>
+<span class="cp">#define ORE_DBGMSG2 ORE_DBGMSG</span>
+
+<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="nf">_raid_page_alloc</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">_raid_page_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__free_page</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* This struct is forward declare in ore_io_state, but is private to here.</span>
+<span class="cm"> * It is put on ios-&gt;sp2d for RAID5/6 writes only. See _gen_xor_unit.</span>
+<span class="cm"> *</span>
+<span class="cm"> * __stripe_pages_2d is a 2d array of pages, and it is also a corner turn.</span>
+<span class="cm"> * Ascending page index access is sp2d(p-minor, c-major). But storage is</span>
+<span class="cm"> * sp2d[p-minor][c-major], so it can be properlly presented to the async-xor</span>
+<span class="cm"> * API.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="p">{</span>
+	<span class="cm">/* Cache some hot path repeated calculations */</span>
+	<span class="kt">unsigned</span> <span class="n">parity</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">data_devs</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">pages_in_unit</span><span class="p">;</span>
+
+	<span class="n">bool</span> <span class="n">needed</span> <span class="p">;</span>
+
+	<span class="cm">/* Array size is pages_in_unit (layout-&gt;stripe_unit / PAGE_SIZE) */</span>
+	<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="p">{</span>
+		<span class="n">bool</span> <span class="n">alloc</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">write_count</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">async_submit_ctl</span> <span class="n">submit</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">dma_async_tx_descriptor</span> <span class="o">*</span><span class="n">tx</span><span class="p">;</span>
+
+		<span class="cm">/* The size of this array is data_devs + parity */</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">scribble</span><span class="p">;</span>
+		<span class="cm">/* bool array, size of this array is data_devs */</span>
+		<span class="kt">char</span> <span class="o">*</span><span class="n">page_is_read</span><span class="p">;</span>
+	<span class="p">}</span> <span class="n">_1p_stripes</span><span class="p">[];</span>
+<span class="p">};</span>
+
+<span class="cm">/* This can get bigger then a page. So support multiple page allocations</span>
+<span class="cm"> * _sp2d_free should be called even if _sp2d_alloc fails (by returning</span>
+<span class="cm"> * none-zero).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_sp2d_alloc</span><span class="p">(</span><span class="kt">unsigned</span> <span class="n">pages_in_unit</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">group_width</span><span class="p">,</span>
+		       <span class="kt">unsigned</span> <span class="n">parity</span><span class="p">,</span> <span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">**</span><span class="n">psp2d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">data_devs</span> <span class="o">=</span> <span class="n">group_width</span> <span class="o">-</span> <span class="n">parity</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">_alloc_all_bytes</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__alloc_stripe_pages_2d</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="n">sp2d</span><span class="p">;</span>
+			<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="n">_1p_stripes</span><span class="p">[</span><span class="n">pages_in_unit</span><span class="p">];</span>
+		<span class="p">}</span> <span class="n">__asp2d</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">__alloc_1p_arrays</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">pages</span><span class="p">[</span><span class="n">group_width</span><span class="p">];</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">scribble</span><span class="p">[</span><span class="n">group_width</span><span class="p">];</span>
+			<span class="kt">char</span> <span class="n">page_is_read</span><span class="p">[</span><span class="n">data_devs</span><span class="p">];</span>
+		<span class="p">}</span> <span class="n">__a1pa</span><span class="p">[</span><span class="n">pages_in_unit</span><span class="p">];</span>
+	<span class="p">}</span> <span class="o">*</span><span class="n">_aab</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">__alloc_1p_arrays</span> <span class="o">*</span><span class="n">__a1pa</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">__alloc_1p_arrays</span> <span class="o">*</span><span class="n">__a1pa_end</span><span class="p">;</span>
+	<span class="k">const</span> <span class="kt">unsigned</span> <span class="n">sizeof__a1pa</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__a1pa</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+	<span class="kt">unsigned</span> <span class="n">num_a1pa</span><span class="p">,</span> <span class="n">alloc_size</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/* FIXME: check these numbers in ore_verify_layout */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__asp2d</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">sizeof__a1pa</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">_aab</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">num_a1pa</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__asp2d</span><span class="p">))</span> <span class="o">/</span> <span class="n">sizeof__a1pa</span><span class="p">;</span>
+		<span class="n">alloc_size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__asp2d</span><span class="p">)</span> <span class="o">+</span> <span class="n">sizeof__a1pa</span> <span class="o">*</span> <span class="n">num_a1pa</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">num_a1pa</span> <span class="o">=</span> <span class="n">pages_in_unit</span><span class="p">;</span>
+		<span class="n">alloc_size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">_aab</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">_aab</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">alloc_size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">_aab</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;!! Failed to alloc sp2d size=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">alloc_size</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">sp2d</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__asp2d</span><span class="p">.</span><span class="n">sp2d</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">psp2d</span> <span class="o">=</span> <span class="n">sp2d</span><span class="p">;</span> <span class="cm">/* From here Just call _sp2d_free */</span>
+
+	<span class="n">__a1pa</span> <span class="o">=</span> <span class="n">_aab</span><span class="o">-&gt;</span><span class="n">__a1pa</span><span class="p">;</span>
+	<span class="n">__a1pa_end</span> <span class="o">=</span> <span class="n">__a1pa</span> <span class="o">+</span> <span class="n">num_a1pa</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages_in_unit</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">__a1pa</span> <span class="o">&gt;=</span> <span class="n">__a1pa_end</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">num_a1pa</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="kt">unsigned</span><span class="p">,</span> <span class="n">PAGE_SIZE</span> <span class="o">/</span> <span class="n">sizeof__a1pa</span><span class="p">,</span>
+							<span class="n">pages_in_unit</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+
+			<span class="n">__a1pa</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">num_a1pa</span> <span class="o">*</span> <span class="n">sizeof__a1pa</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">__a1pa</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;!! Failed to _alloc_1p_arrays=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					   <span class="n">num_a1pa</span><span class="p">);</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">__a1pa_end</span> <span class="o">=</span> <span class="n">__a1pa</span> <span class="o">+</span> <span class="n">num_a1pa</span><span class="p">;</span>
+			<span class="cm">/* First *pages is marked for kfree of the buffer */</span>
+			<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">alloc</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pages</span> <span class="o">=</span> <span class="n">__a1pa</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">;</span>
+		<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">scribble</span> <span class="o">=</span> <span class="n">__a1pa</span><span class="o">-&gt;</span><span class="n">scribble</span> <span class="p">;</span>
+		<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">page_is_read</span> <span class="o">=</span> <span class="n">__a1pa</span><span class="o">-&gt;</span><span class="n">page_is_read</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">__a1pa</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">parity</span> <span class="o">=</span> <span class="n">parity</span><span class="p">;</span>
+	<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span> <span class="o">=</span> <span class="n">data_devs</span><span class="p">;</span>
+	<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span> <span class="o">=</span> <span class="n">pages_in_unit</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">_sp2d_reset</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">,</span>
+			<span class="k">const</span> <span class="k">struct</span> <span class="n">_ore_r4w_op</span> <span class="o">*</span><span class="n">r4w</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">data_devs</span> <span class="o">=</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">group_width</span> <span class="o">=</span> <span class="n">data_devs</span> <span class="o">+</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">parity</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">needed</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span> <span class="o">&lt;</span> <span class="n">group_width</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">unsigned</span> <span class="n">c</span><span class="p">;</span>
+
+			<span class="k">for</span> <span class="p">(</span><span class="n">c</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">c</span> <span class="o">&lt;</span> <span class="n">data_devs</span><span class="p">;</span> <span class="n">c</span><span class="o">++</span><span class="p">)</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">page_is_read</span><span class="p">[</span><span class="n">c</span><span class="p">])</span> <span class="p">{</span>
+					<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">c</span><span class="p">];</span>
+
+					<span class="n">r4w</span><span class="o">-&gt;</span><span class="n">put_page</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+					<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">page_is_read</span><span class="p">[</span><span class="n">c</span><span class="p">]</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+				<span class="p">}</span>
+		<span class="p">}</span>
+
+		<span class="n">memset</span><span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">group_width</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">));</span>
+		<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">tx</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">needed</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">_sp2d_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sp2d</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">alloc</span><span class="p">)</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pages</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">_sp2d_min_pg</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="o">~</span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">_sp2d_max_pg</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">p</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">;</span> <span class="o">--</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="o">~</span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">_gen_xor_unit</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">p</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">init_async_submit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">submit</span><span class="p">,</span>
+			<span class="n">ASYNC_TX_XOR_ZERO_DST</span> <span class="o">|</span> <span class="n">ASYNC_TX_ACK</span><span class="p">,</span>
+			<span class="nb">NULL</span><span class="p">,</span>
+			<span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span>
+			<span class="p">(</span><span class="n">addr_conv_t</span> <span class="o">*</span><span class="p">)</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">scribble</span><span class="p">);</span>
+
+		<span class="cm">/* TODO: raid6 */</span>
+		<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">tx</span> <span class="o">=</span> <span class="n">async_xor</span><span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span><span class="p">],</span> <span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">,</span>
+				     <span class="mi">0</span><span class="p">,</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span>
+				     <span class="o">&amp;</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">submit</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+		<span class="cm">/* NOTE: We wait for HW synchronously (I don&#39;t have such HW</span>
+<span class="cm">		 * to test with.) Is parallelism needed with today&#39;s multi</span>
+<span class="cm">		 * cores?</span>
+<span class="cm">		 */</span>
+		<span class="n">async_tx_issue_pending</span><span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">tx</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">_ore_add_stripe_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="o">*</span><span class="n">si</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span><span class="p">;</span>
+
+	<span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">needed</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span><span class="p">];</span>
+	<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_comp</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+	<span class="o">++</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">write_count</span><span class="p">;</span>
+
+	<span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span> <span class="o">=</span> <span class="p">(</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">;</span>
+	<span class="cm">/* si-&gt;cur_comp is advanced outside at main loop */</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">_ore_add_sg_seg</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_per_dev_state</span> <span class="o">*</span><span class="n">per_dev</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">cur_len</span><span class="p">,</span>
+		     <span class="n">bool</span> <span class="n">not_last</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">osd_sg_entry</span> <span class="o">*</span><span class="n">sge</span><span class="p">;</span>
+
+	<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;dev=%d cur_len=0x%x not_last=%d cur_sg=%d &quot;</span>
+		     <span class="s">&quot;offset=0x%llx length=0x%x last_sgs_total=0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">cur_len</span><span class="p">,</span> <span class="n">not_last</span><span class="p">,</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">,</span>
+		     <span class="n">_LLU</span><span class="p">(</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">),</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span>
+		     <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">last_sgs_total</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sge</span> <span class="o">=</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">sglist</span><span class="p">;</span>
+
+		<span class="cm">/* First time we prepare two entries */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">++</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">;</span>
+			<span class="n">sge</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+			<span class="n">sge</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="cm">/* Here the parity is the first unit of this object.</span>
+<span class="cm">			 * This happens every time we reach a parity device on</span>
+<span class="cm">			 * the same stripe as the per_dev-&gt;offset. We need to</span>
+<span class="cm">			 * just skip this unit.</span>
+<span class="cm">			 */</span>
+			<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+=</span> <span class="n">cur_len</span><span class="p">;</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* finalize the last one */</span>
+		<span class="n">sge</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">sglist</span><span class="p">[</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span> <span class="o">-</span> <span class="mi">1</span><span class="p">];</span>
+		<span class="n">sge</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">-</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">last_sgs_total</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">not_last</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Partly prepare the next one */</span>
+		<span class="k">struct</span> <span class="n">osd_sg_entry</span> <span class="o">*</span><span class="n">next_sge</span> <span class="o">=</span> <span class="n">sge</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="o">++</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">;</span>
+		<span class="n">next_sge</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">sge</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">sge</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">+</span> <span class="n">cur_len</span><span class="p">;</span>
+		<span class="cm">/* Save cur len so we know how mutch was added next time */</span>
+		<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">last_sgs_total</span> <span class="o">=</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="n">next_sge</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sge</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Optimize for when the last unit is a parity */</span>
+		<span class="o">--</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_alloc_read_4_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ore_layout</span> <span class="o">*</span><span class="n">layout</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="cm">/* We want to only read those pages not in cache so worst case</span>
+<span class="cm">	 * is a stripe populated with every other page</span>
+<span class="cm">	 */</span>
+	<span class="kt">unsigned</span> <span class="n">sgs_per_dev</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span> <span class="o">+</span> <span class="mi">2</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">_ore_get_io_state</span><span class="p">(</span><span class="n">layout</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">oc</span><span class="p">,</span>
+				<span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span> <span class="o">*</span> <span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">,</span>
+				<span class="n">sgs_per_dev</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* @si contains info of the to-be-inserted page. Update of @si should be</span>
+<span class="cm"> * maintained by caller. Specificaly si-&gt;dev, si-&gt;obj_offset, ...</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_add_to_r4w</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="o">*</span><span class="n">si</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">pg_len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ore_per_dev_state</span> <span class="o">*</span><span class="n">per_dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">read_ios</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">first_dev</span> <span class="o">=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">-</span> <span class="p">(</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">%</span>
+			  <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span> <span class="o">*</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">));</span>
+	<span class="kt">unsigned</span> <span class="n">comp</span> <span class="o">=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">-</span> <span class="n">first_dev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">added_len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="n">_alloc_read_4_write</span><span class="p">(</span><span class="n">ios</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">read_ios</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">;</span>
+	<span class="n">read_ios</span><span class="o">-&gt;</span><span class="n">numdevs</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span> <span class="o">*</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">;</span>
+
+	<span class="n">per_dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">read_ios</span><span class="o">-&gt;</span><span class="n">per_dev</span><span class="p">[</span><span class="n">comp</span><span class="p">];</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_kmalloc</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span>
+					   <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;Failed to allocate BIO size=%u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				     <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">obj_offset</span><span class="p">;</span>
+		<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">obj_offset</span> <span class="o">!=</span> <span class="p">(</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">u64</span> <span class="n">gap</span> <span class="o">=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">obj_offset</span> <span class="o">-</span> <span class="p">(</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">);</span>
+
+		<span class="n">_ore_add_sg_seg</span><span class="p">(</span><span class="n">per_dev</span><span class="p">,</span> <span class="n">gap</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">q</span> <span class="o">=</span> <span class="n">osd_request_queue</span><span class="p">(</span><span class="n">ore_comp_dev</span><span class="p">(</span><span class="n">read_ios</span><span class="o">-&gt;</span><span class="n">oc</span><span class="p">,</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">));</span>
+	<span class="n">added_len</span> <span class="o">=</span> <span class="n">bio_add_pc_page</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">pg_len</span><span class="p">,</span>
+				    <span class="n">si</span><span class="o">-&gt;</span><span class="n">obj_offset</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">added_len</span> <span class="o">!=</span> <span class="n">pg_len</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;Failed to bio_add_pc_page bi_vcnt=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			      <span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_vcnt</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">+=</span> <span class="n">pg_len</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* read the beginning of an unaligned first page */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_add_to_r4w_first_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="n">si</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">pg_len</span><span class="p">;</span>
+
+	<span class="n">ore_calc_stripe_info</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">);</span>
+
+	<span class="n">pg_len</span> <span class="o">=</span> <span class="n">si</span><span class="p">.</span><span class="n">obj_offset</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">obj_offset</span> <span class="o">-=</span> <span class="n">pg_len</span><span class="p">;</span>
+
+	<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;offset=0x%llx len=0x%x index=0x%lx dev=%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		   <span class="n">_LLU</span><span class="p">(</span><span class="n">si</span><span class="p">.</span><span class="n">obj_offset</span><span class="p">),</span> <span class="n">pg_len</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span> <span class="n">si</span><span class="p">.</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">_add_to_r4w</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">pg_len</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* read the end of an incomplete last page */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_add_to_r4w_last_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">,</span> <span class="n">u64</span> <span class="o">*</span><span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="n">si</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">pg_len</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">c</span><span class="p">;</span>
+
+	<span class="n">ore_calc_stripe_info</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">,</span> <span class="o">*</span><span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">);</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">si</span><span class="p">.</span><span class="n">unit_off</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">c</span> <span class="o">=</span> <span class="n">_dev_order</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span> <span class="o">*</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">,</span>
+		       <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">,</span> <span class="n">si</span><span class="p">.</span><span class="n">par_dev</span><span class="p">,</span> <span class="n">si</span><span class="p">.</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">].</span><span class="n">pages</span><span class="p">[</span><span class="n">c</span><span class="p">];</span>
+
+	<span class="n">pg_len</span> <span class="o">=</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="p">(</span><span class="n">si</span><span class="p">.</span><span class="n">unit_off</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">offset</span> <span class="o">+=</span> <span class="n">pg_len</span><span class="p">;</span>
+
+	<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;p=%d, c=%d next-offset=0x%llx len=0x%x dev=%x par_dev=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		   <span class="n">p</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">_LLU</span><span class="p">(</span><span class="o">*</span><span class="n">offset</span><span class="p">),</span> <span class="n">pg_len</span><span class="p">,</span> <span class="n">si</span><span class="p">.</span><span class="n">dev</span><span class="p">,</span> <span class="n">si</span><span class="p">.</span><span class="n">par_dev</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">_add_to_r4w</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">pg_len</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">_mark_read4write_pages_uptodate</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">,</span> <span class="kt">int</span> <span class="n">ret</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">bio_vec</span> <span class="o">*</span><span class="n">bv</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">,</span> <span class="n">d</span><span class="p">;</span>
+
+	<span class="cm">/* loop on all devices all pages */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">d</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">d</span> <span class="o">&lt;</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">numdevs</span><span class="p">;</span> <span class="n">d</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">per_dev</span><span class="p">[</span><span class="n">d</span><span class="p">].</span><span class="n">bio</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bio</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">__bio_for_each_segment</span><span class="p">(</span><span class="n">bv</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">bv</span><span class="o">-&gt;</span><span class="n">bv_page</span><span class="p">;</span>
+
+			<span class="n">SetPageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">PageError</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+				<span class="n">ClearPageError</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* read_4_write is hacked to read the start of the first stripe and/or</span>
+<span class="cm"> * the end of the last stripe. If needed, with an sg-gap at each device/page.</span>
+<span class="cm"> * It is assumed to be called after the to_be_written pages of the first stripe</span>
+<span class="cm"> * are populating ios-&gt;sp2d[][]</span>
+<span class="cm"> *</span>
+<span class="cm"> * NOTE: We call ios-&gt;r4w-&gt;lock_fn for all pages needed for parity calculations</span>
+<span class="cm"> * These pages are held at sp2d[p].pages[c] but with</span>
+<span class="cm"> * sp2d[p].page_is_read[c] = true. At _sp2d_reset these pages are</span>
+<span class="cm"> * ios-&gt;r4w-&gt;lock_fn(). The ios-&gt;r4w-&gt;lock_fn might signal that the page is</span>
+<span class="cm"> * @uptodate=true, so we don&#39;t need to read it, only unlock, after IO.</span>
+<span class="cm"> *</span>
+<span class="cm"> * TODO: The read_4_write should calc a need_to_read_pages_count, if bigger then</span>
+<span class="cm"> * to-be-written count, we should consider the xor-in-place mode.</span>
+<span class="cm"> * need_to_read_pages_count is the actual number of pages not present in cache.</span>
+<span class="cm"> * maybe &quot;devs_in_group - ios-&gt;sp2d[p].write_count&quot; is a good enough</span>
+<span class="cm"> * approximation? In this mode the read pages are put in the empty places of</span>
+<span class="cm"> * ios-&gt;sp2d[p][*], xor is calculated the same way. These pages are</span>
+<span class="cm"> * allocated/freed and don&#39;t go through cache</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">_read_4_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios_read</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="n">read_si</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">offset</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">si</span><span class="p">.</span><span class="n">first_stripe_start</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">last_stripe_end</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">bytes_in_stripe</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">si</span><span class="p">.</span><span class="n">bytes_in_stripe</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">min_p</span> <span class="o">=</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">,</span> <span class="n">max_p</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">)</span> <span class="cm">/* Go to start collect $200 */</span>
+		<span class="k">goto</span> <span class="n">read_last_stripe</span><span class="p">;</span>
+
+	<span class="n">min_p</span> <span class="o">=</span> <span class="n">_sp2d_min_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+	<span class="n">max_p</span> <span class="o">=</span> <span class="n">_sp2d_max_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">c</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="p">;</span> <span class="n">c</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ore_calc_stripe_info</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_si</span><span class="p">);</span>
+		<span class="n">read_si</span><span class="p">.</span><span class="n">obj_offset</span> <span class="o">+=</span> <span class="n">min_p</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">min_p</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="n">min_p</span><span class="p">;</span> <span class="n">p</span> <span class="o">&lt;=</span> <span class="n">max_p</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pp</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">c</span><span class="p">];</span>
+			<span class="n">bool</span> <span class="n">uptodate</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">pp</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+					<span class="cm">/* Read the remainder of the page */</span>
+					<span class="n">_add_to_r4w_first_page</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">*</span><span class="n">pp</span><span class="p">);</span>
+				<span class="cm">/* to-be-written pages start here */</span>
+				<span class="k">goto</span> <span class="n">read_last_stripe</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="o">*</span><span class="n">pp</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">r4w</span><span class="o">-&gt;</span><span class="n">get_page</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span>
+						 <span class="o">&amp;</span><span class="n">uptodate</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!*</span><span class="n">pp</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uptodate</span><span class="p">)</span>
+				<span class="n">_add_to_r4w</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_si</span><span class="p">,</span> <span class="o">*</span><span class="n">pp</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+
+			<span class="cm">/* Mark read-pages to be cache_released */</span>
+			<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">page_is_read</span><span class="p">[</span><span class="n">c</span><span class="p">]</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="n">read_si</span><span class="p">.</span><span class="n">obj_offset</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="n">offset</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="p">(</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span> <span class="o">-</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">read_last_stripe:</span>
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">_add_to_r4w_last_page</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">offset</span><span class="p">);</span>
+		<span class="cm">/* offset will be aligned to next page */</span>
+
+	<span class="n">last_stripe_end</span> <span class="o">=</span> <span class="n">div_u64</span><span class="p">(</span><span class="n">offset</span> <span class="o">+</span> <span class="n">bytes_in_stripe</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">bytes_in_stripe</span><span class="p">)</span>
+				 <span class="o">*</span> <span class="n">bytes_in_stripe</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="n">last_stripe_end</span><span class="p">)</span> <span class="cm">/* Optimize for the aligned case */</span>
+		<span class="k">goto</span> <span class="n">read_it</span><span class="p">;</span>
+
+	<span class="n">ore_calc_stripe_info</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_si</span><span class="p">);</span>
+	<span class="n">p</span> <span class="o">=</span> <span class="n">read_si</span><span class="p">.</span><span class="n">unit_off</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">c</span> <span class="o">=</span> <span class="n">_dev_order</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span> <span class="o">*</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">,</span>
+		       <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">,</span> <span class="n">read_si</span><span class="p">.</span><span class="n">par_dev</span><span class="p">,</span> <span class="n">read_si</span><span class="p">.</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">si</span><span class="p">.</span><span class="n">first_stripe_start</span> <span class="o">+</span> <span class="n">bytes_in_stripe</span> <span class="o">!=</span> <span class="n">last_stripe_end</span><span class="p">);</span>
+	<span class="cm">/* unaligned IO must be within a single stripe */</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">min_p</span> <span class="o">==</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Didn&#39;t do it yet */</span>
+		<span class="n">min_p</span> <span class="o">=</span> <span class="n">_sp2d_min_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+		<span class="n">max_p</span> <span class="o">=</span> <span class="n">_sp2d_max_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&lt;</span> <span class="n">last_stripe_end</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__1_page_stripe</span> <span class="o">*</span><span class="n">_1ps</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">_1p_stripes</span><span class="p">[</span><span class="n">p</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="n">min_p</span> <span class="o">&lt;=</span> <span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">p</span> <span class="o">&lt;=</span> <span class="n">max_p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+			<span class="n">bool</span> <span class="n">uptodate</span><span class="p">;</span>
+
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">c</span><span class="p">]);</span>
+			<span class="n">page</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">r4w</span><span class="o">-&gt;</span><span class="n">get_page</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span>
+						  <span class="o">&amp;</span><span class="n">uptodate</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+			<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">[</span><span class="n">c</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+			<span class="cm">/* Mark read-pages to be cache_released */</span>
+			<span class="n">_1ps</span><span class="o">-&gt;</span><span class="n">page_is_read</span><span class="p">[</span><span class="n">c</span><span class="p">]</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uptodate</span><span class="p">)</span>
+				<span class="n">_add_to_r4w</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_si</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="p">(</span><span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="p">{</span>
+			<span class="o">++</span><span class="n">c</span><span class="p">;</span>
+			<span class="n">p</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">ore_calc_stripe_info</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_si</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">read_si</span><span class="p">.</span><span class="n">obj_offset</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="o">++</span><span class="n">p</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+<span class="nl">read_it:</span>
+	<span class="n">ios_read</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ios_read</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* FIXME: Ugly to signal _sbi_read_mirror that we have bio(s). Change</span>
+<span class="cm">	 * to check for per_dev-&gt;bio</span>
+<span class="cm">	 */</span>
+	<span class="n">ios_read</span><span class="o">-&gt;</span><span class="n">pages</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">pages</span><span class="p">;</span>
+
+	<span class="cm">/* Now read these devices */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ios_read</span><span class="o">-&gt;</span><span class="n">numdevs</span><span class="p">;</span> <span class="n">i</span> <span class="o">+=</span> <span class="n">ios_read</span><span class="o">-&gt;</span><span class="n">layout</span><span class="o">-&gt;</span><span class="n">mirrors_p1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">_ore_read_mirror</span><span class="p">(</span><span class="n">ios_read</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ore_io_execute</span><span class="p">(</span><span class="n">ios_read</span><span class="p">);</span> <span class="cm">/* Synchronus execution */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;!! ore_io_execute =&gt; %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">_mark_read4write_pages_uptodate</span><span class="p">(</span><span class="n">ios_read</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* In writes @cur_len means length left. .i.e cur_len==0 is the last parity U */</span>
+<span class="kt">int</span> <span class="nf">_ore_add_parity_unit</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">ore_striping_info</span> <span class="o">*</span><span class="n">si</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">ore_per_dev_state</span> <span class="o">*</span><span class="n">per_dev</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="n">cur_len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">reading</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span> <span class="o">&gt;=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sgs_per_dev</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ORE_DBGMSG</span><span class="p">(</span><span class="s">&quot;cur_sg(%d) &gt;= sgs_per_dev(%d)</span><span class="se">\n</span><span class="s">&quot;</span> <span class="p">,</span>
+				<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">cur_sg</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sgs_per_dev</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">_ore_add_sg_seg</span><span class="p">(</span><span class="n">per_dev</span><span class="p">,</span> <span class="n">cur_len</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">__stripe_pages_2d</span> <span class="o">*</span><span class="n">sp2d</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">parity_pages</span> <span class="o">+</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">cur_par_page</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">num_pages</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">array_start</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span> <span class="o">=</span> <span class="n">_sp2d_min_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+		<span class="n">num_pages</span>  <span class="o">=</span> <span class="n">_sp2d_max_pg</span><span class="p">(</span><span class="n">sp2d</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cur_len</span><span class="p">)</span> <span class="cm">/* If last stripe operate on parity comp */</span>
+			<span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_comp</span> <span class="o">=</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">per_dev</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+=</span> <span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="cm">/* If first stripe, Read in all read4write pages</span>
+<span class="cm">			 * (if needed) before we calculate the first parity.</span>
+<span class="cm">			 */</span>
+			<span class="n">_read_4_write</span><span class="p">(</span><span class="n">ios</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">_raid_page_alloc</span><span class="p">();</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">pages</span><span class="p">[</span><span class="n">i</span><span class="p">]))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+			<span class="o">++</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">cur_par_page</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_comp</span> <span class="o">!=</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">data_devs</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">si</span><span class="o">-&gt;</span><span class="n">cur_pg</span> <span class="o">+</span> <span class="n">num_pages</span> <span class="o">&gt;</span> <span class="n">sp2d</span><span class="o">-&gt;</span><span class="n">pages_in_unit</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">_ore_add_stripe_unit</span><span class="p">(</span><span class="n">ios</span><span class="p">,</span>  <span class="o">&amp;</span><span class="n">array_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span>
+					   <span class="n">per_dev</span><span class="p">,</span> <span class="n">num_pages</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="cm">/* TODO: raid6 if (last_parity_dev) */</span>
+		<span class="n">_gen_xor_unit</span><span class="p">(</span><span class="n">sp2d</span><span class="p">);</span>
+		<span class="n">_sp2d_reset</span><span class="p">(</span><span class="n">sp2d</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">r4w</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">_ore_post_alloc_raid_stuff</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ore_layout</span> <span class="o">*</span><span class="n">layout</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">layout</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">parity_pages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="n">pages_in_unit</span> <span class="o">=</span> <span class="n">layout</span><span class="o">-&gt;</span><span class="n">stripe_unit</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">stripe_size</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">si</span><span class="p">.</span><span class="n">bytes_in_stripe</span><span class="p">;</span>
+		<span class="n">u64</span> <span class="n">last_stripe</span><span class="p">,</span> <span class="n">first_stripe</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">_sp2d_alloc</span><span class="p">(</span><span class="n">pages_in_unit</span><span class="p">,</span> <span class="n">layout</span><span class="o">-&gt;</span><span class="n">group_width</span><span class="p">,</span>
+				<span class="n">layout</span><span class="o">-&gt;</span><span class="n">parity</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* Round io down to last full strip */</span>
+		<span class="n">first_stripe</span> <span class="o">=</span> <span class="n">div_u64</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">,</span> <span class="n">stripe_size</span><span class="p">);</span>
+		<span class="n">last_stripe</span> <span class="o">=</span> <span class="n">div_u64</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">stripe_size</span><span class="p">);</span>
+
+		<span class="cm">/* If an IO spans more then a single stripe it must end at</span>
+<span class="cm">		 * a stripe boundary. The reminder at the end is pushed into the</span>
+<span class="cm">		 * next IO.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">last_stripe</span> <span class="o">!=</span> <span class="n">first_stripe</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">=</span> <span class="n">last_stripe</span> <span class="o">*</span> <span class="n">stripe_size</span> <span class="o">-</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">);</span>
+			<span class="n">ios</span><span class="o">-&gt;</span><span class="n">nr_pages</span> <span class="o">=</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">+</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">/</span>
+					<span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="n">ios</span><span class="o">-&gt;</span><span class="n">si</span><span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span> <span class="cm">/*make it consistent */</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">_ore_free_raid_stuff</span><span class="p">(</span><span class="k">struct</span> <span class="n">ore_io_state</span> <span class="o">*</span><span class="n">ios</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* writing and raid */</span>
+		<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">cur_par_page</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">parity_pages</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="p">)</span>
+				<span class="n">_raid_page_free</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">extra_part_alloc</span><span class="p">)</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">parity_pages</span><span class="p">);</span>
+		<span class="cm">/* If IO returned an error pages might need unlocking */</span>
+		<span class="n">_sp2d_reset</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">r4w</span><span class="p">,</span> <span class="n">ios</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">);</span>
+		<span class="n">_sp2d_free</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">sp2d</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Will only be set if raid reading &amp;&amp; sglist is big */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">extra_part_alloc</span><span class="p">)</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">per_dev</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">sglist</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">)</span>
+		<span class="n">ore_put_io_state</span><span class="p">(</span><span class="n">ios</span><span class="o">-&gt;</span><span class="n">ios_read_4_write</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

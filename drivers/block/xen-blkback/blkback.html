@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › block › xen-blkback › blkback.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>blkback.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/******************************************************************************</span>
+<span class="cm"> *</span>
+<span class="cm"> * Back-end of the driver for virtual block devices. This portion of the</span>
+<span class="cm"> * driver exports a &#39;unified&#39; block-device interface that can be accessed</span>
+<span class="cm"> * by any operating system that implements a compatible front end. A</span>
+<span class="cm"> * reference front-end implementation can be found in:</span>
+<span class="cm"> *  drivers/block/xen-blkfront.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2003-2004, Keir Fraser &amp; Steve Hand</span>
+<span class="cm"> * Copyright (c) 2005, Christopher Clark</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public License version 2</span>
+<span class="cm"> * as published by the Free Software Foundation; or, when distributed</span>
+<span class="cm"> * separately from the Linux kernel or incorporated into other</span>
+<span class="cm"> * software packages, subject to the following license:</span>
+<span class="cm"> *</span>
+<span class="cm"> * Permission is hereby granted, free of charge, to any person obtaining a copy</span>
+<span class="cm"> * of this source file (the &quot;Software&quot;), to deal in the Software without</span>
+<span class="cm"> * restriction, including without limitation the rights to use, copy, modify,</span>
+<span class="cm"> * merge, publish, distribute, sublicense, and/or sell copies of the Software,</span>
+<span class="cm"> * and to permit persons to whom the Software is furnished to do so, subject to</span>
+<span class="cm"> * the following conditions:</span>
+<span class="cm"> *</span>
+<span class="cm"> * The above copyright notice and this permission notice shall be included in</span>
+<span class="cm"> * all copies or substantial portions of the Software.</span>
+<span class="cm"> *</span>
+<span class="cm"> * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR</span>
+<span class="cm"> * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,</span>
+<span class="cm"> * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE</span>
+<span class="cm"> * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER</span>
+<span class="cm"> * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING</span>
+<span class="cm"> * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS</span>
+<span class="cm"> * IN THE SOFTWARE.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+
+<span class="cp">#include &lt;xen/events.h&gt;</span>
+<span class="cp">#include &lt;xen/page.h&gt;</span>
+<span class="cp">#include &lt;asm/xen/hypervisor.h&gt;</span>
+<span class="cp">#include &lt;asm/xen/hypercall.h&gt;</span>
+<span class="cp">#include &quot;common.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * These are rather arbitrary. They are fairly large because adjacent requests</span>
+<span class="cm"> * pulled from a communication ring are quite likely to end up being part of</span>
+<span class="cm"> * the same scatter/gather request at the disc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * ** TRY INCREASING &#39;xen_blkif_reqs&#39; IF WRITE SPEEDS SEEM TOO LOW **</span>
+<span class="cm"> *</span>
+<span class="cm"> * This will increase the chances of being able to write whole tracks.</span>
+<span class="cm"> * 64 should be enough to keep us competitive with Linux.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">xen_blkif_reqs</span> <span class="o">=</span> <span class="mi">64</span><span class="p">;</span>
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">reqs</span><span class="p">,</span> <span class="n">xen_blkif_reqs</span><span class="p">,</span> <span class="kt">int</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">reqs</span><span class="p">,</span> <span class="s">&quot;Number of blkback requests to allocate&quot;</span><span class="p">);</span>
+
+<span class="cm">/* Run-time switchable: /sys/module/blkback/parameters/ */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">log_stats</span><span class="p">;</span>
+<span class="n">module_param</span><span class="p">(</span><span class="n">log_stats</span><span class="p">,</span> <span class="kt">int</span><span class="p">,</span> <span class="mo">0644</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Each outstanding request that we&#39;ve passed to the lower device layers has a</span>
+<span class="cm"> * &#39;pending_req&#39; allocated to it. Each buffer_head that completes decrements</span>
+<span class="cm"> * the pendcnt towards zero. When it hits zero, the specified domain has a</span>
+<span class="cm"> * response queued for it, with the saved &#39;id&#39; passed back.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">pending_req</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_blkif</span>	<span class="o">*</span><span class="n">blkif</span><span class="p">;</span>
+	<span class="n">u64</span>			<span class="n">id</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">nr_pages</span><span class="p">;</span>
+	<span class="n">atomic_t</span>		<span class="n">pendcnt</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">short</span>		<span class="n">operation</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">status</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">free_list</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cp">#define BLKBACK_INVALID_HANDLE (~0)</span>
+
+<span class="k">struct</span> <span class="n">xen_blkbk</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pending_req</span>	<span class="o">*</span><span class="n">pending_reqs</span><span class="p">;</span>
+	<span class="cm">/* List of all &#39;pending_req&#39; available */</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">pending_free</span><span class="p">;</span>
+	<span class="cm">/* And its spinlock. */</span>
+	<span class="n">spinlock_t</span>		<span class="n">pending_free_lock</span><span class="p">;</span>
+	<span class="n">wait_queue_head_t</span>	<span class="n">pending_free_wq</span><span class="p">;</span>
+	<span class="cm">/* The list of all pages that are available. */</span>
+	<span class="k">struct</span> <span class="n">page</span>		<span class="o">**</span><span class="n">pending_pages</span><span class="p">;</span>
+	<span class="cm">/* And the grant handles that are available. */</span>
+	<span class="n">grant_handle_t</span>		<span class="o">*</span><span class="n">pending_grant_handles</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">xen_blkbk</span> <span class="o">*</span><span class="n">blkbk</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Little helpful macro to figure out the index and virtual address of the</span>
+<span class="cm"> * pending_pages[..]. For each &#39;pending_req&#39; we have have up to</span>
+<span class="cm"> * BLKIF_MAX_SEGMENTS_PER_REQUEST (11) pages. The seg would be from 0 through</span>
+<span class="cm"> * 10 and would index in the pending_pages[..].</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">vaddr_pagenr</span><span class="p">(</span><span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span> <span class="kt">int</span> <span class="n">seg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">req</span> <span class="o">-</span> <span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span><span class="p">)</span> <span class="o">*</span>
+		<span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span> <span class="o">+</span> <span class="n">seg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define pending_page(req, seg) pending_pages[vaddr_pagenr(req, seg)]</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">vaddr</span><span class="p">(</span><span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span> <span class="kt">int</span> <span class="n">seg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span> <span class="o">=</span> <span class="n">page_to_pfn</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_page</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">seg</span><span class="p">));</span>
+	<span class="k">return</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">pfn_to_kaddr</span><span class="p">(</span><span class="n">pfn</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#define pending_handle(_req, _seg) \</span>
+<span class="cp">	(blkbk-&gt;pending_grant_handles[vaddr_pagenr(_req, _seg)])</span>
+
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">do_block_io_op</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">dispatch_rw_block_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">blkif_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">pending_req</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">make_response</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span> <span class="n">u64</span> <span class="n">id</span><span class="p">,</span>
+			  <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">op</span><span class="p">,</span> <span class="kt">int</span> <span class="n">st</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Retrieve from the &#39;pending_reqs&#39; a free pending_req structure to be used.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="nf">alloc_req</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">req</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">pending_req</span><span class="p">,</span>
+				 <span class="n">free_list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">req</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return the &#39;pending_req&#39; structure back to the freepool. We also</span>
+<span class="cm"> * wake up the thread if it was waiting for a free page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">was_empty</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">was_empty</span> <span class="o">=</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">was_empty</span><span class="p">)</span>
+		<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_wq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Routines for managing virtual block devices (vbds).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_vbd_translate</span><span class="p">(</span><span class="k">struct</span> <span class="n">phys_req</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span> <span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span>
+			     <span class="kt">int</span> <span class="n">operation</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_vbd</span> <span class="o">*</span><span class="n">vbd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">vbd</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EACCES</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">operation</span> <span class="o">!=</span> <span class="n">READ</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">vbd</span><span class="o">-&gt;</span><span class="n">readonly</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">nr_sects</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">blkif_sector_t</span> <span class="n">end</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">sector_number</span> <span class="o">+</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nr_sects</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">end</span> <span class="o">&lt;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">sector_number</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">end</span> <span class="o">&gt;</span> <span class="n">vbd_sz</span><span class="p">(</span><span class="n">vbd</span><span class="p">)))</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">dev</span>  <span class="o">=</span> <span class="n">vbd</span><span class="o">-&gt;</span><span class="n">pdevice</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">vbd</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_vbd_resize</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_vbd</span> <span class="o">*</span><span class="n">vbd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">vbd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xenbus_transaction</span> <span class="n">xbt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xenbus_device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">xen_blkbk_xenbus</span><span class="p">(</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">be</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span> <span class="n">new_size</span> <span class="o">=</span> <span class="n">vbd_sz</span><span class="p">(</span><span class="n">vbd</span><span class="p">);</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;VBD Resize: Domid: %d, Device: (%d, %d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">domid</span><span class="p">,</span> <span class="n">MAJOR</span><span class="p">(</span><span class="n">vbd</span><span class="o">-&gt;</span><span class="n">pdevice</span><span class="p">),</span> <span class="n">MINOR</span><span class="p">(</span><span class="n">vbd</span><span class="o">-&gt;</span><span class="n">pdevice</span><span class="p">));</span>
+	<span class="n">pr_info</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;VBD Resize: new size %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">new_size</span><span class="p">);</span>
+	<span class="n">vbd</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">new_size</span><span class="p">;</span>
+<span class="nl">again:</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">xenbus_transaction_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xbt</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Error starting transaction&quot;</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">xenbus_printf</span><span class="p">(</span><span class="n">xbt</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">nodename</span><span class="p">,</span> <span class="s">&quot;sectors&quot;</span><span class="p">,</span> <span class="s">&quot;%llu&quot;</span><span class="p">,</span>
+			    <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">vbd_sz</span><span class="p">(</span><span class="n">vbd</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Error writing new size&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">abort</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Write the current state; we will use this to synchronize</span>
+<span class="cm">	 * the front-end. If the current state is &quot;connected&quot; the</span>
+<span class="cm">	 * front-end will get the new size information online.</span>
+<span class="cm">	 */</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">xenbus_printf</span><span class="p">(</span><span class="n">xbt</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">nodename</span><span class="p">,</span> <span class="s">&quot;state&quot;</span><span class="p">,</span> <span class="s">&quot;%d&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Error writing the state&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">abort</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">xenbus_transaction_end</span><span class="p">(</span><span class="n">xbt</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">==</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="n">pr_warn</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Error ending transaction&quot;</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+<span class="nl">abort:</span>
+	<span class="n">xenbus_transaction_end</span><span class="p">(</span><span class="n">xbt</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Notification from the guest OS.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">blkif_notify_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">waiting_reqs</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">irqreturn_t</span> <span class="nf">xen_blkif_be_int</span><span class="p">(</span><span class="kt">int</span> <span class="n">irq</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">dev_id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">blkif_notify_work</span><span class="p">(</span><span class="n">dev_id</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">IRQ_HANDLED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * SCHEDULER FUNCTIONS</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">print_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;xen-blkback (%s): oo %3d  |  rd %4d  |  wr %4d  |  f %4d&quot;</span>
+		 <span class="s">&quot;  |  ds %4d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">current</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">,</span> <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_oo_req</span><span class="p">,</span>
+		 <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_rd_req</span><span class="p">,</span> <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_wr_req</span><span class="p">,</span>
+		 <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_f_req</span><span class="p">,</span> <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_ds_req</span><span class="p">);</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_print</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="mi">10</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">);</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_rd_req</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_wr_req</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_oo_req</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_ds_req</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">xen_blkif_schedule</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xen_vbd</span> <span class="o">*</span><span class="n">vbd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">vbd</span><span class="p">;</span>
+
+	<span class="n">xen_blkif_get</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">try_to_freeze</span><span class="p">())</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">vbd</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">!=</span> <span class="n">vbd_sz</span><span class="p">(</span><span class="n">vbd</span><span class="p">)))</span>
+			<span class="n">xen_vbd_resize</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+
+		<span class="n">wait_event_interruptible</span><span class="p">(</span>
+			<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">,</span>
+			<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">waiting_reqs</span> <span class="o">||</span> <span class="n">kthread_should_stop</span><span class="p">());</span>
+		<span class="n">wait_event_interruptible</span><span class="p">(</span>
+			<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_wq</span><span class="p">,</span>
+			<span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">)</span> <span class="o">||</span>
+			<span class="n">kthread_should_stop</span><span class="p">());</span>
+
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">waiting_reqs</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">smp_mb</span><span class="p">();</span> <span class="cm">/* clear flag *before* checking for work */</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">do_block_io_op</span><span class="p">(</span><span class="n">blkif</span><span class="p">))</span>
+			<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">waiting_reqs</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">log_stats</span> <span class="o">&amp;&amp;</span> <span class="n">time_after</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_print</span><span class="p">))</span>
+			<span class="n">print_stats</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">log_stats</span><span class="p">)</span>
+		<span class="n">print_stats</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">xenblkd</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">xen_blkif_put</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">seg_buf</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nsec</span><span class="p">;</span>
+<span class="p">};</span>
+<span class="cm">/*</span>
+<span class="cm"> * Unmap the grant references, and also remove the M2P over-rides</span>
+<span class="cm"> * used in the &#39;pending_req&#39;.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_blkbk_unmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gnttab_unmap_grant_ref</span> <span class="n">unmap</span><span class="p">[</span><span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">pages</span><span class="p">[</span><span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">invcount</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">grant_handle_t</span> <span class="n">handle</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nr_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">handle</span> <span class="o">=</span> <span class="n">pending_handle</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">handle</span> <span class="o">==</span> <span class="n">BLKBACK_INVALID_HANDLE</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">gnttab_set_unmap_op</span><span class="p">(</span><span class="o">&amp;</span><span class="n">unmap</span><span class="p">[</span><span class="n">invcount</span><span class="p">],</span> <span class="n">vaddr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
+				    <span class="n">GNTMAP_host_map</span><span class="p">,</span> <span class="n">handle</span><span class="p">);</span>
+		<span class="n">pending_handle</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="o">=</span> <span class="n">BLKBACK_INVALID_HANDLE</span><span class="p">;</span>
+		<span class="n">pages</span><span class="p">[</span><span class="n">invcount</span><span class="p">]</span> <span class="o">=</span> <span class="n">virt_to_page</span><span class="p">(</span><span class="n">vaddr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">i</span><span class="p">));</span>
+		<span class="n">invcount</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">gnttab_unmap_refs</span><span class="p">(</span><span class="n">unmap</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">invcount</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_blkbk_map</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkif_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span>
+			 <span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">pending_req</span><span class="p">,</span>
+			 <span class="k">struct</span> <span class="n">seg_buf</span> <span class="n">seg</span><span class="p">[])</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gnttab_map_grant_ref</span> <span class="n">map</span><span class="p">[</span><span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nseg</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">nr_segments</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Fill out preq.nr_sects with proper amount of sectors, and setup</span>
+<span class="cm">	 * assign map[..] with the PFN of the page in our domain with the</span>
+<span class="cm">	 * corresponding grant reference for each page.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nseg</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">uint32_t</span> <span class="n">flags</span><span class="p">;</span>
+
+		<span class="n">flags</span> <span class="o">=</span> <span class="n">GNTMAP_host_map</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">operation</span> <span class="o">!=</span> <span class="n">BLKIF_OP_READ</span><span class="p">)</span>
+			<span class="n">flags</span> <span class="o">|=</span> <span class="n">GNTMAP_readonly</span><span class="p">;</span>
+		<span class="n">gnttab_set_map_op</span><span class="p">(</span><span class="o">&amp;</span><span class="n">map</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">vaddr</span><span class="p">(</span><span class="n">pending_req</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span> <span class="n">flags</span><span class="p">,</span>
+				  <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">gref</span><span class="p">,</span>
+				  <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">domid</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">gnttab_map_refs</span><span class="p">(</span><span class="n">map</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_page</span><span class="p">(</span><span class="n">pending_req</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">nseg</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now swizzle the MFN in our domain with the MFN from the other domain</span>
+<span class="cm">	 * so that when we access vaddr(pending_req,i) it has the contents of</span>
+<span class="cm">	 * the page from the other domain.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nseg</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">map</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">status</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;invalid buffer -- could not remap it</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">map</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">handle</span> <span class="o">=</span> <span class="n">BLKBACK_INVALID_HANDLE</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">|=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">pending_handle</span><span class="p">(</span><span class="n">pending_req</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="o">=</span> <span class="n">map</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">handle</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">buf</span>  <span class="o">=</span> <span class="n">map</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">dev_bus_addr</span> <span class="o">|</span>
+			<span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">first_sect</span> <span class="o">&lt;&lt;</span> <span class="mi">9</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dispatch_discard_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">blkif_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_OKAY</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">vbd</span><span class="p">.</span><span class="n">bdev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">secure</span><span class="p">;</span>
+
+	<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_ds_req</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="n">xen_blkif_get</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+	<span class="n">secure</span> <span class="o">=</span> <span class="p">(</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">vbd</span><span class="p">.</span><span class="n">discard_secure</span> <span class="o">&amp;&amp;</span>
+		 <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">discard</span><span class="p">.</span><span class="n">flag</span> <span class="o">&amp;</span> <span class="n">BLKIF_DISCARD_SECURE</span><span class="p">))</span> <span class="o">?</span>
+		 <span class="n">BLKDEV_DISCARD_SECURE</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">blkdev_issue_discard</span><span class="p">(</span><span class="n">bdev</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">discard</span><span class="p">.</span><span class="n">sector_number</span><span class="p">,</span>
+				   <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">discard</span><span class="p">.</span><span class="n">nr_sectors</span><span class="p">,</span>
+				   <span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">secure</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">==</span> <span class="o">-</span><span class="n">EOPNOTSUPP</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;discard op failed, not supported</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_EOPNOTSUPP</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_ERROR</span><span class="p">;</span>
+
+	<span class="n">make_response</span><span class="p">(</span><span class="n">blkif</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">discard</span><span class="p">.</span><span class="n">id</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">operation</span><span class="p">,</span> <span class="n">status</span><span class="p">);</span>
+	<span class="n">xen_blkif_put</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_blk_drain_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="cm">/* The initial value is one, and one refcnt taken at the</span>
+<span class="cm">		 * start of the xen_blkif_schedule thread. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">wait_for_completion_interruptible_timeout</span><span class="p">(</span>
+				<span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain_complete</span><span class="p">,</span> <span class="n">HZ</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">());</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Completion callback on the bio&#39;s. Called as bh-&gt;b_end_io()</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__end_block_io_op</span><span class="p">(</span><span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">pending_req</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* An error fails the entire request. */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">operation</span> <span class="o">==</span> <span class="n">BLKIF_OP_FLUSH_DISKCACHE</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="p">(</span><span class="n">error</span> <span class="o">==</span> <span class="o">-</span><span class="n">EOPNOTSUPP</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;flush diskcache op failed, not supported</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">xen_blkbk_flush_diskcache</span><span class="p">(</span><span class="n">XBT_NIL</span><span class="p">,</span> <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">be</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_EOPNOTSUPP</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">((</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">operation</span> <span class="o">==</span> <span class="n">BLKIF_OP_WRITE_BARRIER</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="p">(</span><span class="n">error</span> <span class="o">==</span> <span class="o">-</span><span class="n">EOPNOTSUPP</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;write barrier op failed, not supported</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">xen_blkbk_barrier</span><span class="p">(</span><span class="n">XBT_NIL</span><span class="p">,</span> <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">be</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_EOPNOTSUPP</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">error</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Buffer not up-to-date at end of operation,&quot;</span>
+			 <span class="s">&quot; error=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+		<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">BLKIF_RSP_ERROR</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If all of the bio&#39;s have completed it is time to unmap</span>
+<span class="cm">	 * the grant references associated with &#39;request&#39; and provide</span>
+<span class="cm">	 * the proper response on the ring.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">pendcnt</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">xen_blkbk_unmap</span><span class="p">(</span><span class="n">pending_req</span><span class="p">);</span>
+		<span class="n">make_response</span><span class="p">(</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="p">,</span> <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">,</span>
+			      <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">operation</span><span class="p">,</span> <span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">);</span>
+		<span class="n">xen_blkif_put</span><span class="p">(</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain</span><span class="p">))</span>
+				<span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">drain_complete</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">free_req</span><span class="p">(</span><span class="n">pending_req</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * bio callback.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">end_block_io_op</span><span class="p">(</span><span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__end_block_io_op</span><span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+	<span class="n">bio_put</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Function to copy the from the ring buffer the &#39;struct blkif_request&#39;</span>
+<span class="cm"> * (which has the sectors we want, number of them, grant references, etc),</span>
+<span class="cm"> * and transmute  it to the block API to hand it over to the proper block disk.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">__do_block_io_op</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">union</span> <span class="n">blkif_back_rings</span> <span class="o">*</span><span class="n">blk_rings</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_rings</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">blkif_request</span> <span class="n">req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">pending_req</span><span class="p">;</span>
+	<span class="n">RING_IDX</span> <span class="n">rc</span><span class="p">,</span> <span class="n">rp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">more_to_do</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">.</span><span class="n">req_cons</span><span class="p">;</span>
+	<span class="n">rp</span> <span class="o">=</span> <span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">.</span><span class="n">sring</span><span class="o">-&gt;</span><span class="n">req_prod</span><span class="p">;</span>
+	<span class="n">rmb</span><span class="p">();</span> <span class="cm">/* Ensure we see queued requests up to &#39;rp&#39;. */</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">rc</span> <span class="o">!=</span> <span class="n">rp</span><span class="p">)</span> <span class="p">{</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">RING_REQUEST_CONS_OVERFLOW</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">,</span> <span class="n">rc</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+			<span class="n">more_to_do</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">pending_req</span> <span class="o">=</span> <span class="n">alloc_req</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="nb">NULL</span> <span class="o">==</span> <span class="n">pending_req</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_oo_req</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">more_to_do</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_protocol</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_NATIVE</span>:
+			<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="p">,</span> <span class="n">RING_GET_REQUEST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">native</span><span class="p">,</span> <span class="n">rc</span><span class="p">),</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">req</span><span class="p">));</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_X86_32</span>:
+			<span class="n">blkif_get_x86_32_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="p">,</span> <span class="n">RING_GET_REQUEST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_32</span><span class="p">,</span> <span class="n">rc</span><span class="p">));</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_X86_64</span>:
+			<span class="n">blkif_get_x86_64_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="p">,</span> <span class="n">RING_GET_REQUEST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_64</span><span class="p">,</span> <span class="n">rc</span><span class="p">));</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="nl">default:</span>
+			<span class="n">BUG</span><span class="p">();</span>
+		<span class="p">}</span>
+		<span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">.</span><span class="n">req_cons</span> <span class="o">=</span> <span class="o">++</span><span class="n">rc</span><span class="p">;</span> <span class="cm">/* before make_response() */</span>
+
+		<span class="cm">/* Apply all sanity checks to /private copy/ of request. */</span>
+		<span class="n">barrier</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">req</span><span class="p">.</span><span class="n">operation</span> <span class="o">==</span> <span class="n">BLKIF_OP_DISCARD</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">free_req</span><span class="p">(</span><span class="n">pending_req</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">dispatch_discard_io</span><span class="p">(</span><span class="n">blkif</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">req</span><span class="p">))</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">dispatch_rw_block_io</span><span class="p">(</span><span class="n">blkif</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">req</span><span class="p">,</span> <span class="n">pending_req</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="cm">/* Yield point for this unbounded loop. */</span>
+		<span class="n">cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">more_to_do</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">do_block_io_op</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">union</span> <span class="n">blkif_back_rings</span> <span class="o">*</span><span class="n">blk_rings</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_rings</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">more_to_do</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">more_to_do</span> <span class="o">=</span> <span class="n">__do_block_io_op</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">more_to_do</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">RING_FINAL_CHECK_FOR_REQUESTS</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">,</span> <span class="n">more_to_do</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">more_to_do</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">more_to_do</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cm">/*</span>
+<span class="cm"> * Transmutation of the &#39;struct blkif_request&#39; to a proper &#39;struct bio&#39;</span>
+<span class="cm"> * and call the &#39;submit_bio&#39; to pass it to the underlying storage.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dispatch_rw_block_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">blkif_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">pending_req</span> <span class="o">*</span><span class="n">pending_req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">phys_req</span> <span class="n">preq</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">seg_buf</span> <span class="n">seg</span><span class="p">[</span><span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nseg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">biolist</span><span class="p">[</span><span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">nbio</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">operation</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">blk_plug</span> <span class="n">plug</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">drain</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">operation</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">BLKIF_OP_READ</span>:
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_rd_req</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">operation</span> <span class="o">=</span> <span class="n">READ</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">BLKIF_OP_WRITE</span>:
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_wr_req</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">operation</span> <span class="o">=</span> <span class="n">WRITE_ODIRECT</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">BLKIF_OP_WRITE_BARRIER</span>:
+		<span class="n">drain</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">BLKIF_OP_FLUSH_DISKCACHE</span>:
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_f_req</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">operation</span> <span class="o">=</span> <span class="n">WRITE_FLUSH</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">operation</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* make gcc happy */</span>
+		<span class="k">goto</span> <span class="n">fail_response</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Check that the number of segments is sane. */</span>
+	<span class="n">nseg</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">nr_segments</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">nseg</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">operation</span> <span class="o">!=</span> <span class="n">WRITE_FLUSH</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="n">unlikely</span><span class="p">(</span><span class="n">nseg</span> <span class="o">&gt;</span> <span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Bad number of segments in request (%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			 <span class="n">nseg</span><span class="p">);</span>
+		<span class="cm">/* Haven&#39;t submitted any bio&#39;s yet. */</span>
+		<span class="k">goto</span> <span class="n">fail_response</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">preq</span><span class="p">.</span><span class="n">dev</span>           <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">handle</span><span class="p">;</span>
+	<span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">sector_number</span><span class="p">;</span>
+	<span class="n">preq</span><span class="p">.</span><span class="n">nr_sects</span>      <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span>     <span class="o">=</span> <span class="n">blkif</span><span class="p">;</span>
+	<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">id</span>        <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">id</span><span class="p">;</span>
+	<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">operation</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">operation</span><span class="p">;</span>
+	<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">status</span>    <span class="o">=</span> <span class="n">BLKIF_RSP_OKAY</span><span class="p">;</span>
+	<span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">nr_pages</span>  <span class="o">=</span> <span class="n">nseg</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nseg</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">nsec</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">last_sect</span> <span class="o">-</span>
+			<span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">first_sect</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">last_sect</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">&gt;&gt;</span> <span class="mi">9</span><span class="p">))</span> <span class="o">||</span>
+		    <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">last_sect</span> <span class="o">&lt;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">first_sect</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">fail_response</span><span class="p">;</span>
+		<span class="n">preq</span><span class="p">.</span><span class="n">nr_sects</span> <span class="o">+=</span> <span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">nsec</span><span class="p">;</span>
+
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">xen_vbd_translate</span><span class="p">(</span><span class="o">&amp;</span><span class="n">preq</span><span class="p">,</span> <span class="n">blkif</span><span class="p">,</span> <span class="n">operation</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;access denied: %s of [%llu,%llu] on dev=%04x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			 <span class="n">operation</span> <span class="o">==</span> <span class="n">READ</span> <span class="o">?</span> <span class="s">&quot;read&quot;</span> <span class="o">:</span> <span class="s">&quot;write&quot;</span><span class="p">,</span>
+			 <span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span><span class="p">,</span>
+			 <span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span> <span class="o">+</span> <span class="n">preq</span><span class="p">.</span><span class="n">nr_sects</span><span class="p">,</span> <span class="n">preq</span><span class="p">.</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">fail_response</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This check _MUST_ be done after xen_vbd_translate as the preq.bdev</span>
+<span class="cm">	 * is set there.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nseg</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(((</span><span class="kt">int</span><span class="p">)</span><span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span><span class="o">|</span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">nsec</span><span class="p">)</span> <span class="o">&amp;</span>
+		    <span class="p">((</span><span class="n">bdev_logical_block_size</span><span class="p">(</span><span class="n">preq</span><span class="p">.</span><span class="n">bdev</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">9</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;Misaligned I/O request from domain %d&quot;</span><span class="p">,</span>
+				 <span class="n">blkif</span><span class="o">-&gt;</span><span class="n">domid</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">fail_response</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Wait on all outstanding I/O&#39;s and once that has been completed</span>
+<span class="cm">	 * issue the WRITE_FLUSH.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">drain</span><span class="p">)</span>
+		<span class="n">xen_blk_drain_io</span><span class="p">(</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">blkif</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If we have failed at this point, we need to undo the M2P override,</span>
+<span class="cm">	 * set gnttab_set_unmap_op on all of the grant references and perform</span>
+<span class="cm">	 * the hypercall to unmap the grants - that is all done in</span>
+<span class="cm">	 * xen_blkbk_unmap.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xen_blkbk_map</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">pending_req</span><span class="p">,</span> <span class="n">seg</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">fail_flush</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This corresponding xen_blkif_put is done in __end_block_io_op, or</span>
+<span class="cm">	 * below (in &quot;!bio&quot;) if we are handling a BLKIF_OP_DISCARD.</span>
+<span class="cm">	 */</span>
+	<span class="n">xen_blkif_get</span><span class="p">(</span><span class="n">blkif</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nseg</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">||</span>
+		       <span class="p">(</span><span class="n">bio_add_page</span><span class="p">(</span><span class="n">bio</span><span class="p">,</span>
+				     <span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_page</span><span class="p">(</span><span class="n">pending_req</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
+				     <span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">nsec</span> <span class="o">&lt;&lt;</span> <span class="mi">9</span><span class="p">,</span>
+				     <span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">buf</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+
+			<span class="n">bio</span> <span class="o">=</span> <span class="n">bio_alloc</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">nseg</span><span class="o">-</span><span class="n">i</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">bio</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+				<span class="k">goto</span> <span class="n">fail_put_bio</span><span class="p">;</span>
+
+			<span class="n">biolist</span><span class="p">[</span><span class="n">nbio</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="n">bio</span><span class="p">;</span>
+			<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_bdev</span>    <span class="o">=</span> <span class="n">preq</span><span class="p">.</span><span class="n">bdev</span><span class="p">;</span>
+			<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span> <span class="o">=</span> <span class="n">pending_req</span><span class="p">;</span>
+			<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_end_io</span>  <span class="o">=</span> <span class="n">end_block_io_op</span><span class="p">;</span>
+			<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_sector</span>  <span class="o">=</span> <span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">preq</span><span class="p">.</span><span class="n">sector_number</span> <span class="o">+=</span> <span class="n">seg</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">nsec</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* This will be hit if the operation was a flush or discard. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bio</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">operation</span> <span class="o">!=</span> <span class="n">WRITE_FLUSH</span><span class="p">);</span>
+
+		<span class="n">bio</span> <span class="o">=</span> <span class="n">bio_alloc</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">bio</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">fail_put_bio</span><span class="p">;</span>
+
+		<span class="n">biolist</span><span class="p">[</span><span class="n">nbio</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="n">bio</span><span class="p">;</span>
+		<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_bdev</span>    <span class="o">=</span> <span class="n">preq</span><span class="p">.</span><span class="n">bdev</span><span class="p">;</span>
+		<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_private</span> <span class="o">=</span> <span class="n">pending_req</span><span class="p">;</span>
+		<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_end_io</span>  <span class="o">=</span> <span class="n">end_block_io_op</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We set it one so that the last submit_bio does not have to call</span>
+<span class="cm">	 * atomic_inc.</span>
+<span class="cm">	 */</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pending_req</span><span class="o">-&gt;</span><span class="n">pendcnt</span><span class="p">,</span> <span class="n">nbio</span><span class="p">);</span>
+
+	<span class="cm">/* Get a reference count for the disk queue and start sending I/O */</span>
+	<span class="n">blk_start_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nbio</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">submit_bio</span><span class="p">(</span><span class="n">operation</span><span class="p">,</span> <span class="n">biolist</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="cm">/* Let the I/Os go.. */</span>
+	<span class="n">blk_finish_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">operation</span> <span class="o">==</span> <span class="n">READ</span><span class="p">)</span>
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_rd_sect</span> <span class="o">+=</span> <span class="n">preq</span><span class="p">.</span><span class="n">nr_sects</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">operation</span> <span class="o">&amp;</span> <span class="n">WRITE</span><span class="p">)</span>
+		<span class="n">blkif</span><span class="o">-&gt;</span><span class="n">st_wr_sect</span> <span class="o">+=</span> <span class="n">preq</span><span class="p">.</span><span class="n">nr_sects</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">fail_flush:</span>
+	<span class="n">xen_blkbk_unmap</span><span class="p">(</span><span class="n">pending_req</span><span class="p">);</span>
+ <span class="nl">fail_response:</span>
+	<span class="cm">/* Haven&#39;t submitted any bio&#39;s yet. */</span>
+	<span class="n">make_response</span><span class="p">(</span><span class="n">blkif</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">rw</span><span class="p">.</span><span class="n">id</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">operation</span><span class="p">,</span> <span class="n">BLKIF_RSP_ERROR</span><span class="p">);</span>
+	<span class="n">free_req</span><span class="p">(</span><span class="n">pending_req</span><span class="p">);</span>
+	<span class="n">msleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span> <span class="cm">/* back off a bit */</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+
+ <span class="nl">fail_put_bio:</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nbio</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">bio_put</span><span class="p">(</span><span class="n">biolist</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+	<span class="n">__end_block_io_op</span><span class="p">(</span><span class="n">pending_req</span><span class="p">,</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">);</span>
+	<span class="n">msleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span> <span class="cm">/* back off a bit */</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Put a response on the ring on how the operation fared.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">make_response</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkif</span> <span class="o">*</span><span class="n">blkif</span><span class="p">,</span> <span class="n">u64</span> <span class="n">id</span><span class="p">,</span>
+			  <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">op</span><span class="p">,</span> <span class="kt">int</span> <span class="n">st</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">blkif_response</span>  <span class="n">resp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>     <span class="n">flags</span><span class="p">;</span>
+	<span class="k">union</span> <span class="n">blkif_back_rings</span> <span class="o">*</span><span class="n">blk_rings</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_rings</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">notify</span><span class="p">;</span>
+
+	<span class="n">resp</span><span class="p">.</span><span class="n">id</span>        <span class="o">=</span> <span class="n">id</span><span class="p">;</span>
+	<span class="n">resp</span><span class="p">.</span><span class="n">operation</span> <span class="o">=</span> <span class="n">op</span><span class="p">;</span>
+	<span class="n">resp</span><span class="p">.</span><span class="n">status</span>    <span class="o">=</span> <span class="n">st</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_ring_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="cm">/* Place on the response ring for the relevant domain. */</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_protocol</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_NATIVE</span>:
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">RING_GET_RESPONSE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">native</span><span class="p">,</span> <span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">native</span><span class="p">.</span><span class="n">rsp_prod_pvt</span><span class="p">),</span>
+		       <span class="o">&amp;</span><span class="n">resp</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">resp</span><span class="p">));</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_X86_32</span>:
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">RING_GET_RESPONSE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_32</span><span class="p">,</span> <span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_32</span><span class="p">.</span><span class="n">rsp_prod_pvt</span><span class="p">),</span>
+		       <span class="o">&amp;</span><span class="n">resp</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">resp</span><span class="p">));</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">BLKIF_PROTOCOL_X86_64</span>:
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">RING_GET_RESPONSE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_64</span><span class="p">,</span> <span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">x86_64</span><span class="p">.</span><span class="n">rsp_prod_pvt</span><span class="p">),</span>
+		       <span class="o">&amp;</span><span class="n">resp</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">resp</span><span class="p">));</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">.</span><span class="n">rsp_prod_pvt</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">RING_PUSH_RESPONSES_AND_CHECK_NOTIFY</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blk_rings</span><span class="o">-&gt;</span><span class="n">common</span><span class="p">,</span> <span class="n">notify</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">blk_ring_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">notify</span><span class="p">)</span>
+		<span class="n">notify_remote_via_irq</span><span class="p">(</span><span class="n">blkif</span><span class="o">-&gt;</span><span class="n">irq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">xen_blkif_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">mmap_pages</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_domain</span><span class="p">())</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">blkbk</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_blkbk</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">blkbk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_alert</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;%s: out of memory!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mmap_pages</span> <span class="o">=</span> <span class="n">xen_blkif_reqs</span> <span class="o">*</span> <span class="n">BLKIF_MAX_SEGMENTS_PER_REQUEST</span><span class="p">;</span>
+
+	<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span>          <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span>
+					<span class="n">xen_blkif_reqs</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_grant_handles</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_grant_handles</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span>
+					<span class="n">mmap_pages</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span>         <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span>
+					<span class="n">mmap_pages</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span> <span class="o">||</span> <span class="o">!</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_grant_handles</span> <span class="o">||</span>
+	    <span class="o">!</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out_of_memory</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">mmap_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_grant_handles</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">BLKBACK_INVALID_HANDLE</span><span class="p">;</span>
+		<span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out_of_memory</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">xen_blkif_interface_init</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">failed_init</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_lock</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free_wq</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">xen_blkif_reqs</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">free_list</span><span class="p">,</span>
+			      <span class="o">&amp;</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_free</span><span class="p">);</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">xen_blkif_xenbus_init</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">failed_init</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">out_of_memory:</span>
+	<span class="n">pr_alert</span><span class="p">(</span><span class="n">DRV_PFX</span> <span class="s">&quot;%s: out of memory</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+ <span class="nl">failed_init:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_reqs</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_grant_handles</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">mmap_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+				<span class="n">__free_page</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="p">}</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">blkbk</span><span class="o">-&gt;</span><span class="n">pending_pages</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">blkbk</span><span class="p">);</span>
+	<span class="n">blkbk</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">xen_blkif_init</span><span class="p">);</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;Dual BSD/GPL&quot;</span><span class="p">);</span>
+<span class="n">MODULE_ALIAS</span><span class="p">(</span><span class="s">&quot;xen-backend:vbd&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

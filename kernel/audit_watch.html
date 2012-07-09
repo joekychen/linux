@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › audit_watch.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>audit_watch.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/* audit_watch.c -- watching inodes</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright 2003-2009 Red Hat, Inc.</span>
+<span class="cm"> * Copyright 2005 Hewlett-Packard Development Company, L.P.</span>
+<span class="cm"> * Copyright 2005 IBM Corporation</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License as published by</span>
+<span class="cm"> * the Free Software Foundation; either version 2 of the License, or</span>
+<span class="cm"> * (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</span>
+<span class="cm"> * GNU General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License</span>
+<span class="cm"> * along with this program; if not, write to the Free Software</span>
+<span class="cm"> * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/audit.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/fsnotify_backend.h&gt;</span>
+<span class="cp">#include &lt;linux/namei.h&gt;</span>
+<span class="cp">#include &lt;linux/netlink.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/security.h&gt;</span>
+<span class="cp">#include &quot;audit.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Reference counting:</span>
+<span class="cm"> *</span>
+<span class="cm"> * audit_parent: lifetime is from audit_init_parent() to receipt of an FS_IGNORED</span>
+<span class="cm"> * 	event.  Each audit_watch holds a reference to its associated parent.</span>
+<span class="cm"> *</span>
+<span class="cm"> * audit_watch: if added to lists, lifetime is from audit_init_watch() to</span>
+<span class="cm"> * 	audit_remove_watch().  Additionally, an audit_watch may exist</span>
+<span class="cm"> * 	temporarily to assist in searching existing filter data.  Each</span>
+<span class="cm"> * 	audit_krule holds a reference to its associated watch.</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">audit_watch</span> <span class="p">{</span>
+	<span class="n">atomic_t</span>		<span class="n">count</span><span class="p">;</span>	<span class="cm">/* reference count */</span>
+	<span class="n">dev_t</span>			<span class="n">dev</span><span class="p">;</span>	<span class="cm">/* associated superblock device */</span>
+	<span class="kt">char</span>			<span class="o">*</span><span class="n">path</span><span class="p">;</span>	<span class="cm">/* insertion path */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>		<span class="n">ino</span><span class="p">;</span>	<span class="cm">/* associated inode number */</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span>	<span class="o">*</span><span class="n">parent</span><span class="p">;</span> <span class="cm">/* associated parent */</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">wlist</span><span class="p">;</span>	<span class="cm">/* entry in parent-&gt;watches list */</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">rules</span><span class="p">;</span>	<span class="cm">/* anchor for krule-&gt;rlist */</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">audit_parent</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">watches</span><span class="p">;</span> <span class="cm">/* anchor for audit_watch-&gt;wlist */</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="n">mark</span><span class="p">;</span> <span class="cm">/* fsnotify mark on the inode */</span>
+<span class="p">};</span>
+
+<span class="cm">/* fsnotify handle. */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">audit_watch_group</span><span class="p">;</span>
+
+<span class="cm">/* fsnotify events we care about. */</span>
+<span class="cp">#define AUDIT_FS_WATCH (FS_MOVE | FS_CREATE | FS_DELETE | FS_DELETE_SELF |\</span>
+<span class="cp">			FS_MOVE_SELF | FS_EVENT_ON_CHILD)</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_free_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">));</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_watch_free_mark</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">;</span>
+
+	<span class="n">parent</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_parent</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+	<span class="n">audit_free_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_get_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">parent</span><span class="p">))</span>
+		<span class="n">fsnotify_get_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_put_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">parent</span><span class="p">))</span>
+		<span class="n">fsnotify_put_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find and return the audit_parent on the given inode.  If found a reference</span>
+<span class="cm"> * is taken on this parent.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="nf">audit_find_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">entry</span><span class="p">;</span>
+
+	<span class="n">entry</span> <span class="o">=</span> <span class="n">fsnotify_find_inode_mark</span><span class="p">(</span><span class="n">audit_watch_group</span><span class="p">,</span> <span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">entry</span><span class="p">)</span>
+		<span class="n">parent</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_parent</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">parent</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_get_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_put_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">));</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_remove_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">wlist</span><span class="p">);</span>
+	<span class="n">audit_put_parent</span><span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+	<span class="n">watch</span><span class="o">-&gt;</span><span class="n">parent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">audit_put_watch</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span> <span class="cm">/* match initial get */</span>
+<span class="p">}</span>
+
+<span class="kt">char</span> <span class="o">*</span><span class="nf">audit_watch_path</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">watch</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">audit_watch_compare</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ino</span><span class="p">,</span> <span class="n">dev_t</span> <span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">!=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		<span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">==</span> <span class="n">ino</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		<span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">==</span> <span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Initialize a parent watch entry. */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="nf">audit_init_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">path</span> <span class="o">*</span><span class="n">path</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">path</span><span class="o">-&gt;</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">parent</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">parent</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">parent</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">);</span>
+
+	<span class="n">fsnotify_init_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">,</span> <span class="n">audit_watch_free_mark</span><span class="p">);</span>
+	<span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">.</span><span class="n">mask</span> <span class="o">=</span> <span class="n">AUDIT_FS_WATCH</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">fsnotify_add_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">,</span> <span class="n">audit_watch_group</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">audit_free_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">parent</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Initialize a watch entry. */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="nf">audit_init_watch</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">path</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">;</span>
+
+	<span class="n">watch</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">watch</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">watch</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">watch</span><span class="o">-&gt;</span><span class="n">path</span> <span class="o">=</span> <span class="n">path</span><span class="p">;</span>
+	<span class="n">watch</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="p">(</span><span class="n">dev_t</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">watch</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">watch</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Translate a watch string to kernel respresentation. */</span>
+<span class="kt">int</span> <span class="nf">audit_to_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">krule</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">path</span><span class="p">,</span> <span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="n">u32</span> <span class="n">op</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">audit_watch_group</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EOPNOTSUPP</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">path</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="sc">&#39;/&#39;</span> <span class="o">||</span> <span class="n">path</span><span class="p">[</span><span class="n">len</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="sc">&#39;/&#39;</span> <span class="o">||</span>
+	    <span class="n">krule</span><span class="o">-&gt;</span><span class="n">listnr</span> <span class="o">!=</span> <span class="n">AUDIT_FILTER_EXIT</span> <span class="o">||</span>
+	    <span class="n">op</span> <span class="o">!=</span> <span class="n">Audit_equal</span> <span class="o">||</span>
+	    <span class="n">krule</span><span class="o">-&gt;</span><span class="n">inode_f</span> <span class="o">||</span> <span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span> <span class="o">||</span> <span class="n">krule</span><span class="o">-&gt;</span><span class="n">tree</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">watch</span> <span class="o">=</span> <span class="n">audit_init_watch</span><span class="p">(</span><span class="n">path</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">watch</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+
+	<span class="n">audit_get_watch</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+	<span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span> <span class="o">=</span> <span class="n">watch</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Duplicate the given audit watch.  The new watch&#39;s rules list is initialized</span>
+<span class="cm"> * to an empty list and wlist is undefined. */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="nf">audit_dupe_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">old</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">path</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">new</span><span class="p">;</span>
+
+	<span class="n">path</span> <span class="o">=</span> <span class="n">kstrdup</span><span class="p">(</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">path</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+
+	<span class="n">new</span> <span class="o">=</span> <span class="n">audit_init_watch</span><span class="p">(</span><span class="n">path</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">new</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">path</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">new</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="n">new</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">=</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">ino</span><span class="p">;</span>
+	<span class="n">audit_get_parent</span><span class="p">(</span><span class="n">old</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+	<span class="n">new</span><span class="o">-&gt;</span><span class="n">parent</span> <span class="o">=</span> <span class="n">old</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">new</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_watch_log_rule_change</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">r</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">w</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">op</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">audit_enabled</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">audit_buffer</span> <span class="o">*</span><span class="n">ab</span><span class="p">;</span>
+		<span class="n">ab</span> <span class="o">=</span> <span class="n">audit_log_start</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">GFP_NOFS</span><span class="p">,</span> <span class="n">AUDIT_CONFIG_CHANGE</span><span class="p">);</span>
+		<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot;auid=%u ses=%u op=&quot;</span><span class="p">,</span>
+				 <span class="n">audit_get_loginuid</span><span class="p">(</span><span class="n">current</span><span class="p">),</span>
+				 <span class="n">audit_get_sessionid</span><span class="p">(</span><span class="n">current</span><span class="p">));</span>
+		<span class="n">audit_log_string</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="n">op</span><span class="p">);</span>
+		<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot; path=&quot;</span><span class="p">);</span>
+		<span class="n">audit_log_untrustedstring</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="n">w</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">);</span>
+		<span class="n">audit_log_key</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">filterkey</span><span class="p">);</span>
+		<span class="n">audit_log_format</span><span class="p">(</span><span class="n">ab</span><span class="p">,</span> <span class="s">&quot; list=%d res=1&quot;</span><span class="p">,</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">listnr</span><span class="p">);</span>
+		<span class="n">audit_log_end</span><span class="p">(</span><span class="n">ab</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* Update inode info in audit rules based on filesystem event. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_update_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">,</span>
+			       <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dname</span><span class="p">,</span> <span class="n">dev_t</span> <span class="n">dev</span><span class="p">,</span>
+			       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ino</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">invalidating</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">owatch</span><span class="p">,</span> <span class="o">*</span><span class="n">nwatch</span><span class="p">,</span> <span class="o">*</span><span class="n">nextw</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">r</span><span class="p">,</span> <span class="o">*</span><span class="n">nextr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_entry</span> <span class="o">*</span><span class="n">oentry</span><span class="p">,</span> <span class="o">*</span><span class="n">nentry</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="cm">/* Run all of the watches on this parent looking for the one that</span>
+<span class="cm">	 * matches the given dname */</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">owatch</span><span class="p">,</span> <span class="n">nextw</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">,</span> <span class="n">wlist</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">audit_compare_dname_path</span><span class="p">(</span><span class="n">dname</span><span class="p">,</span> <span class="n">owatch</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="cm">/* If the update involves invalidating rules, do the inode-based</span>
+<span class="cm">		 * filtering now, so we don&#39;t omit records. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">invalidating</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">audit_dummy_context</span><span class="p">())</span>
+			<span class="n">audit_filter_inodes</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">audit_context</span><span class="p">);</span>
+
+		<span class="cm">/* updating ino will likely change which audit_hash_list we</span>
+<span class="cm">		 * are on so we need a new watch for the new list */</span>
+		<span class="n">nwatch</span> <span class="o">=</span> <span class="n">audit_dupe_watch</span><span class="p">(</span><span class="n">owatch</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">nwatch</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+			<span class="n">audit_panic</span><span class="p">(</span><span class="s">&quot;error updating watch, skipping&quot;</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">nwatch</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+		<span class="n">nwatch</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">=</span> <span class="n">ino</span><span class="p">;</span>
+
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">nextr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">owatch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">,</span> <span class="n">rlist</span><span class="p">)</span> <span class="p">{</span>
+
+			<span class="n">oentry</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_entry</span><span class="p">,</span> <span class="n">rule</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">rlist</span><span class="p">);</span>
+			<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+			<span class="n">nentry</span> <span class="o">=</span> <span class="n">audit_dupe_rule</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">nentry</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+				<span class="n">audit_panic</span><span class="p">(</span><span class="s">&quot;error updating watch, removing&quot;</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="kt">int</span> <span class="n">h</span> <span class="o">=</span> <span class="n">audit_hash_ino</span><span class="p">((</span><span class="n">u32</span><span class="p">)</span><span class="n">ino</span><span class="p">);</span>
+
+				<span class="cm">/*</span>
+<span class="cm">				 * nentry-&gt;rule.watch == oentry-&gt;rule.watch so</span>
+<span class="cm">				 * we must drop that reference and set it to our</span>
+<span class="cm">				 * new watch.</span>
+<span class="cm">				 */</span>
+				<span class="n">audit_put_watch</span><span class="p">(</span><span class="n">nentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">watch</span><span class="p">);</span>
+				<span class="n">audit_get_watch</span><span class="p">(</span><span class="n">nwatch</span><span class="p">);</span>
+				<span class="n">nentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">watch</span> <span class="o">=</span> <span class="n">nwatch</span><span class="p">;</span>
+				<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">rlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nwatch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+				<span class="n">list_add_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nentry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">audit_inode_hash</span><span class="p">[</span><span class="n">h</span><span class="p">]);</span>
+				<span class="n">list_replace</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">list</span><span class="p">,</span>
+					     <span class="o">&amp;</span><span class="n">nentry</span><span class="o">-&gt;</span><span class="n">rule</span><span class="p">.</span><span class="n">list</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="n">audit_watch_log_rule_change</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">owatch</span><span class="p">,</span> <span class="s">&quot;updated rules&quot;</span><span class="p">);</span>
+
+			<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oentry</span><span class="o">-&gt;</span><span class="n">rcu</span><span class="p">,</span> <span class="n">audit_free_rule_rcu</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">audit_remove_watch</span><span class="p">(</span><span class="n">owatch</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">add_watch_to_parent</span><span class="p">;</span> <span class="cm">/* event applies to a single watch */</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+
+<span class="nl">add_watch_to_parent:</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nwatch</span><span class="o">-&gt;</span><span class="n">wlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Remove all watches &amp; rules associated with a parent that is going away. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_remove_parent_watches</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">w</span><span class="p">,</span> <span class="o">*</span><span class="n">nextw</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">r</span><span class="p">,</span> <span class="o">*</span><span class="n">nextr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_entry</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">nextw</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">,</span> <span class="n">wlist</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">nextr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">w</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">,</span> <span class="n">rlist</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">e</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_entry</span><span class="p">,</span> <span class="n">rule</span><span class="p">);</span>
+			<span class="n">audit_watch_log_rule_change</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="s">&quot;remove rule&quot;</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">e</span><span class="o">-&gt;</span><span class="n">rcu</span><span class="p">,</span> <span class="n">audit_free_rule_rcu</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">audit_remove_watch</span><span class="p">(</span><span class="n">w</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Get path information necessary for adding watches. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">audit_get_nd</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">path</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nameidata</span> <span class="n">nd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">d</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">kern_path_parent</span><span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nd</span><span class="p">.</span><span class="n">last_type</span> <span class="o">!=</span> <span class="n">LAST_NORM</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock_nested</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_mutex</span><span class="p">,</span> <span class="n">I_MUTEX_PARENT</span><span class="p">);</span>
+	<span class="n">d</span> <span class="o">=</span> <span class="n">lookup_one_len</span><span class="p">(</span><span class="n">nd</span><span class="p">.</span><span class="n">last</span><span class="p">.</span><span class="n">name</span><span class="p">,</span> <span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">.</span><span class="n">dentry</span><span class="p">,</span> <span class="n">nd</span><span class="p">.</span><span class="n">last</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">d</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_mutex</span><span class="p">);</span>
+		<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">d</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">d</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* update watch filter fields */</span>
+		<span class="n">watch</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">d</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_dev</span><span class="p">;</span>
+		<span class="n">watch</span><span class="o">-&gt;</span><span class="n">ino</span> <span class="o">=</span> <span class="n">d</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_mutex</span><span class="p">);</span>
+
+	<span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="n">nd</span><span class="p">.</span><span class="n">path</span><span class="p">;</span>
+	<span class="n">dput</span><span class="p">(</span><span class="n">d</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Associate the given rule with an existing parent.</span>
+<span class="cm"> * Caller must hold audit_filter_mutex. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">audit_add_to_parent</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">krule</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">w</span><span class="p">,</span> <span class="o">*</span><span class="n">watch</span> <span class="o">=</span> <span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">watch_found</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">mutex_is_locked</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">));</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">,</span> <span class="n">wlist</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">,</span> <span class="n">w</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">watch_found</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="cm">/* put krule&#39;s and initial refs to temporary watch */</span>
+		<span class="n">audit_put_watch</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+		<span class="n">audit_put_watch</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+
+		<span class="n">audit_get_watch</span><span class="p">(</span><span class="n">w</span><span class="p">);</span>
+		<span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span> <span class="o">=</span> <span class="n">watch</span> <span class="o">=</span> <span class="n">w</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">watch_found</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">audit_get_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+		<span class="n">watch</span><span class="o">-&gt;</span><span class="n">parent</span> <span class="o">=</span> <span class="n">parent</span><span class="p">;</span>
+
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">wlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">krule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Find a matching watch entry, or add this one.</span>
+<span class="cm"> * Caller must hold audit_filter_mutex. */</span>
+<span class="kt">int</span> <span class="nf">audit_add_watch</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">krule</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">**</span><span class="n">list</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span> <span class="o">=</span> <span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">path</span> <span class="n">parent_path</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">h</span><span class="p">,</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="cm">/* Avoid calling path_lookup under audit_filter_mutex. */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">audit_get_nd</span><span class="p">(</span><span class="n">watch</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">parent_path</span><span class="p">);</span>
+
+	<span class="cm">/* caller expects mutex locked */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_filter_mutex</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="cm">/* either find an old parent or attach a new one */</span>
+	<span class="n">parent</span> <span class="o">=</span> <span class="n">audit_find_parent</span><span class="p">(</span><span class="n">parent_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">parent</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">parent</span> <span class="o">=</span> <span class="n">audit_init_parent</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent_path</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">parent</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">audit_add_to_parent</span><span class="p">(</span><span class="n">krule</span><span class="p">,</span> <span class="n">parent</span><span class="p">);</span>
+
+	<span class="cm">/* match get in audit_find_parent or audit_init_parent */</span>
+	<span class="n">audit_put_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+
+	<span class="n">h</span> <span class="o">=</span> <span class="n">audit_hash_ino</span><span class="p">((</span><span class="n">u32</span><span class="p">)</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">ino</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">audit_inode_hash</span><span class="p">[</span><span class="n">h</span><span class="p">];</span>
+<span class="nl">error:</span>
+	<span class="n">path_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent_path</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">audit_remove_watch_rule</span><span class="p">(</span><span class="k">struct</span> <span class="n">audit_krule</span> <span class="o">*</span><span class="n">krule</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">audit_watch</span> <span class="o">*</span><span class="n">watch</span> <span class="o">=</span> <span class="n">krule</span><span class="o">-&gt;</span><span class="n">watch</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="n">watch</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">;</span>
+
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">krule</span><span class="o">-&gt;</span><span class="n">rlist</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">watch</span><span class="o">-&gt;</span><span class="n">rules</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">audit_remove_watch</span><span class="p">(</span><span class="n">watch</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">watches</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">audit_get_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+			<span class="n">fsnotify_destroy_mark</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">mark</span><span class="p">);</span>
+			<span class="n">audit_put_parent</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">audit_watch_should_send_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">inode_mark</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">vfsmount_mark</span><span class="p">,</span>
+					  <span class="n">__u32</span> <span class="n">mask</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">int</span> <span class="n">data_type</span><span class="p">)</span>
+<span class="p">{</span>
+       <span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Update watch data in audit rules based on fsnotify events. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">audit_watch_handle_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">fsnotify_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">inode_mark</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">fsnotify_mark</span> <span class="o">*</span><span class="n">vfsmount_mark</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">fsnotify_event</span> <span class="o">*</span><span class="n">event</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+	<span class="n">__u32</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">event</span><span class="o">-&gt;</span><span class="n">mask</span><span class="p">;</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dname</span> <span class="o">=</span> <span class="n">event</span><span class="o">-&gt;</span><span class="n">file_name</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">audit_parent</span> <span class="o">*</span><span class="n">parent</span><span class="p">;</span>
+
+	<span class="n">parent</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">inode_mark</span><span class="p">,</span> <span class="k">struct</span> <span class="n">audit_parent</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">group</span> <span class="o">!=</span> <span class="n">audit_watch_group</span><span class="p">);</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">event</span><span class="o">-&gt;</span><span class="n">data_type</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="p">(</span><span class="n">FSNOTIFY_EVENT_PATH</span><span class="p">)</span>:
+		<span class="n">inode</span> <span class="o">=</span> <span class="n">event</span><span class="o">-&gt;</span><span class="n">path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="p">(</span><span class="n">FSNOTIFY_EVENT_INODE</span><span class="p">)</span>:
+		<span class="n">inode</span> <span class="o">=</span> <span class="n">event</span><span class="o">-&gt;</span><span class="n">inode</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">BUG</span><span class="p">();</span>
+		<span class="n">inode</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mask</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">FS_CREATE</span><span class="o">|</span><span class="n">FS_MOVED_TO</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">inode</span><span class="p">)</span>
+		<span class="n">audit_update_watch</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">dname</span><span class="p">,</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_dev</span><span class="p">,</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mask</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">FS_DELETE</span><span class="o">|</span><span class="n">FS_MOVED_FROM</span><span class="p">))</span>
+		<span class="n">audit_update_watch</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">dname</span><span class="p">,</span> <span class="p">(</span><span class="n">dev_t</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mask</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">FS_DELETE_SELF</span><span class="o">|</span><span class="n">FS_UNMOUNT</span><span class="o">|</span><span class="n">FS_MOVE_SELF</span><span class="p">))</span>
+		<span class="n">audit_remove_parent_watches</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">fsnotify_ops</span> <span class="n">audit_watch_fsnotify_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">should_send_event</span> <span class="o">=</span> 	<span class="n">audit_watch_should_send_event</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">handle_event</span> <span class="o">=</span> 	<span class="n">audit_watch_handle_event</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_group_priv</span> <span class="o">=</span> 	<span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">freeing_mark</span> <span class="o">=</span> 	<span class="nb">NULL</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_event_priv</span> <span class="o">=</span> 	<span class="nb">NULL</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">audit_watch_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">audit_watch_group</span> <span class="o">=</span> <span class="n">fsnotify_alloc_group</span><span class="p">(</span><span class="o">&amp;</span><span class="n">audit_watch_fsnotify_ops</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">audit_watch_group</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">audit_watch_group</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">audit_panic</span><span class="p">(</span><span class="s">&quot;cannot create audit fsnotify group&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">device_initcall</span><span class="p">(</span><span class="n">audit_watch_init</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

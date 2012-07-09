@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › async.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>async.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * async.c: Asynchronous function calls for boot performance</span>
+<span class="cm"> *</span>
+<span class="cm"> * (C) Copyright 2009 Intel Corporation</span>
+<span class="cm"> * Author: Arjan van de Ven &lt;arjan@linux.intel.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public License</span>
+<span class="cm"> * as published by the Free Software Foundation; version 2</span>
+<span class="cm"> * of the License.</span>
+<span class="cm"> */</span>
+
+
+<span class="cm">/*</span>
+
+<span class="cm">Goals and Theory of Operation</span>
+
+<span class="cm">The primary goal of this feature is to reduce the kernel boot time,</span>
+<span class="cm">by doing various independent hardware delays and discovery operations</span>
+<span class="cm">decoupled and not strictly serialized.</span>
+
+<span class="cm">More specifically, the asynchronous function call concept allows</span>
+<span class="cm">certain operations (primarily during system boot) to happen</span>
+<span class="cm">asynchronously, out of order, while these operations still</span>
+<span class="cm">have their externally visible parts happen sequentially and in-order.</span>
+<span class="cm">(not unlike how out-of-order CPUs retire their instructions in order)</span>
+
+<span class="cm">Key to the asynchronous function call implementation is the concept of</span>
+<span class="cm">a &quot;sequence cookie&quot; (which, although it has an abstracted type, can be</span>
+<span class="cm">thought of as a monotonically incrementing number).</span>
+
+<span class="cm">The async core will assign each scheduled event such a sequence cookie and</span>
+<span class="cm">pass this to the called functions.</span>
+
+<span class="cm">The asynchronously called function should before doing a globally visible</span>
+<span class="cm">operation, such as registering device numbers, call the</span>
+<span class="cm">async_synchronize_cookie() function and pass in its own cookie. The</span>
+<span class="cm">async_synchronize_cookie() function will make sure that all asynchronous</span>
+<span class="cm">operations that were scheduled prior to the operation corresponding with the</span>
+<span class="cm">cookie have completed.</span>
+
+<span class="cm">Subsystem/driver initialization code that scheduled asynchronous probe</span>
+<span class="cm">functions, but which shares global resources with other drivers/subsystems</span>
+<span class="cm">that do not use the asynchronous call feature, need to do a full</span>
+<span class="cm">synchronization with the async_synchronize_full() function, before returning</span>
+<span class="cm">from their init function. This is to maintain strict ordering between the</span>
+<span class="cm">asynchronous and synchronous parts of the kernel.</span>
+
+<span class="cm">*/</span>
+
+<span class="cp">#include &lt;linux/async.h&gt;</span>
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+<span class="cp">#include &lt;linux/ktime.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/wait.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+
+<span class="k">static</span> <span class="n">async_cookie_t</span> <span class="n">next_cookie</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="cp">#define MAX_WORK	32768</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">async_pending</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">async_running</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">async_lock</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">async_entry</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">work_struct</span>	<span class="n">work</span><span class="p">;</span>
+	<span class="n">async_cookie_t</span>		<span class="n">cookie</span><span class="p">;</span>
+	<span class="n">async_func_ptr</span>		<span class="o">*</span><span class="n">func</span><span class="p">;</span>
+	<span class="kt">void</span>			<span class="o">*</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="o">*</span><span class="n">running</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">async_done</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">entry_count</span><span class="p">;</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * MUST be called with the lock held!</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">async_cookie_t</span>  <span class="nf">__lowest_in_progress</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">async_entry</span> <span class="o">*</span><span class="n">entry</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">running</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">entry</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="n">running</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">async_entry</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">async_pending</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">running</span> <span class="o">==</span> <span class="n">running</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">next_cookie</span><span class="p">;</span>	<span class="cm">/* &quot;infinity&quot; value */</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">async_cookie_t</span>  <span class="nf">lowest_in_progress</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">async_cookie_t</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">__lowest_in_progress</span><span class="p">(</span><span class="n">running</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * pick the first pending entry and run it</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">async_run_entry_fn</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">async_entry</span> <span class="o">*</span><span class="n">entry</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">async_entry</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">ktime_t</span> <span class="n">uninitialized_var</span><span class="p">(</span><span class="n">calltime</span><span class="p">),</span> <span class="n">delta</span><span class="p">,</span> <span class="n">rettime</span><span class="p">;</span>
+
+	<span class="cm">/* 1) move self to the running queue */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_move_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">entry</span><span class="o">-&gt;</span><span class="n">running</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* 2) run (and print duration) */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">initcall_debug</span> <span class="o">&amp;&amp;</span> <span class="n">system_state</span> <span class="o">==</span> <span class="n">SYSTEM_BOOTING</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;calling  %lli_%pF @ %i</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span><span class="p">,</span>
+			<span class="n">entry</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">,</span> <span class="n">task_pid_nr</span><span class="p">(</span><span class="n">current</span><span class="p">));</span>
+		<span class="n">calltime</span> <span class="o">=</span> <span class="n">ktime_get</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">entry</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">(</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">initcall_debug</span> <span class="o">&amp;&amp;</span> <span class="n">system_state</span> <span class="o">==</span> <span class="n">SYSTEM_BOOTING</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rettime</span> <span class="o">=</span> <span class="n">ktime_get</span><span class="p">();</span>
+		<span class="n">delta</span> <span class="o">=</span> <span class="n">ktime_sub</span><span class="p">(</span><span class="n">rettime</span><span class="p">,</span> <span class="n">calltime</span><span class="p">);</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;initcall %lli_%pF returned 0 after %lld usecs</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span><span class="p">,</span>
+			<span class="n">entry</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">ktime_to_ns</span><span class="p">(</span><span class="n">delta</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">10</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 3) remove self from the running queue */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="cm">/* 4) free the entry */</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry_count</span><span class="p">);</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* 5) wake up any waiters */</span>
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_done</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">async_cookie_t</span> <span class="nf">__async_schedule</span><span class="p">(</span><span class="n">async_func_ptr</span> <span class="o">*</span><span class="n">ptr</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">async_entry</span> <span class="o">*</span><span class="n">entry</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">async_cookie_t</span> <span class="n">newcookie</span><span class="p">;</span>
+
+	<span class="cm">/* allow irq-off callers */</span>
+	<span class="n">entry</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">async_entry</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If we&#39;re out of memory or if there&#39;s too much work</span>
+<span class="cm">	 * pending already, we execute synchronously.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">entry</span> <span class="o">||</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry_count</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">MAX_WORK</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">newcookie</span> <span class="o">=</span> <span class="n">next_cookie</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+		<span class="cm">/* low on memory.. run synchronously */</span>
+		<span class="n">ptr</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">newcookie</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">newcookie</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">,</span> <span class="n">async_run_entry_fn</span><span class="p">);</span>
+	<span class="n">entry</span><span class="o">-&gt;</span><span class="n">func</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+	<span class="n">entry</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">entry</span><span class="o">-&gt;</span><span class="n">running</span> <span class="o">=</span> <span class="n">running</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">newcookie</span> <span class="o">=</span> <span class="n">entry</span><span class="o">-&gt;</span><span class="n">cookie</span> <span class="o">=</span> <span class="n">next_cookie</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">async_pending</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry_count</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* schedule for execution */</span>
+	<span class="n">queue_work</span><span class="p">(</span><span class="n">system_unbound_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">entry</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">newcookie</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_schedule - schedule a function for asynchronous execution</span>
+<span class="cm"> * @ptr: function to execute asynchronously</span>
+<span class="cm"> * @data: data pointer to pass to the function</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns an async_cookie_t that may be used for checkpointing later.</span>
+<span class="cm"> * Note: This function may be called from atomic or non-atomic contexts.</span>
+<span class="cm"> */</span>
+<span class="n">async_cookie_t</span> <span class="nf">async_schedule</span><span class="p">(</span><span class="n">async_func_ptr</span> <span class="o">*</span><span class="n">ptr</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">__async_schedule</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">async_running</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_schedule</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_schedule_domain - schedule a function for asynchronous execution within a certain domain</span>
+<span class="cm"> * @ptr: function to execute asynchronously</span>
+<span class="cm"> * @data: data pointer to pass to the function</span>
+<span class="cm"> * @running: running list for the domain</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns an async_cookie_t that may be used for checkpointing later.</span>
+<span class="cm"> * @running may be used in the async_synchronize_*_domain() functions</span>
+<span class="cm"> * to wait within a certain synchronization domain rather than globally.</span>
+<span class="cm"> * A synchronization domain is specified via the running queue @running to use.</span>
+<span class="cm"> * Note: This function may be called from atomic or non-atomic contexts.</span>
+<span class="cm"> */</span>
+<span class="n">async_cookie_t</span> <span class="nf">async_schedule_domain</span><span class="p">(</span><span class="n">async_func_ptr</span> <span class="o">*</span><span class="n">ptr</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span>
+				     <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">__async_schedule</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">running</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_schedule_domain</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_synchronize_full - synchronize all asynchronous function calls</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function waits until all asynchronous function calls have been done.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">async_synchronize_full</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">async_synchronize_cookie</span><span class="p">(</span><span class="n">next_cookie</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_running</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">async_pending</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_synchronize_full</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_synchronize_full_domain - synchronize all asynchronous function within a certain domain</span>
+<span class="cm"> * @list: running list to synchronize on</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function waits until all asynchronous function calls for the</span>
+<span class="cm"> * synchronization domain specified by the running list @list have been done.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">async_synchronize_full_domain</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">list</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">async_synchronize_cookie_domain</span><span class="p">(</span><span class="n">next_cookie</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_synchronize_full_domain</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_synchronize_cookie_domain - synchronize asynchronous function calls within a certain domain with cookie checkpointing</span>
+<span class="cm"> * @cookie: async_cookie_t to use as checkpoint</span>
+<span class="cm"> * @running: running list to synchronize on</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function waits until all asynchronous function calls for the</span>
+<span class="cm"> * synchronization domain specified by the running list @list submitted</span>
+<span class="cm"> * prior to @cookie have been done.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">async_synchronize_cookie_domain</span><span class="p">(</span><span class="n">async_cookie_t</span> <span class="n">cookie</span><span class="p">,</span>
+				     <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">running</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ktime_t</span> <span class="n">uninitialized_var</span><span class="p">(</span><span class="n">starttime</span><span class="p">),</span> <span class="n">delta</span><span class="p">,</span> <span class="n">endtime</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">initcall_debug</span> <span class="o">&amp;&amp;</span> <span class="n">system_state</span> <span class="o">==</span> <span class="n">SYSTEM_BOOTING</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;async_waiting @ %i</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">task_pid_nr</span><span class="p">(</span><span class="n">current</span><span class="p">));</span>
+		<span class="n">starttime</span> <span class="o">=</span> <span class="n">ktime_get</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="n">wait_event</span><span class="p">(</span><span class="n">async_done</span><span class="p">,</span> <span class="n">lowest_in_progress</span><span class="p">(</span><span class="n">running</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">cookie</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">initcall_debug</span> <span class="o">&amp;&amp;</span> <span class="n">system_state</span> <span class="o">==</span> <span class="n">SYSTEM_BOOTING</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">endtime</span> <span class="o">=</span> <span class="n">ktime_get</span><span class="p">();</span>
+		<span class="n">delta</span> <span class="o">=</span> <span class="n">ktime_sub</span><span class="p">(</span><span class="n">endtime</span><span class="p">,</span> <span class="n">starttime</span><span class="p">);</span>
+
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;async_continuing @ %i after %lli usec</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">task_pid_nr</span><span class="p">(</span><span class="n">current</span><span class="p">),</span>
+			<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">ktime_to_ns</span><span class="p">(</span><span class="n">delta</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">10</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_synchronize_cookie_domain</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * async_synchronize_cookie - synchronize asynchronous function calls with cookie checkpointing</span>
+<span class="cm"> * @cookie: async_cookie_t to use as checkpoint</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function waits until all asynchronous function calls prior to @cookie</span>
+<span class="cm"> * have been done.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">async_synchronize_cookie</span><span class="p">(</span><span class="n">async_cookie_t</span> <span class="n">cookie</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">async_synchronize_cookie_domain</span><span class="p">(</span><span class="n">cookie</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">async_running</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">async_synchronize_cookie</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » mm › slob.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>slob.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * SLOB Allocator: Simple List Of Blocks</span>
+<span class="cm"> *</span>
+<span class="cm"> * Matt Mackall &lt;mpm@selenic.com&gt; 12/30/03</span>
+<span class="cm"> *</span>
+<span class="cm"> * NUMA support by Paul Mundt, 2007.</span>
+<span class="cm"> *</span>
+<span class="cm"> * How SLOB works:</span>
+<span class="cm"> *</span>
+<span class="cm"> * The core of SLOB is a traditional K&amp;R style heap allocator, with</span>
+<span class="cm"> * support for returning aligned objects. The granularity of this</span>
+<span class="cm"> * allocator is as little as 2 bytes, however typically most architectures</span>
+<span class="cm"> * will require 4 bytes on 32-bit and 8 bytes on 64-bit.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The slob heap is a set of linked list of pages from alloc_pages(),</span>
+<span class="cm"> * and within each page, there is a singly-linked list of free blocks</span>
+<span class="cm"> * (slob_t). The heap is grown on demand. To reduce fragmentation,</span>
+<span class="cm"> * heap pages are segregated into three lists, with objects less than</span>
+<span class="cm"> * 256 bytes, objects less than 1024 bytes, and all other objects.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Allocation from heap involves first searching for a page with</span>
+<span class="cm"> * sufficient free blocks (using a next-fit-like approach) followed by</span>
+<span class="cm"> * a first-fit scan of the page. Deallocation inserts objects back</span>
+<span class="cm"> * into the free list in address order, so this is effectively an</span>
+<span class="cm"> * address-ordered first fit.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Above this is an implementation of kmalloc/kfree. Blocks returned</span>
+<span class="cm"> * from kmalloc are prepended with a 4-byte header with the kmalloc size.</span>
+<span class="cm"> * If kmalloc is asked for objects of PAGE_SIZE or larger, it calls</span>
+<span class="cm"> * alloc_pages() directly, allocating compound pages so the page order</span>
+<span class="cm"> * does not have to be separately tracked, and also stores the exact</span>
+<span class="cm"> * allocation size in page-&gt;private so that it can be used to accurately</span>
+<span class="cm"> * provide ksize(). These objects are detected in kfree() because slob_page()</span>
+<span class="cm"> * is false for them.</span>
+<span class="cm"> *</span>
+<span class="cm"> * SLAB is emulated on top of SLOB by simply calling constructors and</span>
+<span class="cm"> * destructors for every SLAB allocation. Objects are returned with the</span>
+<span class="cm"> * 4-byte alignment unless the SLAB_HWCACHE_ALIGN flag is set, in which</span>
+<span class="cm"> * case the low-level allocator will fragment blocks to create the proper</span>
+<span class="cm"> * alignment. Again, objects of page-size or greater are allocated by</span>
+<span class="cm"> * calling alloc_pages(). As SLAB objects know their size, no separate</span>
+<span class="cm"> * size bookkeeping is necessary and there is essentially no allocation</span>
+<span class="cm"> * space overhead, and compound pages aren&#39;t needed for multi-page</span>
+<span class="cm"> * allocations.</span>
+<span class="cm"> *</span>
+<span class="cm"> * NUMA support in SLOB is fairly simplistic, pushing most of the real</span>
+<span class="cm"> * logic down to the page allocator, and simply doing the node accounting</span>
+<span class="cm"> * on the upper levels. In the event that a node id is explicitly</span>
+<span class="cm"> * provided, alloc_pages_exact_node() with the specified node id is used</span>
+<span class="cm"> * instead. The common case (or when the node id isn&#39;t explicitly provided)</span>
+<span class="cm"> * will default to the current node, as per numa_node_id().</span>
+<span class="cm"> *</span>
+<span class="cm"> * Node aware pages are still inserted in to the global freelist, and</span>
+<span class="cm"> * these are scanned for by matching against the node id encoded in the</span>
+<span class="cm"> * page flags. As a result, block allocations that can be satisfied from</span>
+<span class="cm"> * the freelist will only be done so on pages residing on the same node,</span>
+<span class="cm"> * in order to prevent random node placement.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/swap.h&gt; </span><span class="cm">/* struct reclaim_state */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/cache.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/rcupdate.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/kmemleak.h&gt;</span>
+
+<span class="cp">#include &lt;trace/events/kmem.h&gt;</span>
+
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * slob_block has a field &#39;units&#39;, which indicates size of block if +ve,</span>
+<span class="cm"> * or offset of next block if -ve (in SLOB_UNITs).</span>
+<span class="cm"> *</span>
+<span class="cm"> * Free blocks of size 1 unit simply contain the offset of the next block.</span>
+<span class="cm"> * Those with larger size contain their size in the first SLOB_UNIT of</span>
+<span class="cm"> * memory, and the offset of the next free block in the second SLOB_UNIT.</span>
+<span class="cm"> */</span>
+<span class="cp">#if PAGE_SIZE &lt;= (32767 * 2)</span>
+<span class="k">typedef</span> <span class="n">s16</span> <span class="n">slobidx_t</span><span class="p">;</span>
+<span class="cp">#else</span>
+<span class="k">typedef</span> <span class="n">s32</span> <span class="n">slobidx_t</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+<span class="k">struct</span> <span class="n">slob_block</span> <span class="p">{</span>
+	<span class="n">slobidx_t</span> <span class="n">units</span><span class="p">;</span>
+<span class="p">};</span>
+<span class="k">typedef</span> <span class="k">struct</span> <span class="n">slob_block</span> <span class="n">slob_t</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We use struct page fields to manage some slob allocation aspects,</span>
+<span class="cm"> * however to avoid the horrible mess in include/linux/mm_types.h, we&#39;ll</span>
+<span class="cm"> * just define our own struct page type variant here.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">slob_page</span> <span class="p">{</span>
+	<span class="k">union</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="p">{</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>	<span class="cm">/* mandatory */</span>
+			<span class="n">atomic_t</span> <span class="n">_count</span><span class="p">;</span>	<span class="cm">/* mandatory */</span>
+			<span class="n">slobidx_t</span> <span class="n">units</span><span class="p">;</span>	<span class="cm">/* free units left in page */</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pad</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+			<span class="n">slob_t</span> <span class="o">*</span><span class="n">free</span><span class="p">;</span>		<span class="cm">/* first free slob_t in page */</span>
+			<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>	<span class="cm">/* linked list of free pages */</span>
+		<span class="p">};</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="n">page</span><span class="p">;</span>
+	<span class="p">};</span>
+<span class="p">};</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">struct_slob_page_wrong_size</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span> <span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span><span class="p">)</span> <span class="o">!=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span><span class="p">));</span> <span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * free_slob_page: call before a slob_page is returned to the page allocator.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">free_slob_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">reset_page_mapcount</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">sp</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * All partially free slob pages go on these lists.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SLOB_BREAK1 256</span>
+<span class="cp">#define SLOB_BREAK2 1024</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">free_slob_small</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">free_slob_medium</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">free_slob_large</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * is_slob_page: True for all slob pages (false for bigblock pages)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">is_slob_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">PageSlab</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">set_slob_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__SetPageSlab</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">clear_slob_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__ClearPageSlab</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="nf">slob_page</span><span class="p">(</span><span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="p">)</span><span class="n">virt_to_page</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * slob_page_free: true for pages on free_slob_pages list.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">slob_page_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">PageSlobFree</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">set_slob_page_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">list</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+	<span class="n">__SetPageSlobFree</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">clear_slob_page_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">__ClearPageSlobFree</span><span class="p">((</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span><span class="n">sp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#define SLOB_UNIT sizeof(slob_t)</span>
+<span class="cp">#define SLOB_UNITS(size) (((size) + SLOB_UNIT - 1)/SLOB_UNIT)</span>
+<span class="cp">#define SLOB_ALIGN L1_CACHE_BYTES</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * struct slob_rcu is inserted at the tail of allocated slob blocks, which</span>
+<span class="cm"> * were created with a SLAB_DESTROY_BY_RCU slab. slob_rcu is used to free</span>
+<span class="cm"> * the block using call_rcu.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">slob_rcu</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rcu_head</span> <span class="n">head</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">size</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * slob_lock protects all slob allocator structures.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">slob_lock</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Encode the given size and next info into a free slob block s.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">set_slob</span><span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="n">s</span><span class="p">,</span> <span class="n">slobidx_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">slob_t</span> <span class="o">*</span><span class="n">next</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">slob_t</span> <span class="o">*</span><span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="p">)((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">s</span> <span class="o">&amp;</span> <span class="n">PAGE_MASK</span><span class="p">);</span>
+	<span class="n">slobidx_t</span> <span class="n">offset</span> <span class="o">=</span> <span class="n">next</span> <span class="o">-</span> <span class="n">base</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">s</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">units</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="n">s</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">units</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">s</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">units</span> <span class="o">=</span> <span class="o">-</span><span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return the size of a slob block.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">slobidx_t</span> <span class="nf">slob_units</span><span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="n">s</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">units</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return the next free slob block pointer after this one.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">slob_t</span> <span class="o">*</span><span class="nf">slob_next</span><span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="n">s</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">slob_t</span> <span class="o">*</span><span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="p">)((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">s</span> <span class="o">&amp;</span> <span class="n">PAGE_MASK</span><span class="p">);</span>
+	<span class="n">slobidx_t</span> <span class="n">next</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">s</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">units</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">next</span> <span class="o">=</span> <span class="o">-</span><span class="n">s</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">units</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">next</span> <span class="o">=</span> <span class="n">s</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">units</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">base</span><span class="o">+</span><span class="n">next</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Returns true if s is the last free block in its page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">slob_last</span><span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="n">s</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">!</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">slob_next</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">slob_new_pages</span><span class="p">(</span><span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">order</span><span class="p">,</span> <span class="kt">int</span> <span class="n">node</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_NUMA</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">node</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages_exact_node</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">gfp</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+	<span class="k">else</span>
+<span class="cp">#endif</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages</span><span class="p">(</span><span class="n">gfp</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">slob_free_pages</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">order</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">reclaim_state</span><span class="p">)</span>
+		<span class="n">current</span><span class="o">-&gt;</span><span class="n">reclaim_state</span><span class="o">-&gt;</span><span class="n">reclaimed_slab</span> <span class="o">+=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">;</span>
+	<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">b</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate a slob block within a given slob_page sp.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">slob_page_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">int</span> <span class="n">align</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">slob_t</span> <span class="o">*</span><span class="n">prev</span><span class="p">,</span> <span class="o">*</span><span class="n">cur</span><span class="p">,</span> <span class="o">*</span><span class="n">aligned</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">delta</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">units</span> <span class="o">=</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">prev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">cur</span> <span class="o">=</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">;</span> <span class="p">;</span> <span class="n">prev</span> <span class="o">=</span> <span class="n">cur</span><span class="p">,</span> <span class="n">cur</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">cur</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">slobidx_t</span> <span class="n">avail</span> <span class="o">=</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">align</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">aligned</span> <span class="o">=</span> <span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="p">)</span><span class="n">ALIGN</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">cur</span><span class="p">,</span> <span class="n">align</span><span class="p">);</span>
+			<span class="n">delta</span> <span class="o">=</span> <span class="n">aligned</span> <span class="o">-</span> <span class="n">cur</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">avail</span> <span class="o">&gt;=</span> <span class="n">units</span> <span class="o">+</span> <span class="n">delta</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* room enough? */</span>
+			<span class="n">slob_t</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">delta</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* need to fragment head to align? */</span>
+				<span class="n">next</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+				<span class="n">set_slob</span><span class="p">(</span><span class="n">aligned</span><span class="p">,</span> <span class="n">avail</span> <span class="o">-</span> <span class="n">delta</span><span class="p">,</span> <span class="n">next</span><span class="p">);</span>
+				<span class="n">set_slob</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">aligned</span><span class="p">);</span>
+				<span class="n">prev</span> <span class="o">=</span> <span class="n">cur</span><span class="p">;</span>
+				<span class="n">cur</span> <span class="o">=</span> <span class="n">aligned</span><span class="p">;</span>
+				<span class="n">avail</span> <span class="o">=</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="n">next</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">avail</span> <span class="o">==</span> <span class="n">units</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* exact fit? unlink. */</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">prev</span><span class="p">)</span>
+					<span class="n">set_slob</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">prev</span><span class="p">),</span> <span class="n">next</span><span class="p">);</span>
+				<span class="k">else</span>
+					<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span> <span class="cm">/* fragment */</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">prev</span><span class="p">)</span>
+					<span class="n">set_slob</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">prev</span><span class="p">),</span> <span class="n">cur</span> <span class="o">+</span> <span class="n">units</span><span class="p">);</span>
+				<span class="k">else</span>
+					<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">cur</span> <span class="o">+</span> <span class="n">units</span><span class="p">;</span>
+				<span class="n">set_slob</span><span class="p">(</span><span class="n">cur</span> <span class="o">+</span> <span class="n">units</span><span class="p">,</span> <span class="n">avail</span> <span class="o">-</span> <span class="n">units</span><span class="p">,</span> <span class="n">next</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">-=</span> <span class="n">units</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span><span class="p">)</span>
+				<span class="n">clear_slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">cur</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slob_last</span><span class="p">(</span><span class="n">cur</span><span class="p">))</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * slob_alloc: entry point into the slob allocator.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">slob_alloc</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">align</span><span class="p">,</span> <span class="kt">int</span> <span class="n">node</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">prev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">slob_list</span><span class="p">;</span>
+	<span class="n">slob_t</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">SLOB_BREAK1</span><span class="p">)</span>
+		<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_small</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">SLOB_BREAK2</span><span class="p">)</span>
+		<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_medium</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_large</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="cm">/* Iterate through each partially free page, try to find room */</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">slob_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_NUMA</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * If there&#39;s a node specification, search for a partial</span>
+<span class="cm">		 * page with a matching node id in the freelist.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">node</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span> <span class="o">&amp;&amp;</span> <span class="n">page_to_nid</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">)</span> <span class="o">!=</span> <span class="n">node</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+<span class="cp">#endif</span>
+		<span class="cm">/* Enough room on this page? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">&lt;</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">size</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="cm">/* Attempt to alloc */</span>
+		<span class="n">prev</span> <span class="o">=</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">.</span><span class="n">prev</span><span class="p">;</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">slob_page_alloc</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">align</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="cm">/* Improve fragment distribution and reduce our average</span>
+<span class="cm">		 * search time by starting our next search here. (see</span>
+<span class="cm">		 * Knuth vol 1, sec 2.5, pg 449) */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">prev</span> <span class="o">!=</span> <span class="n">slob_list</span><span class="o">-&gt;</span><span class="n">prev</span> <span class="o">&amp;&amp;</span>
+				<span class="n">slob_list</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">!=</span> <span class="n">prev</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">)</span>
+			<span class="n">list_move_tail</span><span class="p">(</span><span class="n">slob_list</span><span class="p">,</span> <span class="n">prev</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* Not enough space: must allocate a new page */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">slob_new_pages</span><span class="p">(</span><span class="n">gfp</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">__GFP_ZERO</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">sp</span> <span class="o">=</span> <span class="n">slob_page</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">set_slob_page</span><span class="p">(</span><span class="n">sp</span><span class="p">);</span>
+
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">=</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">PAGE_SIZE</span><span class="p">);</span>
+		<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">b</span><span class="p">;</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">set_slob</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">PAGE_SIZE</span><span class="p">),</span> <span class="n">b</span> <span class="o">+</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">PAGE_SIZE</span><span class="p">));</span>
+		<span class="n">set_slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">slob_list</span><span class="p">);</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">slob_page_alloc</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">align</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">((</span><span class="n">gfp</span> <span class="o">&amp;</span> <span class="n">__GFP_ZERO</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">b</span><span class="p">))</span>
+		<span class="n">memset</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * slob_free: entry point into the slob allocator.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">slob_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">;</span>
+	<span class="n">slob_t</span> <span class="o">*</span><span class="n">prev</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">,</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="p">(</span><span class="n">slob_t</span> <span class="o">*</span><span class="p">)</span><span class="n">block</span><span class="p">;</span>
+	<span class="n">slobidx_t</span> <span class="n">units</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">slob_list</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ZERO_OR_NULL_PTR</span><span class="p">(</span><span class="n">block</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="n">sp</span> <span class="o">=</span> <span class="n">slob_page</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="n">units</span> <span class="o">=</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">+</span> <span class="n">units</span> <span class="o">==</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">PAGE_SIZE</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Go directly to page allocator. Do not pass slob allocator */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">))</span>
+			<span class="n">clear_slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">clear_slob_page</span><span class="p">(</span><span class="n">sp</span><span class="p">);</span>
+		<span class="n">free_slob_page</span><span class="p">(</span><span class="n">sp</span><span class="p">);</span>
+		<span class="n">slob_free_pages</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* This slob page is about to become partially free. Easy! */</span>
+		<span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">=</span> <span class="n">units</span><span class="p">;</span>
+		<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">b</span><span class="p">;</span>
+		<span class="n">set_slob</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">units</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)(</span><span class="n">b</span> <span class="o">+</span>
+					<span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">PAGE_SIZE</span><span class="p">))</span> <span class="o">&amp;</span> <span class="n">PAGE_MASK</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">SLOB_BREAK1</span><span class="p">)</span>
+			<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_small</span><span class="p">;</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">SLOB_BREAK2</span><span class="p">)</span>
+			<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_medium</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">slob_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">free_slob_large</span><span class="p">;</span>
+		<span class="n">set_slob_page_free</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">slob_list</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Otherwise the page is already partially free, so find reinsertion</span>
+<span class="cm">	 * point.</span>
+<span class="cm">	 */</span>
+	<span class="n">sp</span><span class="o">-&gt;</span><span class="n">units</span> <span class="o">+=</span> <span class="n">units</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span> <span class="o">&lt;</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">b</span> <span class="o">+</span> <span class="n">units</span> <span class="o">==</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">units</span> <span class="o">+=</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">);</span>
+			<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">set_slob</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">units</span><span class="p">,</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">);</span>
+		<span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span> <span class="o">=</span> <span class="n">b</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">prev</span> <span class="o">=</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">free</span><span class="p">;</span>
+		<span class="n">next</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">prev</span><span class="p">);</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">b</span> <span class="o">&gt;</span> <span class="n">next</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">prev</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+			<span class="n">next</span> <span class="o">=</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">prev</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">slob_last</span><span class="p">(</span><span class="n">prev</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">b</span> <span class="o">+</span> <span class="n">units</span> <span class="o">==</span> <span class="n">next</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">units</span> <span class="o">+=</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">next</span><span class="p">);</span>
+			<span class="n">set_slob</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">units</span><span class="p">,</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">next</span><span class="p">));</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">set_slob</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">units</span><span class="p">,</span> <span class="n">next</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">prev</span> <span class="o">+</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">prev</span><span class="p">)</span> <span class="o">==</span> <span class="n">b</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">units</span> <span class="o">=</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">+</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">prev</span><span class="p">);</span>
+			<span class="n">set_slob</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">units</span><span class="p">,</span> <span class="n">slob_next</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">set_slob</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">slob_units</span><span class="p">(</span><span class="n">prev</span><span class="p">),</span> <span class="n">b</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * End of slob allocator proper. Begin kmem_cache_alloc and kmalloc frontend.</span>
+<span class="cm"> */</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">__kmalloc_node</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">,</span> <span class="kt">int</span> <span class="n">node</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">m</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">align</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">ARCH_KMALLOC_MINALIGN</span><span class="p">,</span> <span class="n">ARCH_SLAB_MINALIGN</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">gfp</span> <span class="o">&amp;=</span> <span class="n">gfp_allowed_mask</span><span class="p">;</span>
+
+	<span class="n">lockdep_trace_alloc</span><span class="p">(</span><span class="n">gfp</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">align</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">size</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ZERO_SIZE_PTR</span><span class="p">;</span>
+
+		<span class="n">m</span> <span class="o">=</span> <span class="n">slob_alloc</span><span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">align</span><span class="p">,</span> <span class="n">gfp</span><span class="p">,</span> <span class="n">align</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">m</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">m</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">m</span> <span class="o">+</span> <span class="n">align</span><span class="p">;</span>
+
+		<span class="n">trace_kmalloc_node</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span>
+				   <span class="n">size</span><span class="p">,</span> <span class="n">size</span> <span class="o">+</span> <span class="n">align</span><span class="p">,</span> <span class="n">gfp</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">order</span> <span class="o">=</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">order</span><span class="p">))</span>
+			<span class="n">gfp</span> <span class="o">|=</span> <span class="n">__GFP_COMP</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">slob_new_pages</span><span class="p">(</span><span class="n">gfp</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+			<span class="n">page</span> <span class="o">=</span> <span class="n">virt_to_page</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+			<span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">trace_kmalloc_node</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span>
+				   <span class="n">size</span><span class="p">,</span> <span class="n">PAGE_SIZE</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">,</span> <span class="n">gfp</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">kmemleak_alloc</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">gfp</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">__kmalloc_node</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">kfree</span><span class="p">(</span><span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">;</span>
+
+	<span class="n">trace_kfree</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ZERO_OR_NULL_PTR</span><span class="p">(</span><span class="n">block</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">kmemleak_free</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+
+	<span class="n">sp</span> <span class="o">=</span> <span class="n">slob_page</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_slob_page</span><span class="p">(</span><span class="n">sp</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">align</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">ARCH_KMALLOC_MINALIGN</span><span class="p">,</span> <span class="n">ARCH_SLAB_MINALIGN</span><span class="p">);</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">m</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">block</span> <span class="o">-</span> <span class="n">align</span><span class="p">);</span>
+		<span class="n">slob_free</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="o">*</span><span class="n">m</span> <span class="o">+</span> <span class="n">align</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kfree</span><span class="p">);</span>
+
+<span class="cm">/* can&#39;t use ksize for kmem_cache_alloc memory, only kmalloc */</span>
+<span class="kt">size_t</span> <span class="nf">ksize</span><span class="p">(</span><span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">slob_page</span> <span class="o">*</span><span class="n">sp</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="n">ZERO_SIZE_PTR</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">sp</span> <span class="o">=</span> <span class="n">slob_page</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_slob_page</span><span class="p">(</span><span class="n">sp</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">align</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">ARCH_KMALLOC_MINALIGN</span><span class="p">,</span> <span class="n">ARCH_SLAB_MINALIGN</span><span class="p">);</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">m</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">block</span> <span class="o">-</span> <span class="n">align</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="o">*</span><span class="n">m</span><span class="p">)</span> <span class="o">*</span> <span class="n">SLOB_UNIT</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="k">return</span> <span class="n">sp</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">.</span><span class="n">private</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ksize</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">kmem_cache</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">,</span> <span class="n">align</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">ctor</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="p">);</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="nf">kmem_cache_create</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+	<span class="kt">size_t</span> <span class="n">align</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">,</span> <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">ctor</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="p">))</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">c</span> <span class="o">=</span> <span class="n">slob_alloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span><span class="p">),</span>
+		<span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">ARCH_KMALLOC_MINALIGN</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">=</span> <span class="n">name</span><span class="p">;</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">SLAB_DESTROY_BY_RCU</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* leave room for rcu footer at the end of object */</span>
+			<span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_rcu</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">flags</span><span class="p">;</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">ctor</span> <span class="o">=</span> <span class="n">ctor</span><span class="p">;</span>
+		<span class="cm">/* ignore alignment unless it&#39;s forced */</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span> <span class="o">=</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">SLAB_HWCACHE_ALIGN</span><span class="p">)</span> <span class="o">?</span> <span class="n">SLOB_ALIGN</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span> <span class="o">&lt;</span> <span class="n">ARCH_SLAB_MINALIGN</span><span class="p">)</span>
+			<span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span> <span class="o">=</span> <span class="n">ARCH_SLAB_MINALIGN</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span> <span class="o">&lt;</span> <span class="n">align</span><span class="p">)</span>
+			<span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span> <span class="o">=</span> <span class="n">align</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">SLAB_PANIC</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot create slab cache %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">name</span><span class="p">);</span>
+
+	<span class="n">kmemleak_alloc</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span><span class="p">),</span> <span class="mi">1</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">c</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_create</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">kmem_cache_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kmemleak_free</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">SLAB_DESTROY_BY_RCU</span><span class="p">)</span>
+		<span class="n">rcu_barrier</span><span class="p">();</span>
+	<span class="n">slob_free</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_destroy</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">kmem_cache_alloc_node</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">flags</span><span class="p">,</span> <span class="kt">int</span> <span class="n">node</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+
+	<span class="n">flags</span> <span class="o">&amp;=</span> <span class="n">gfp_allowed_mask</span><span class="p">;</span>
+
+	<span class="n">lockdep_trace_alloc</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">slob_alloc</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">align</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+		<span class="n">trace_kmem_cache_alloc_node</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span>
+					    <span class="n">SLOB_UNITS</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">)</span> <span class="o">*</span> <span class="n">SLOB_UNIT</span><span class="p">,</span>
+					    <span class="n">flags</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">slob_new_pages</span><span class="p">(</span><span class="n">flags</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">),</span> <span class="n">node</span><span class="p">);</span>
+		<span class="n">trace_kmem_cache_alloc_node</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span>
+					    <span class="n">PAGE_SIZE</span> <span class="o">&lt;&lt;</span> <span class="n">get_order</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">),</span>
+					    <span class="n">flags</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">ctor</span><span class="p">)</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">ctor</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="n">kmemleak_alloc_recursive</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_alloc_node</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__kmem_cache_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">slob_free</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">slob_free_pages</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">kmem_rcu_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">rcu_head</span> <span class="o">*</span><span class="n">head</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">slob_rcu</span> <span class="o">*</span><span class="n">slob_rcu</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">slob_rcu</span> <span class="o">*</span><span class="p">)</span><span class="n">head</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">slob_rcu</span> <span class="o">-</span> <span class="p">(</span><span class="n">slob_rcu</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_rcu</span><span class="p">));</span>
+
+	<span class="n">__kmem_cache_free</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">slob_rcu</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">kmem_cache_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kmemleak_free_recursive</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">SLAB_DESTROY_BY_RCU</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">slob_rcu</span> <span class="o">*</span><span class="n">slob_rcu</span><span class="p">;</span>
+		<span class="n">slob_rcu</span> <span class="o">=</span> <span class="n">b</span> <span class="o">+</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">slob_rcu</span><span class="p">));</span>
+		<span class="n">slob_rcu</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+		<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slob_rcu</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span> <span class="n">kmem_rcu_free</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">__kmem_cache_free</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">trace_kmem_cache_free</span><span class="p">(</span><span class="n">_RET_IP_</span><span class="p">,</span> <span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_free</span><span class="p">);</span>
+
+<span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">kmem_cache_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_size</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">kmem_cache_shrink</span><span class="p">(</span><span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">kmem_cache_shrink</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">slob_ready</span> <span class="n">__read_mostly</span><span class="p">;</span>
+
+<span class="kt">int</span> <span class="nf">slab_is_available</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">slob_ready</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">kmem_cache_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">slob_ready</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">kmem_cache_init_late</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Nothing to do */</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

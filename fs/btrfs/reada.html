@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › btrfs › reada.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>reada.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2011 STRATO.  All rights reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public</span>
+<span class="cm"> * License v2 as published by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</span>
+<span class="cm"> * General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public</span>
+<span class="cm"> * License along with this program; if not, write to the</span>
+<span class="cm"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330,</span>
+<span class="cm"> * Boston, MA 021110-1307, USA.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/writeback.h&gt;</span>
+<span class="cp">#include &lt;linux/blkdev.h&gt;</span>
+<span class="cp">#include &lt;linux/rbtree.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+<span class="cp">#include &quot;ctree.h&quot;</span>
+<span class="cp">#include &quot;volumes.h&quot;</span>
+<span class="cp">#include &quot;disk-io.h&quot;</span>
+<span class="cp">#include &quot;transaction.h&quot;</span>
+
+<span class="cp">#undef DEBUG</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the implementation for the generic read ahead framework.</span>
+<span class="cm"> *</span>
+<span class="cm"> * To trigger a readahead, btrfs_reada_add must be called. It will start</span>
+<span class="cm"> * a read ahead for the given range [start, end) on tree root. The returned</span>
+<span class="cm"> * handle can either be used to wait on the readahead to finish</span>
+<span class="cm"> * (btrfs_reada_wait), or to send it to the background (btrfs_reada_detach).</span>
+<span class="cm"> *</span>
+<span class="cm"> * The read ahead works as follows:</span>
+<span class="cm"> * On btrfs_reada_add, the root of the tree is inserted into a radix_tree.</span>
+<span class="cm"> * reada_start_machine will then search for extents to prefetch and trigger</span>
+<span class="cm"> * some reads. When a read finishes for a node, all contained node/leaf</span>
+<span class="cm"> * pointers that lie in the given range will also be enqueued. The reads will</span>
+<span class="cm"> * be triggered in sequential order, thus giving a big win over a naive</span>
+<span class="cm"> * enumeration. It will also make use of multi-device layouts. Each disk</span>
+<span class="cm"> * will have its on read pointer and all disks will by utilized in parallel.</span>
+<span class="cm"> * Also will no two disks read both sides of a mirror simultaneously, as this</span>
+<span class="cm"> * would waste seeking capacity. Instead both disks will read different parts</span>
+<span class="cm"> * of the filesystem.</span>
+<span class="cm"> * Any number of readaheads can be started in parallel. The read order will be</span>
+<span class="cm"> * determined globally, i.e. 2 parallel readaheads will normally finish faster</span>
+<span class="cm"> * than the 2 started one after another.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define MAX_IN_FLIGHT 6</span>
+
+<span class="k">struct</span> <span class="n">reada_extctl</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_control</span>	<span class="o">*</span><span class="n">rc</span><span class="p">;</span>
+	<span class="n">u64</span>			<span class="n">generation</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">reada_extent</span> <span class="p">{</span>
+	<span class="n">u64</span>			<span class="n">logical</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_key</span>	<span class="n">top</span><span class="p">;</span>
+	<span class="n">u32</span>			<span class="n">blocksize</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">err</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">extctl</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">kref</span>		<span class="n">refcnt</span><span class="p">;</span>
+	<span class="n">spinlock_t</span>		<span class="n">lock</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_zone</span>	<span class="o">*</span><span class="n">zones</span><span class="p">[</span><span class="n">BTRFS_MAX_MIRRORS</span><span class="p">];</span>
+	<span class="kt">int</span>			<span class="n">nzones</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span>	<span class="o">*</span><span class="n">scheduled_for</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">reada_zone</span> <span class="p">{</span>
+	<span class="n">u64</span>			<span class="n">start</span><span class="p">;</span>
+	<span class="n">u64</span>			<span class="n">end</span><span class="p">;</span>
+	<span class="n">u64</span>			<span class="n">elems</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">list</span><span class="p">;</span>
+	<span class="n">spinlock_t</span>		<span class="n">lock</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">locked</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span>	<span class="o">*</span><span class="n">device</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span>	<span class="o">*</span><span class="n">devs</span><span class="p">[</span><span class="n">BTRFS_MAX_MIRRORS</span><span class="p">];</span> <span class="cm">/* full list, incl</span>
+<span class="cm">							   * self */</span>
+	<span class="kt">int</span>			<span class="n">ndevs</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">kref</span>		<span class="n">refcnt</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">reada_machine_work</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_work</span>	<span class="n">work</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_info</span>	<span class="o">*</span><span class="n">fs_info</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">reada_extent_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="p">,</span> <span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">reada_control_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">reada_zone_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">reada_start_machine</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__reada_start_machine</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">reada_add_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span><span class="p">,</span> <span class="n">u64</span> <span class="n">logical</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">btrfs_key</span> <span class="o">*</span><span class="n">top</span><span class="p">,</span> <span class="kt">int</span> <span class="n">level</span><span class="p">,</span> <span class="n">u64</span> <span class="n">generation</span><span class="p">);</span>
+
+<span class="cm">/* recurses */</span>
+<span class="cm">/* in case of err, eb might be NULL */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__readahead_hook</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_root</span> <span class="o">*</span><span class="n">root</span><span class="p">,</span> <span class="k">struct</span> <span class="n">extent_buffer</span> <span class="o">*</span><span class="n">eb</span><span class="p">,</span>
+			    <span class="n">u64</span> <span class="n">start</span><span class="p">,</span> <span class="kt">int</span> <span class="n">err</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">level</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nritems</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">bytenr</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">generation</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span> <span class="o">=</span> <span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span> <span class="o">=</span> <span class="n">start</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">for_dev</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">eb</span><span class="p">)</span>
+		<span class="n">level</span> <span class="o">=</span> <span class="n">btrfs_header_level</span><span class="p">(</span><span class="n">eb</span><span class="p">);</span>
+
+	<span class="cm">/* find extent */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">re</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="p">)</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">re</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * just take the full list from the extent. afterwards we</span>
+<span class="cm">	 * don&#39;t need the lock anymore</span>
+<span class="cm">	 */</span>
+	<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">extctl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">for_dev</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="p">;</span>
+	<span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">nritems</span> <span class="o">=</span> <span class="n">level</span> <span class="o">?</span> <span class="n">btrfs_header_nritems</span><span class="p">(</span><span class="n">eb</span><span class="p">)</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">generation</span> <span class="o">=</span> <span class="n">btrfs_header_generation</span><span class="p">(</span><span class="n">eb</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * FIXME: currently we just set nritems to 0 if this is a leaf,</span>
+<span class="cm">		 * effectively ignoring the content. In a next step we could</span>
+<span class="cm">		 * trigger more readahead depending from the content, e.g.</span>
+<span class="cm">		 * fetch the checksums for the extents in the leaf.</span>
+<span class="cm">		 */</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * this is the error case, the extent buffer has not been</span>
+<span class="cm">		 * read correctly. We won&#39;t access anything from it and</span>
+<span class="cm">		 * just cleanup our data structures. Effectively this will</span>
+<span class="cm">		 * cut the branch below this node from read ahead.</span>
+<span class="cm">		 */</span>
+		<span class="n">nritems</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">generation</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nritems</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_extctl</span> <span class="o">*</span><span class="n">rec</span><span class="p">;</span>
+		<span class="n">u64</span> <span class="n">n_gen</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">btrfs_key</span> <span class="n">key</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">btrfs_key</span> <span class="n">next_key</span><span class="p">;</span>
+
+		<span class="n">btrfs_node_key_to_cpu</span><span class="p">(</span><span class="n">eb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&lt;</span> <span class="n">nritems</span><span class="p">)</span>
+			<span class="n">btrfs_node_key_to_cpu</span><span class="p">(</span><span class="n">eb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">next_key</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">next_key</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">top</span><span class="p">;</span>
+		<span class="n">bytenr</span> <span class="o">=</span> <span class="n">btrfs_node_blockptr</span><span class="p">(</span><span class="n">eb</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="n">n_gen</span> <span class="o">=</span> <span class="n">btrfs_node_ptr_generation</span><span class="p">(</span><span class="n">eb</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">rec</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span> <span class="o">=</span> <span class="n">rec</span><span class="o">-&gt;</span><span class="n">rc</span><span class="p">;</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * if the generation doesn&#39;t match, just ignore this</span>
+<span class="cm">			 * extctl. This will probably cut off a branch from</span>
+<span class="cm">			 * prefetch. Alternatively one could start a new (sub-)</span>
+<span class="cm">			 * prefetch for this branch, starting again from root.</span>
+<span class="cm">			 * FIXME: move the generation check out of this loop</span>
+<span class="cm">			 */</span>
+<span class="cp">#ifdef DEBUG</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rec</span><span class="o">-&gt;</span><span class="n">generation</span> <span class="o">!=</span> <span class="n">generation</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;generation mismatch for &quot;</span>
+						<span class="s">&quot;(%llu,%d,%llu) %llu != %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				       <span class="n">key</span><span class="p">.</span><span class="n">objectid</span><span class="p">,</span> <span class="n">key</span><span class="p">.</span><span class="n">type</span><span class="p">,</span> <span class="n">key</span><span class="p">.</span><span class="n">offset</span><span class="p">,</span>
+				       <span class="n">rec</span><span class="o">-&gt;</span><span class="n">generation</span><span class="p">,</span> <span class="n">generation</span><span class="p">);</span>
+			<span class="p">}</span>
+<span class="cp">#endif</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rec</span><span class="o">-&gt;</span><span class="n">generation</span> <span class="o">==</span> <span class="n">generation</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">btrfs_comp_cpu_keys</span><span class="p">(</span><span class="o">&amp;</span><span class="n">key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">key_end</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">btrfs_comp_cpu_keys</span><span class="p">(</span><span class="o">&amp;</span><span class="n">next_key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">key_start</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">reada_add_block</span><span class="p">(</span><span class="n">rc</span><span class="p">,</span> <span class="n">bytenr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">next_key</span><span class="p">,</span>
+						<span class="n">level</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">n_gen</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * free extctl records</span>
+<span class="cm">	 */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">reada_extctl</span> <span class="o">*</span><span class="n">rec</span><span class="p">;</span>
+
+		<span class="n">rec</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">,</span> <span class="k">struct</span> <span class="n">reada_extctl</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rec</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">rec</span><span class="o">-&gt;</span><span class="n">rc</span><span class="p">;</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">rec</span><span class="p">);</span>
+
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_control_release</span><span class="p">);</span>
+			<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">wait</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_control_release</span><span class="p">);</span>
+
+		<span class="n">reada_extent_put</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>	<span class="cm">/* one ref for each entry */</span>
+	<span class="p">}</span>
+	<span class="n">reada_extent_put</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>	<span class="cm">/* our ref */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">for_dev</span><span class="p">)</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">for_dev</span><span class="o">-&gt;</span><span class="n">reada_in_flight</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * start is passed separately in case eb in NULL, which may be the case with</span>
+<span class="cm"> * failed I/O</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">btree_readahead_hook</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_root</span> <span class="o">*</span><span class="n">root</span><span class="p">,</span> <span class="k">struct</span> <span class="n">extent_buffer</span> <span class="o">*</span><span class="n">eb</span><span class="p">,</span>
+			 <span class="n">u64</span> <span class="n">start</span><span class="p">,</span> <span class="kt">int</span> <span class="n">err</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">__readahead_hook</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">eb</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+
+	<span class="n">reada_start_machine</span><span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="nf">reada_find_zone</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">u64</span> <span class="n">logical</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">btrfs_bio</span> <span class="o">*</span><span class="n">bbio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_block_group_cache</span> <span class="o">*</span><span class="n">cache</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">start</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">end</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">zone</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">zone</span><span class="p">,</span>
+				     <span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">logical</span> <span class="o">&gt;=</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">&amp;&amp;</span> <span class="n">logical</span> <span class="o">&lt;</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">zone</span><span class="p">;</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">cache</span> <span class="o">=</span> <span class="n">btrfs_lookup_block_group</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">logical</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cache</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">start</span> <span class="o">=</span> <span class="n">cache</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">.</span><span class="n">objectid</span><span class="p">;</span>
+	<span class="n">end</span> <span class="o">=</span> <span class="n">start</span> <span class="o">+</span> <span class="n">cache</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">.</span><span class="n">offset</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">btrfs_put_block_group</span><span class="p">(</span><span class="n">cache</span><span class="p">);</span>
+
+	<span class="n">zone</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">zone</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">zone</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">=</span> <span class="n">start</span><span class="p">;</span>
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">=</span> <span class="n">end</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">locked</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">kref_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">device</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span> <span class="cm">/* our device always sits at index 0 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">num_stripes</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* bounds have already been checked */</span>
+		<span class="n">zone</span><span class="o">-&gt;</span><span class="n">devs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">dev</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">zone</span><span class="o">-&gt;</span><span class="n">ndevs</span> <span class="o">=</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">num_stripes</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">),</span>
+				<span class="n">zone</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">zone</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">zone</span><span class="p">,</span>
+					     <span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+			<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">zone</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="nf">reada_find_extent</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_root</span> <span class="o">*</span><span class="n">root</span><span class="p">,</span>
+					      <span class="n">u64</span> <span class="n">logical</span><span class="p">,</span>
+					      <span class="k">struct</span> <span class="n">btrfs_key</span> <span class="o">*</span><span class="n">top</span><span class="p">,</span> <span class="kt">int</span> <span class="n">level</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re_exist</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span> <span class="o">=</span> <span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_mapping_tree</span> <span class="o">*</span><span class="n">map_tree</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">mapping_tree</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_bio</span> <span class="o">*</span><span class="n">bbio</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">prev_dev</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">blocksize</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">length</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nzones</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span> <span class="o">=</span> <span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">re</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="p">)</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">re</span><span class="p">;</span>
+
+	<span class="n">re</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">re</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">re</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">blocksize</span> <span class="o">=</span> <span class="n">btrfs_level_size</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">level</span><span class="p">);</span>
+	<span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">=</span> <span class="n">logical</span><span class="p">;</span>
+	<span class="n">re</span><span class="o">-&gt;</span><span class="n">blocksize</span> <span class="o">=</span> <span class="n">blocksize</span><span class="p">;</span>
+	<span class="n">re</span><span class="o">-&gt;</span><span class="n">top</span> <span class="o">=</span> <span class="o">*</span><span class="n">top</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">extctl</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">kref_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * map block</span>
+<span class="cm">	 */</span>
+	<span class="n">length</span> <span class="o">=</span> <span class="n">blocksize</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">btrfs_map_block</span><span class="p">(</span><span class="n">map_tree</span><span class="p">,</span> <span class="n">REQ_WRITE</span><span class="p">,</span> <span class="n">logical</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">length</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bbio</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">||</span> <span class="o">!</span><span class="n">bbio</span> <span class="o">||</span> <span class="n">length</span> <span class="o">&lt;</span> <span class="n">blocksize</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bbio</span><span class="o">-&gt;</span><span class="n">num_stripes</span> <span class="o">&gt;</span> <span class="n">BTRFS_MAX_MIRRORS</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;btrfs readahead: more than %d copies not &quot;</span>
+				<span class="s">&quot;supported&quot;</span><span class="p">,</span> <span class="n">BTRFS_MAX_MIRRORS</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">nzones</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">nzones</span> <span class="o">&lt;</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">num_stripes</span><span class="p">;</span> <span class="o">++</span><span class="n">nzones</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">;</span>
+
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">stripes</span><span class="p">[</span><span class="n">nzones</span><span class="p">].</span><span class="n">dev</span><span class="p">;</span>
+		<span class="n">zone</span> <span class="o">=</span> <span class="n">reada_find_zone</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="n">logical</span><span class="p">,</span> <span class="n">bbio</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">zone</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">nzones</span><span class="p">]</span> <span class="o">=</span> <span class="n">zone</span><span class="p">;</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">)</span>
+			<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="o">++</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span> <span class="o">=</span> <span class="n">nzones</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nzones</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* not a single zone found, error and out */</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* insert extent in reada_tree + all per-device trees, all or nothing */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">re_exist</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">re_exist</span><span class="p">);</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re_exist</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">prev_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">dev</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span> <span class="o">==</span> <span class="n">prev_dev</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * in case of DUP, just add the first zone. As both</span>
+<span class="cm">			 * are on the same device, there&#39;s nothing to gain</span>
+<span class="cm">			 * from adding both.</span>
+<span class="cm">			 * Also, it wouldn&#39;t work, as the tree is per device</span>
+<span class="cm">			 * and adding would fail with EEXIST</span>
+<span class="cm">			 */</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">prev_dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">while</span> <span class="p">(</span><span class="o">--</span><span class="n">i</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dev</span> <span class="o">=</span> <span class="n">bbio</span><span class="o">-&gt;</span><span class="n">stripes</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">dev</span><span class="p">;</span>
+				<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dev</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+				<span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">fs_info</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+			<span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">bbio</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">re</span><span class="p">;</span>
+
+<span class="nl">error:</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">nzones</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">;</span>
+
+		<span class="o">--</span><span class="n">nzones</span><span class="p">;</span>
+		<span class="n">zone</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">nzones</span><span class="p">];</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="o">--</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * no fs_info-&gt;reada_lock needed, as this can&#39;t be</span>
+<span class="cm">			 * the last ref</span>
+<span class="cm">			 */</span>
+			<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">bbio</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">re</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">re_exist</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_kref_dummy</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kr</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_extent_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_kref_dummy</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="o">--</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* no fs_info-&gt;reada_lock needed, as this can&#39;t be</span>
+<span class="cm">			 * the last ref */</span>
+			<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="p">)</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="o">-&gt;</span><span class="n">reada_in_flight</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">re</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_zone_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">kref</span><span class="p">,</span> <span class="k">struct</span> <span class="n">reada_zone</span><span class="p">,</span> <span class="n">refcnt</span><span class="p">);</span>
+
+	<span class="n">radix_tree_delete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span>
+			  <span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">zone</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_control_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">kref</span><span class="p">,</span> <span class="k">struct</span> <span class="n">reada_control</span><span class="p">,</span>
+						<span class="n">refcnt</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rc</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">reada_add_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span><span class="p">,</span> <span class="n">u64</span> <span class="n">logical</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">btrfs_key</span> <span class="o">*</span><span class="n">top</span><span class="p">,</span> <span class="kt">int</span> <span class="n">level</span><span class="p">,</span> <span class="n">u64</span> <span class="n">generation</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_root</span> <span class="o">*</span><span class="n">root</span> <span class="o">=</span> <span class="n">rc</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_extctl</span> <span class="o">*</span><span class="n">rec</span><span class="p">;</span>
+
+	<span class="n">re</span> <span class="o">=</span> <span class="n">reada_find_extent</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">logical</span><span class="p">,</span> <span class="n">top</span><span class="p">,</span> <span class="n">level</span><span class="p">);</span> <span class="cm">/* takes one ref */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">re</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">rec</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rec</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rec</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">reada_extent_put</span><span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rec</span><span class="o">-&gt;</span><span class="n">rc</span> <span class="o">=</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">rec</span><span class="o">-&gt;</span><span class="n">generation</span> <span class="o">=</span> <span class="n">generation</span><span class="p">;</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">);</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rec</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">extctl</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="cm">/* leave the ref on the extent */</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * called with fs_info-&gt;reada_lock held</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_peer_zones_set_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">,</span> <span class="kt">int</span> <span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span> <span class="o">=</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">ndevs</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">peer</span><span class="p">;</span>
+		<span class="n">peer</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">devs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">peer</span> <span class="o">&amp;&amp;</span> <span class="n">peer</span><span class="o">-&gt;</span><span class="n">device</span> <span class="o">!=</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">device</span><span class="p">)</span>
+			<span class="n">peer</span><span class="o">-&gt;</span><span class="n">locked</span> <span class="o">=</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * called with fs_info-&gt;reada_lock held</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">reada_pick_zone</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">top_zone</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">top_locked_zone</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">top_elems</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">top_locked_elems</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">reada_peer_zones_set_lock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_zone_release</span><span class="p">);</span>
+		<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* pick the zone with the most elements */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span>
+					     <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">zone</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">locked</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">&gt;</span> <span class="n">top_locked_elems</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">top_locked_elems</span> <span class="o">=</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">;</span>
+				<span class="n">top_locked_zone</span> <span class="o">=</span> <span class="n">zone</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">&gt;</span> <span class="n">top_elems</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">top_elems</span> <span class="o">=</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">;</span>
+				<span class="n">top_zone</span> <span class="o">=</span> <span class="n">zone</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">top_zone</span><span class="p">)</span>
+		<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span> <span class="o">=</span> <span class="n">top_zone</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">top_locked_zone</span><span class="p">)</span>
+		<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span> <span class="o">=</span> <span class="n">top_locked_zone</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_next</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">;</span>
+	<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">reada_peer_zones_set_lock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">reada_start_machine_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">mirror_num</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">extent_buffer</span> <span class="o">*</span><span class="n">eb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">logical</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">blocksize</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">need_kick</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">reada_pick_zone</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * FIXME currently we issue the reads one extent at a time. If we have</span>
+<span class="cm">	 * a contiguous block of extents, we could also coagulate them or use</span>
+<span class="cm">	 * plugging to speed things up</span>
+<span class="cm">	 */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">re</span><span class="p">,</span>
+				     <span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_next</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">&gt;=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">reada_pick_zone</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">re</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">re</span><span class="p">,</span>
+					<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_next</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_next</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">+</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">blocksize</span><span class="p">;</span>
+	<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * find mirror num</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">device</span> <span class="o">==</span> <span class="n">dev</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">mirror_num</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">logical</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span><span class="p">;</span>
+	<span class="n">blocksize</span> <span class="o">=</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">blocksize</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+		<span class="n">need_kick</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">reada_extent_put</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">re</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">need_kick</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">reada_in_flight</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">reada_tree_block_flagged</span><span class="p">(</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">extent_root</span><span class="p">,</span> <span class="n">logical</span><span class="p">,</span> <span class="n">blocksize</span><span class="p">,</span>
+			 <span class="n">mirror_num</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">eb</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">__readahead_hook</span><span class="p">(</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">extent_root</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">logical</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">eb</span><span class="p">)</span>
+		<span class="n">__readahead_hook</span><span class="p">(</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">extent_root</span><span class="p">,</span> <span class="n">eb</span><span class="p">,</span> <span class="n">eb</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">eb</span><span class="p">)</span>
+		<span class="n">free_extent_buffer</span><span class="p">(</span><span class="n">eb</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_start_machine_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_machine_work</span> <span class="o">*</span><span class="n">rmw</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">old_ioprio</span><span class="p">;</span>
+
+	<span class="n">rmw</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">reada_machine_work</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+	<span class="n">fs_info</span> <span class="o">=</span> <span class="n">rmw</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">;</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rmw</span><span class="p">);</span>
+
+	<span class="n">old_ioprio</span> <span class="o">=</span> <span class="n">IOPRIO_PRIO_VALUE</span><span class="p">(</span><span class="n">task_nice_ioclass</span><span class="p">(</span><span class="n">current</span><span class="p">),</span>
+				       <span class="n">task_nice_ioprio</span><span class="p">(</span><span class="n">current</span><span class="p">));</span>
+	<span class="n">set_task_ioprio</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">BTRFS_IOPRIO_READA</span><span class="p">);</span>
+	<span class="n">__reada_start_machine</span><span class="p">(</span><span class="n">fs_info</span><span class="p">);</span>
+	<span class="n">set_task_ioprio</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">old_ioprio</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__reada_start_machine</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">device</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_devices</span> <span class="o">*</span><span class="n">fs_devices</span> <span class="o">=</span> <span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">fs_devices</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">enqueued</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">total</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">enqueued</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">fs_devices</span><span class="o">-&gt;</span><span class="n">devices</span><span class="p">,</span> <span class="n">dev_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_in_flight</span><span class="p">)</span> <span class="o">&lt;</span>
+			    <span class="n">MAX_IN_FLIGHT</span><span class="p">)</span>
+				<span class="n">enqueued</span> <span class="o">+=</span> <span class="n">reada_start_machine_dev</span><span class="p">(</span><span class="n">fs_info</span><span class="p">,</span>
+								    <span class="n">device</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">total</span> <span class="o">+=</span> <span class="n">enqueued</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">enqueued</span> <span class="o">&amp;&amp;</span> <span class="n">total</span> <span class="o">&lt;</span> <span class="mi">10000</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">enqueued</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If everything is already in the cache, this is effectively single</span>
+<span class="cm">	 * threaded. To a) not hold the caller for too long and b) to utilize</span>
+<span class="cm">	 * more cores, we broke the loop above after 10000 iterations and now</span>
+<span class="cm">	 * enqueue to workers to finish it. This will distribute the load to</span>
+<span class="cm">	 * the cores.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+		<span class="n">reada_start_machine</span><span class="p">(</span><span class="n">fs_info</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">reada_start_machine</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_machine_work</span> <span class="o">*</span><span class="n">rmw</span><span class="p">;</span>
+
+	<span class="n">rmw</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rmw</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rmw</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* FIXME we cannot handle this properly right now */</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">rmw</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">.</span><span class="n">func</span> <span class="o">=</span> <span class="n">reada_start_machine_worker</span><span class="p">;</span>
+	<span class="n">rmw</span><span class="o">-&gt;</span><span class="n">fs_info</span> <span class="o">=</span> <span class="n">fs_info</span><span class="p">;</span>
+
+	<span class="n">btrfs_queue_worker</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">readahead_workers</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rmw</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef DEBUG</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dump_devs</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_fs_info</span> <span class="o">*</span><span class="n">fs_info</span><span class="p">,</span> <span class="kt">int</span> <span class="n">all</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_device</span> <span class="o">*</span><span class="n">device</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_fs_devices</span> <span class="o">*</span><span class="n">fs_devices</span> <span class="o">=</span> <span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">fs_devices</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">index</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">j</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cnt</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">fs_devices</span><span class="o">-&gt;</span><span class="n">devices</span><span class="p">,</span> <span class="n">dev_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;dev %lld has %d in flight</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">device</span><span class="o">-&gt;</span><span class="n">devid</span><span class="p">,</span>
+			<span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_in_flight</span><span class="p">));</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">reada_zone</span> <span class="o">*</span><span class="n">zone</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_zones</span><span class="p">,</span>
+						     <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">zone</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;  zone %llu-%llu elems %llu locked &quot;</span>
+				<span class="s">&quot;%d devs&quot;</span><span class="p">,</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">,</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">,</span>
+				<span class="n">zone</span><span class="o">-&gt;</span><span class="n">locked</span><span class="p">);</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">ndevs</span><span class="p">;</span> <span class="o">++</span><span class="n">j</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; %lld&quot;</span><span class="p">,</span>
+					<span class="n">zone</span><span class="o">-&gt;</span><span class="n">devs</span><span class="p">[</span><span class="n">j</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">devid</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_curr_zone</span> <span class="o">==</span> <span class="n">zone</span><span class="p">)</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; curr off %llu&quot;</span><span class="p">,</span>
+					<span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_next</span> <span class="o">-</span> <span class="n">zone</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">);</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">zone</span><span class="o">-&gt;</span><span class="n">end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">cnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">all</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">reada_extents</span><span class="p">,</span>
+						     <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">re</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span>
+				<span class="s">&quot;  re: logical %llu size %u empty %d for %lld&quot;</span><span class="p">,</span>
+				<span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span><span class="p">,</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">blocksize</span><span class="p">,</span>
+				<span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">extctl</span><span class="p">),</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span> <span class="o">?</span>
+				<span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="o">-&gt;</span><span class="n">devid</span> <span class="o">:</span> <span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+
+			<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; zone %llu-%llu devs&quot;</span><span class="p">,</span>
+					<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span>
+					<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">);</span>
+				<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">ndevs</span><span class="p">;</span> <span class="o">++</span><span class="n">j</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; %lld&quot;</span><span class="p">,</span>
+						<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">devs</span><span class="p">[</span><span class="n">j</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">devid</span><span class="p">);</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">cnt</span> <span class="o">&gt;</span> <span class="mi">15</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">cnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">all</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">reada_extent</span> <span class="o">*</span><span class="n">re</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">radix_tree_gang_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_tree</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="o">&amp;</span><span class="n">re</span><span class="p">,</span>
+					     <span class="n">index</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span>
+			<span class="s">&quot;re: logical %llu size %u list empty %d for %lld&quot;</span><span class="p">,</span>
+			<span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span><span class="p">,</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">blocksize</span><span class="p">,</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">extctl</span><span class="p">),</span>
+			<span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span> <span class="o">?</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">scheduled_for</span><span class="o">-&gt;</span><span class="n">devid</span> <span class="o">:</span> <span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; zone %llu-%llu devs&quot;</span><span class="p">,</span>
+				<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span>
+				<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">);</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">nzones</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; zone %llu-%llu devs&quot;</span><span class="p">,</span>
+					<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span>
+					<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">end</span><span class="p">);</span>
+				<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">ndevs</span><span class="p">;</span> <span class="o">++</span><span class="n">j</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot; %lld&quot;</span><span class="p">,</span>
+						<span class="n">re</span><span class="o">-&gt;</span><span class="n">zones</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">devs</span><span class="p">[</span><span class="n">j</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">devid</span><span class="p">);</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_CONT</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">re</span><span class="o">-&gt;</span><span class="n">logical</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fs_info</span><span class="o">-&gt;</span><span class="n">reada_lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * interface</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="nf">btrfs_reada_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_root</span> <span class="o">*</span><span class="n">root</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">btrfs_key</span> <span class="o">*</span><span class="n">key_start</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_key</span> <span class="o">*</span><span class="n">key_end</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">start</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">generation</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">level</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">extent_buffer</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+	<span class="k">static</span> <span class="k">struct</span> <span class="n">btrfs_key</span> <span class="n">max_key</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">objectid</span> <span class="o">=</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="p">(</span><span class="n">u8</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span>
+	<span class="p">};</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rc</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+
+	<span class="n">rc</span><span class="o">-&gt;</span><span class="n">root</span> <span class="o">=</span> <span class="n">root</span><span class="p">;</span>
+	<span class="n">rc</span><span class="o">-&gt;</span><span class="n">key_start</span> <span class="o">=</span> <span class="o">*</span><span class="n">key_start</span><span class="p">;</span>
+	<span class="n">rc</span><span class="o">-&gt;</span><span class="n">key_end</span> <span class="o">=</span> <span class="o">*</span><span class="n">key_end</span><span class="p">;</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">wait</span><span class="p">);</span>
+	<span class="n">kref_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span> <span class="cm">/* one ref for having elements */</span>
+
+	<span class="n">node</span> <span class="o">=</span> <span class="n">btrfs_root_node</span><span class="p">(</span><span class="n">root</span><span class="p">);</span>
+	<span class="n">start</span> <span class="o">=</span> <span class="n">node</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">;</span>
+	<span class="n">level</span> <span class="o">=</span> <span class="n">btrfs_header_level</span><span class="p">(</span><span class="n">node</span><span class="p">);</span>
+	<span class="n">generation</span> <span class="o">=</span> <span class="n">btrfs_header_generation</span><span class="p">(</span><span class="n">node</span><span class="p">);</span>
+	<span class="n">free_extent_buffer</span><span class="p">(</span><span class="n">node</span><span class="p">);</span>
+
+	<span class="n">reada_add_block</span><span class="p">(</span><span class="n">rc</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">max_key</span><span class="p">,</span> <span class="n">level</span><span class="p">,</span> <span class="n">generation</span><span class="p">);</span>
+
+	<span class="n">reada_start_machine</span><span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef DEBUG</span>
+<span class="kt">int</span> <span class="nf">btrfs_reada_wait</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">handle</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span> <span class="o">=</span> <span class="n">handle</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">wait_event_timeout</span><span class="p">(</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">wait</span><span class="p">,</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span>
+				   <span class="mi">5</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+		<span class="n">dump_devs</span><span class="p">(</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">&lt;</span> <span class="mi">10</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">dump_devs</span><span class="p">(</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">fs_info</span><span class="p">,</span> <span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span> <span class="o">&lt;</span> <span class="mi">10</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_control_release</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#else</span>
+<span class="kt">int</span> <span class="nf">btrfs_reada_wait</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">handle</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span> <span class="o">=</span> <span class="n">handle</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">wait_event</span><span class="p">(</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">wait</span><span class="p">,</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">elems</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_control_release</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="kt">void</span> <span class="nf">btrfs_reada_detach</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">handle</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">reada_control</span> <span class="o">*</span><span class="n">rc</span> <span class="o">=</span> <span class="n">handle</span><span class="p">;</span>
+
+	<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rc</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="n">reada_control_release</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,1421 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › usb › mon › mon_bin.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>mon_bin.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * The USB Monitor, inspired by Dave Harding&#39;s USBMon.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is a binary format reader.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2006 Paolo Abeni (paolo.abeni@email.it)</span>
+<span class="cm"> * Copyright (C) 2006,2007 Pete Zaitcev (zaitcev@redhat.com)</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/cdev.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/usb.h&gt;</span>
+<span class="cp">#include &lt;linux/poll.h&gt;</span>
+<span class="cp">#include &lt;linux/compat.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/scatterlist.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+
+<span class="cp">#include &lt;asm/uaccess.h&gt;</span>
+
+<span class="cp">#include &quot;usb_mon.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Defined by USB 2.0 clause 9.3, table 9.2.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SETUP_LEN  8</span>
+
+<span class="cm">/* ioctl macros */</span>
+<span class="cp">#define MON_IOC_MAGIC 0x92</span>
+
+<span class="cp">#define MON_IOCQ_URB_LEN _IO(MON_IOC_MAGIC, 1)</span>
+<span class="cm">/* #2 used to be MON_IOCX_URB, removed before it got into Linus tree */</span>
+<span class="cp">#define MON_IOCG_STATS _IOR(MON_IOC_MAGIC, 3, struct mon_bin_stats)</span>
+<span class="cp">#define MON_IOCT_RING_SIZE _IO(MON_IOC_MAGIC, 4)</span>
+<span class="cp">#define MON_IOCQ_RING_SIZE _IO(MON_IOC_MAGIC, 5)</span>
+<span class="cp">#define MON_IOCX_GET   _IOW(MON_IOC_MAGIC, 6, struct mon_bin_get)</span>
+<span class="cp">#define MON_IOCX_MFETCH _IOWR(MON_IOC_MAGIC, 7, struct mon_bin_mfetch)</span>
+<span class="cp">#define MON_IOCH_MFLUSH _IO(MON_IOC_MAGIC, 8)</span>
+<span class="cm">/* #9 was MON_IOCT_SETAPI */</span>
+<span class="cp">#define MON_IOCX_GETX   _IOW(MON_IOC_MAGIC, 10, struct mon_bin_get)</span>
+
+<span class="cp">#ifdef CONFIG_COMPAT</span>
+<span class="cp">#define MON_IOCX_GET32 _IOW(MON_IOC_MAGIC, 6, struct mon_bin_get32)</span>
+<span class="cp">#define MON_IOCX_MFETCH32 _IOWR(MON_IOC_MAGIC, 7, struct mon_bin_mfetch32)</span>
+<span class="cp">#define MON_IOCX_GETX32   _IOW(MON_IOC_MAGIC, 10, struct mon_bin_get32)</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Some architectures have enormous basic pages (16KB for ia64, 64KB for ppc).</span>
+<span class="cm"> * But it&#39;s all right. Just use a simple way to make sure the chunk is never</span>
+<span class="cm"> * smaller than a page.</span>
+<span class="cm"> *</span>
+<span class="cm"> * N.B. An application does not know our chunk size.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Woops, get_zeroed_page() returns a single page. I guess we&#39;re stuck with</span>
+<span class="cm"> * page-sized chunks for the time being.</span>
+<span class="cm"> */</span>
+<span class="cp">#define CHUNK_SIZE   PAGE_SIZE</span>
+<span class="cp">#define CHUNK_ALIGN(x)   (((x)+CHUNK_SIZE-1) &amp; ~(CHUNK_SIZE-1))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The magic limit was calculated so that it allows the monitoring</span>
+<span class="cm"> * application to pick data once in two ticks. This way, another application,</span>
+<span class="cm"> * which presumably drives the bus, gets to hog CPU, yet we collect our data.</span>
+<span class="cm"> * If HZ is 100, a 480 mbit/s bus drives 614 KB every jiffy. USB has an</span>
+<span class="cm"> * enormous overhead built into the bus protocol, so we need about 1000 KB.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is still too much for most cases, where we just snoop a few</span>
+<span class="cm"> * descriptor fetches for enumeration. So, the default is a &quot;reasonable&quot;</span>
+<span class="cm"> * amount for systems with HZ=250 and incomplete bus saturation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * XXX What about multi-megabyte URBs which take minutes to transfer?</span>
+<span class="cm"> */</span>
+<span class="cp">#define BUFF_MAX  CHUNK_ALIGN(1200*1024)</span>
+<span class="cp">#define BUFF_DFL   CHUNK_ALIGN(300*1024)</span>
+<span class="cp">#define BUFF_MIN     CHUNK_ALIGN(8*1024)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The per-event API header (2 per URB).</span>
+<span class="cm"> *</span>
+<span class="cm"> * This structure is seen in userland as defined by the documentation.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="p">{</span>
+	<span class="n">u64</span> <span class="n">id</span><span class="p">;</span>			<span class="cm">/* URB ID - from submission to callback */</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">type</span><span class="p">;</span>	<span class="cm">/* Same as in text API; extensible. */</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">xfer_type</span><span class="p">;</span>	<span class="cm">/* ISO, Intr, Control, Bulk */</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">epnum</span><span class="p">;</span>	<span class="cm">/* Endpoint number and transfer direction */</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">devnum</span><span class="p">;</span>	<span class="cm">/* Device address */</span>
+	<span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">busnum</span><span class="p">;</span>	<span class="cm">/* Bus number */</span>
+	<span class="kt">char</span> <span class="n">flag_setup</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">flag_data</span><span class="p">;</span>
+	<span class="n">s64</span> <span class="n">ts_sec</span><span class="p">;</span>		<span class="cm">/* gettimeofday */</span>
+	<span class="n">s32</span> <span class="n">ts_usec</span><span class="p">;</span>		<span class="cm">/* gettimeofday */</span>
+	<span class="kt">int</span> <span class="n">status</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len_urb</span><span class="p">;</span>	<span class="cm">/* Length of data (submitted or actual) */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len_cap</span><span class="p">;</span>	<span class="cm">/* Delivered length */</span>
+	<span class="k">union</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">setup</span><span class="p">[</span><span class="n">SETUP_LEN</span><span class="p">];</span>	<span class="cm">/* Only for Control S-type */</span>
+		<span class="k">struct</span> <span class="n">iso_rec</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">error_count</span><span class="p">;</span>
+			<span class="kt">int</span> <span class="n">numdesc</span><span class="p">;</span>
+		<span class="p">}</span> <span class="n">iso</span><span class="p">;</span>
+	<span class="p">}</span> <span class="n">s</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">interval</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">start_frame</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">xfer_flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ndesc</span><span class="p">;</span>	<span class="cm">/* Actual number of ISO descriptors */</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * ISO vector, packed into the head of data stream.</span>
+<span class="cm"> * This has to take 16 bytes to make sure that the end of buffer</span>
+<span class="cm"> * wrap is not happening in the middle of a descriptor.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">mon_bin_isodesc</span> <span class="p">{</span>
+	<span class="kt">int</span>          <span class="n">iso_status</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">iso_off</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">iso_len</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">_pad</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/* per file statistic */</span>
+<span class="k">struct</span> <span class="n">mon_bin_stats</span> <span class="p">{</span>
+	<span class="n">u32</span> <span class="n">queued</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">dropped</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mon_bin_get</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="n">__user</span> <span class="o">*</span><span class="n">hdr</span><span class="p">;</span>	<span class="cm">/* Can be 48 bytes or 64. */</span>
+	<span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">data</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">alloc</span><span class="p">;</span>		<span class="cm">/* Length of data (can be zero) */</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mon_bin_mfetch</span> <span class="p">{</span>
+	<span class="n">u32</span> <span class="n">__user</span> <span class="o">*</span><span class="n">offvec</span><span class="p">;</span>	<span class="cm">/* Vector of events fetched */</span>
+	<span class="n">u32</span> <span class="n">nfetch</span><span class="p">;</span>		<span class="cm">/* Number of events to fetch (out: fetched) */</span>
+	<span class="n">u32</span> <span class="n">nflush</span><span class="p">;</span>		<span class="cm">/* Number of events to flush */</span>
+<span class="p">};</span>
+
+<span class="cp">#ifdef CONFIG_COMPAT</span>
+<span class="k">struct</span> <span class="n">mon_bin_get32</span> <span class="p">{</span>
+	<span class="n">u32</span> <span class="n">hdr32</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">data32</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">alloc32</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mon_bin_mfetch32</span> <span class="p">{</span>
+        <span class="n">u32</span> <span class="n">offvec32</span><span class="p">;</span>
+        <span class="n">u32</span> <span class="n">nfetch32</span><span class="p">;</span>
+        <span class="n">u32</span> <span class="n">nflush32</span><span class="p">;</span>
+<span class="p">};</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/* Having these two values same prevents wrapping of the mon_bin_hdr */</span>
+<span class="cp">#define PKT_ALIGN   64</span>
+<span class="cp">#define PKT_SIZE    64</span>
+
+<span class="cp">#define PKT_SZ_API0 48	</span><span class="cm">/* API 0 (2.6.20) size */</span><span class="cp"></span>
+<span class="cp">#define PKT_SZ_API1 64	</span><span class="cm">/* API 1 size: extra fields */</span><span class="cp"></span>
+
+<span class="cp">#define ISODESC_MAX   128	</span><span class="cm">/* Same number as usbfs allows, 2048 bytes. */</span><span class="cp"></span>
+
+<span class="cm">/* max number of USB bus supported */</span>
+<span class="cp">#define MON_BIN_MAX_MINOR 128</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The buffer: map of used pages.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">pg</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">ptr</span><span class="p">;</span>	<span class="cm">/* XXX just use page_to_virt everywhere? */</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This gets associated with an open file struct.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="p">{</span>
+	<span class="cm">/* The buffer: one per open. */</span>
+	<span class="n">spinlock_t</span> <span class="n">b_lock</span><span class="p">;</span>		<span class="cm">/* Protect b_cnt, b_in */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">b_size</span><span class="p">;</span>		<span class="cm">/* Current size of the buffer - bytes */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">b_cnt</span><span class="p">;</span>		<span class="cm">/* Bytes used */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">b_in</span><span class="p">,</span> <span class="n">b_out</span><span class="p">;</span>	<span class="cm">/* Offsets into buffer - bytes */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">b_read</span><span class="p">;</span>		<span class="cm">/* Amount of read data in curr. pkt. */</span>
+	<span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">b_vec</span><span class="p">;</span>	<span class="cm">/* The map array */</span>
+	<span class="n">wait_queue_head_t</span> <span class="n">b_wait</span><span class="p">;</span>	<span class="cm">/* Wait for data here */</span>
+
+	<span class="k">struct</span> <span class="n">mutex</span> <span class="n">fetch_lock</span><span class="p">;</span>	<span class="cm">/* Protect b_read, b_out */</span>
+	<span class="kt">int</span> <span class="n">mmap_active</span><span class="p">;</span>
+
+	<span class="cm">/* A list of these is needed for &quot;bus 0&quot;. Some time later. */</span>
+	<span class="k">struct</span> <span class="n">mon_reader</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="cm">/* Stats */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cnt_lost</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="nf">MON_OFF2HDR</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="p">)</span>
+	    <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">[</span><span class="n">offset</span> <span class="o">/</span> <span class="n">CHUNK_SIZE</span><span class="p">].</span><span class="n">ptr</span> <span class="o">+</span> <span class="n">offset</span> <span class="o">%</span> <span class="n">CHUNK_SIZE</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#define MON_RING_EMPTY(rp)	((rp)-&gt;b_cnt == 0)</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">xfer_to_pipe</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="n">PIPE_CONTROL</span><span class="p">,</span> <span class="n">PIPE_ISOCHRONOUS</span><span class="p">,</span> <span class="n">PIPE_BULK</span><span class="p">,</span> <span class="n">PIPE_INTERRUPT</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">class</span> <span class="o">*</span><span class="n">mon_bin_class</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">dev_t</span> <span class="n">mon_bin_dev0</span><span class="p">;</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cdev</span> <span class="n">mon_bin_cdev</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">mon_buff_area_fill</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">mon_bin_wait_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">mon_alloc_buff</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span> <span class="kt">int</span> <span class="n">npages</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">mon_free_buff</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span> <span class="kt">int</span> <span class="n">npages</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a &quot;chunked memcpy&quot;. It does not manipulate any counters.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">mon_copy_to_buff</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">this</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">off</span><span class="p">,</span> <span class="k">const</span> <span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">from</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">length</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">in_page</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">length</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Determine step_len.</span>
+<span class="cm">		 */</span>
+		<span class="n">step_len</span> <span class="o">=</span> <span class="n">length</span><span class="p">;</span>
+		<span class="n">in_page</span> <span class="o">=</span> <span class="n">CHUNK_SIZE</span> <span class="o">-</span> <span class="p">(</span><span class="n">off</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">CHUNK_SIZE</span><span class="o">-</span><span class="mi">1</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">in_page</span> <span class="o">&lt;</span> <span class="n">step_len</span><span class="p">)</span>
+			<span class="n">step_len</span> <span class="o">=</span> <span class="n">in_page</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Copy data and advance pointers.</span>
+<span class="cm">		 */</span>
+		<span class="n">buf</span> <span class="o">=</span> <span class="n">this</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">[</span><span class="n">off</span> <span class="o">/</span> <span class="n">CHUNK_SIZE</span><span class="p">].</span><span class="n">ptr</span> <span class="o">+</span> <span class="n">off</span> <span class="o">%</span> <span class="n">CHUNK_SIZE</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">from</span><span class="p">,</span> <span class="n">step_len</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">off</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">this</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="n">off</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">from</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">length</span> <span class="o">-=</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">off</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a little worse than the above because it&#39;s &quot;chunked copy_to_user&quot;.</span>
+<span class="cm"> * The return value is an error code, not an offset.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">copy_from_buf</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">this</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">off</span><span class="p">,</span>
+    <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">to</span><span class="p">,</span> <span class="kt">int</span> <span class="n">length</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">in_page</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">length</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Determine step_len.</span>
+<span class="cm">		 */</span>
+		<span class="n">step_len</span> <span class="o">=</span> <span class="n">length</span><span class="p">;</span>
+		<span class="n">in_page</span> <span class="o">=</span> <span class="n">CHUNK_SIZE</span> <span class="o">-</span> <span class="p">(</span><span class="n">off</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">CHUNK_SIZE</span><span class="o">-</span><span class="mi">1</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">in_page</span> <span class="o">&lt;</span> <span class="n">step_len</span><span class="p">)</span>
+			<span class="n">step_len</span> <span class="o">=</span> <span class="n">in_page</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Copy data and advance pointers.</span>
+<span class="cm">		 */</span>
+		<span class="n">buf</span> <span class="o">=</span> <span class="n">this</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">[</span><span class="n">off</span> <span class="o">/</span> <span class="n">CHUNK_SIZE</span><span class="p">].</span><span class="n">ptr</span> <span class="o">+</span> <span class="n">off</span> <span class="o">%</span> <span class="n">CHUNK_SIZE</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">to</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">step_len</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">off</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">this</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="n">off</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">to</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">length</span> <span class="o">-=</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate an (aligned) area in the buffer.</span>
+<span class="cm"> * This is called under b_lock.</span>
+<span class="cm"> * Returns ~0 on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">mon_buff_area_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+</span> <span class="n">size</span> <span class="o">&gt;</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">~</span><span class="mi">0</span><span class="p">;</span>
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">+=</span> <span class="n">size</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the same thing as mon_buff_area_alloc, only it does not allow</span>
+<span class="cm"> * buffers to wrap. This is needed by applications which pass references</span>
+<span class="cm"> * into mmap-ed buffers up their stacks (libpcap can do that).</span>
+<span class="cm"> *</span>
+<span class="cm"> * Currently, we always have the header stuck with the data, although</span>
+<span class="cm"> * it is not strictly speaking necessary.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When a buffer would wrap, we place a filler packet to mark the space.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">mon_buff_area_alloc_contiguous</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">fill_size</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+</span> <span class="n">size</span> <span class="o">&gt;</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">~</span><span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">+</span> <span class="n">size</span> <span class="o">&gt;</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * This would wrap. Find if we still have space after</span>
+<span class="cm">		 * skipping to the end of the buffer. If we do, place</span>
+<span class="cm">		 * a filler packet and allocate a new packet.</span>
+<span class="cm">		 */</span>
+		<span class="n">fill_size</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span> <span class="o">-</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+</span> <span class="n">size</span> <span class="o">+</span> <span class="n">fill_size</span> <span class="o">&gt;</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">~</span><span class="mi">0</span><span class="p">;</span>
+		<span class="n">mon_buff_area_fill</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span><span class="p">,</span> <span class="n">fill_size</span><span class="p">);</span>
+
+		<span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+=</span> <span class="n">size</span> <span class="o">+</span> <span class="n">fill_size</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">+</span> <span class="n">size</span> <span class="o">==</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return a few (kilo-)bytes to the head of the buffer.</span>
+<span class="cm"> * This is used if a data fetch fails.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_buff_area_shrink</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="cm">/* size &amp;= ~(PKT_ALIGN-1);  -- we&#39;re called with aligned size */</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">-=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">&lt;</span> <span class="n">size</span><span class="p">)</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">+=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">-=</span> <span class="n">size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This has to be called under both b_lock and fetch_lock, because</span>
+<span class="cm"> * it accesses both b_cnt and b_out.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_buff_area_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">-=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span> <span class="o">+=</span> <span class="n">size</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_buff_area_fill</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+
+	<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">PKT_SIZE</span><span class="p">);</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">type</span> <span class="o">=</span> <span class="sc">&#39;@&#39;</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">=</span> <span class="n">size</span> <span class="o">-</span> <span class="n">PKT_SIZE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">char</span> <span class="nf">mon_bin_get_setup</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">setupb</span><span class="p">,</span>
+    <span class="k">const</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">char</span> <span class="n">ev_type</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">setup_packet</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="sc">&#39;Z&#39;</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">setupb</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">setup_packet</span><span class="p">,</span> <span class="n">SETUP_LEN</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">mon_bin_get_data</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">length</span><span class="p">,</span>
+    <span class="kt">char</span> <span class="o">*</span><span class="n">flag</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">this_len</span><span class="p">;</span>
+
+	<span class="o">*</span><span class="n">flag</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">num_sgs</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_buffer</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">flag</span> <span class="o">=</span> <span class="sc">&#39;Z&#39;</span><span class="p">;</span>
+			<span class="k">return</span> <span class="n">length</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">mon_copy_to_buff</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_buffer</span><span class="p">,</span> <span class="n">length</span><span class="p">);</span>
+		<span class="n">length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* If IOMMU coalescing occurred, we cannot trust sg_page */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_flags</span> <span class="o">&amp;</span> <span class="n">URB_DMA_SG_COMBINED</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">flag</span> <span class="o">=</span> <span class="sc">&#39;D&#39;</span><span class="p">;</span>
+			<span class="k">return</span> <span class="n">length</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* Copy up to the first non-addressable segment */</span>
+		<span class="n">for_each_sg</span><span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">sg</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">num_sgs</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">length</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">PageHighMem</span><span class="p">(</span><span class="n">sg_page</span><span class="p">(</span><span class="n">sg</span><span class="p">)))</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="n">this_len</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">length</span><span class="p">);</span>
+			<span class="n">offset</span> <span class="o">=</span> <span class="n">mon_copy_to_buff</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">sg_virt</span><span class="p">(</span><span class="n">sg</span><span class="p">),</span>
+					<span class="n">this_len</span><span class="p">);</span>
+			<span class="n">length</span> <span class="o">-=</span> <span class="n">this_len</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">flag</span> <span class="o">=</span> <span class="sc">&#39;D&#39;</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">length</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the look-ahead pass in case of &#39;C Zi&#39;, when actual_length cannot</span>
+<span class="cm"> * be used to determine the length of the whole contiguous buffer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">mon_bin_collate_isodesc</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ndesc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">usb_iso_packet_descriptor</span> <span class="o">*</span><span class="n">fp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">length</span><span class="p">;</span>
+
+	<span class="n">length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">fp</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">iso_frame_desc</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">ndesc</span><span class="o">--</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fp</span><span class="o">-&gt;</span><span class="n">actual_length</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">fp</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">actual_length</span> <span class="o">&gt;</span> <span class="n">length</span><span class="p">)</span>
+				<span class="n">length</span> <span class="o">=</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">actual_length</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">fp</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">length</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_get_isodesc</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">char</span> <span class="n">ev_type</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ndesc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_bin_isodesc</span> <span class="o">*</span><span class="n">dp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_iso_packet_descriptor</span> <span class="o">*</span><span class="n">fp</span><span class="p">;</span>
+
+	<span class="n">fp</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">iso_frame_desc</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">ndesc</span><span class="o">--</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dp</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_isodesc</span> <span class="o">*</span><span class="p">)</span>
+		    <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">[</span><span class="n">offset</span> <span class="o">/</span> <span class="n">CHUNK_SIZE</span><span class="p">].</span><span class="n">ptr</span> <span class="o">+</span> <span class="n">offset</span> <span class="o">%</span> <span class="n">CHUNK_SIZE</span><span class="p">);</span>
+		<span class="n">dp</span><span class="o">-&gt;</span><span class="n">iso_status</span> <span class="o">=</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">;</span>
+		<span class="n">dp</span><span class="o">-&gt;</span><span class="n">iso_off</span> <span class="o">=</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+		<span class="n">dp</span><span class="o">-&gt;</span><span class="n">iso_len</span> <span class="o">=</span> <span class="p">(</span><span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;S&#39;</span><span class="p">)</span> <span class="o">?</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">:</span> <span class="n">fp</span><span class="o">-&gt;</span><span class="n">actual_length</span><span class="p">;</span>
+		<span class="n">dp</span><span class="o">-&gt;</span><span class="n">_pad</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">offset</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_isodesc</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">fp</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span>
+    <span class="kt">char</span> <span class="n">ev_type</span><span class="p">,</span> <span class="kt">int</span> <span class="n">status</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">usb_endpoint_descriptor</span> <span class="o">*</span><span class="n">epd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">desc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timeval</span> <span class="n">ts</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">urb_length</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">length</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">delta</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ndesc</span><span class="p">,</span> <span class="n">lendesc</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">dir</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">data_tag</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">do_gettimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ts</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Find the maximum allowable length, then allocate space.</span>
+<span class="cm">	 */</span>
+	<span class="n">urb_length</span> <span class="o">=</span> <span class="p">(</span><span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;S&#39;</span><span class="p">)</span> <span class="o">?</span>
+	    <span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_buffer_length</span> <span class="o">:</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">actual_length</span><span class="p">;</span>
+	<span class="n">length</span> <span class="o">=</span> <span class="n">urb_length</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">usb_endpoint_xfer_isoc</span><span class="p">(</span><span class="n">epd</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">number_of_packets</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ndesc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">number_of_packets</span> <span class="o">&gt;=</span> <span class="n">ISODESC_MAX</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ndesc</span> <span class="o">=</span> <span class="n">ISODESC_MAX</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">ndesc</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">number_of_packets</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;C&#39;</span> <span class="o">&amp;&amp;</span> <span class="n">usb_urb_dir_in</span><span class="p">(</span><span class="n">urb</span><span class="p">))</span>
+			<span class="n">length</span> <span class="o">=</span> <span class="n">mon_bin_collate_isodesc</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="n">ndesc</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">ndesc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">lendesc</span> <span class="o">=</span> <span class="n">ndesc</span><span class="o">*</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_isodesc</span><span class="p">);</span>
+
+	<span class="cm">/* not an issue unless there&#39;s a subtle bug in a HCD somewhere */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">length</span> <span class="o">&gt;=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_buffer_length</span><span class="p">)</span>
+		<span class="n">length</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_buffer_length</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">length</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="mi">5</span><span class="p">)</span>
+		<span class="n">length</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="mi">5</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">usb_urb_dir_in</span><span class="p">(</span><span class="n">urb</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;S&#39;</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">data_tag</span> <span class="o">=</span> <span class="sc">&#39;&lt;&#39;</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="cm">/* Cannot rely on endpoint number in case of control ep.0 */</span>
+		<span class="n">dir</span> <span class="o">=</span> <span class="n">USB_DIR_IN</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;C&#39;</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">data_tag</span> <span class="o">=</span> <span class="sc">&#39;&gt;&#39;</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dir</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">mmap_active</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">mon_buff_area_alloc_contiguous</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span>
+						 <span class="n">length</span> <span class="o">+</span> <span class="n">PKT_SIZE</span> <span class="o">+</span> <span class="n">lendesc</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">mon_buff_area_alloc</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">length</span> <span class="o">+</span> <span class="n">PKT_SIZE</span> <span class="o">+</span> <span class="n">lendesc</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">cnt_lost</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">offset</span> <span class="o">+=</span> <span class="n">PKT_SIZE</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Fill the allocated area.</span>
+<span class="cm">	 */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">PKT_SIZE</span><span class="p">);</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">type</span> <span class="o">=</span> <span class="n">ev_type</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">xfer_type</span> <span class="o">=</span> <span class="n">xfer_to_pipe</span><span class="p">[</span><span class="n">usb_endpoint_type</span><span class="p">(</span><span class="n">epd</span><span class="p">)];</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">epnum</span> <span class="o">=</span> <span class="n">dir</span> <span class="o">|</span> <span class="n">usb_endpoint_num</span><span class="p">(</span><span class="n">epd</span><span class="p">);</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">devnum</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">devnum</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">busnum</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">busnum</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">id</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">urb</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">ts_sec</span> <span class="o">=</span> <span class="n">ts</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">ts_usec</span> <span class="o">=</span> <span class="n">ts</span><span class="p">.</span><span class="n">tv_usec</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">status</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_urb</span> <span class="o">=</span> <span class="n">urb_length</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">=</span> <span class="n">length</span> <span class="o">+</span> <span class="n">lendesc</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">xfer_flags</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">transfer_flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">usb_endpoint_xfer_int</span><span class="p">(</span><span class="n">epd</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">interval</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">interval</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">usb_endpoint_xfer_isoc</span><span class="p">(</span><span class="n">epd</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">interval</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">interval</span><span class="p">;</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">start_frame</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">start_frame</span><span class="p">;</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">s</span><span class="p">.</span><span class="n">iso</span><span class="p">.</span><span class="n">error_count</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">error_count</span><span class="p">;</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">s</span><span class="p">.</span><span class="n">iso</span><span class="p">.</span><span class="n">numdesc</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">number_of_packets</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">usb_endpoint_xfer_control</span><span class="p">(</span><span class="n">epd</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">ev_type</span> <span class="o">==</span> <span class="sc">&#39;S&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_setup</span> <span class="o">=</span> <span class="n">mon_bin_get_setup</span><span class="p">(</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">s</span><span class="p">.</span><span class="n">setup</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="n">ev_type</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_setup</span> <span class="o">=</span> <span class="sc">&#39;-&#39;</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ndesc</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">ndesc</span> <span class="o">=</span> <span class="n">ndesc</span><span class="p">;</span>
+		<span class="n">mon_bin_get_isodesc</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="n">ev_type</span><span class="p">,</span> <span class="n">ndesc</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">offset</span> <span class="o">+=</span> <span class="n">lendesc</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="n">offset</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">length</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">length</span> <span class="o">=</span> <span class="n">mon_bin_get_data</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span>
+				<span class="o">&amp;</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_data</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">length</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">delta</span> <span class="o">=</span> <span class="p">(</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+			<span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">-=</span> <span class="n">length</span><span class="p">;</span>
+			<span class="n">delta</span> <span class="o">-=</span> <span class="p">(</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+			<span class="n">mon_buff_area_shrink</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">delta</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_data</span> <span class="o">=</span> <span class="n">data_tag</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_submit</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">mon_bin_event</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="sc">&#39;S&#39;</span><span class="p">,</span> <span class="o">-</span><span class="n">EINPROGRESS</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_complete</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">int</span> <span class="n">status</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">mon_bin_event</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">urb</span><span class="p">,</span> <span class="sc">&#39;C&#39;</span><span class="p">,</span> <span class="n">status</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_error</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="k">struct</span> <span class="n">urb</span> <span class="o">*</span><span class="n">urb</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timeval</span> <span class="n">ts</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+
+	<span class="n">do_gettimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ts</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">mon_buff_area_alloc</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">PKT_SIZE</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Not incrementing cnt_lost. Just because. */</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">PKT_SIZE</span><span class="p">);</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">type</span> <span class="o">=</span> <span class="sc">&#39;E&#39;</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">xfer_type</span> <span class="o">=</span> <span class="n">xfer_to_pipe</span><span class="p">[</span><span class="n">usb_endpoint_type</span><span class="p">(</span><span class="o">&amp;</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">desc</span><span class="p">)];</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">epnum</span> <span class="o">=</span> <span class="n">usb_urb_dir_in</span><span class="p">(</span><span class="n">urb</span><span class="p">)</span> <span class="o">?</span> <span class="n">USB_DIR_IN</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">epnum</span> <span class="o">|=</span> <span class="n">usb_endpoint_num</span><span class="p">(</span><span class="o">&amp;</span><span class="n">urb</span><span class="o">-&gt;</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">desc</span><span class="p">);</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">devnum</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">devnum</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">busnum</span> <span class="o">=</span> <span class="n">urb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">busnum</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">id</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">urb</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">ts_sec</span> <span class="o">=</span> <span class="n">ts</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">ts_usec</span> <span class="o">=</span> <span class="n">ts</span><span class="p">.</span><span class="n">tv_usec</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">status</span> <span class="o">=</span> <span class="n">error</span><span class="p">;</span>
+
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_setup</span> <span class="o">=</span> <span class="sc">&#39;-&#39;</span><span class="p">;</span>
+	<span class="n">ep</span><span class="o">-&gt;</span><span class="n">flag_data</span> <span class="o">=</span> <span class="sc">&#39;E&#39;</span><span class="p">;</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_bus</span> <span class="o">*</span><span class="n">mbus</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">mbus</span> <span class="o">=</span> <span class="n">mon_bus_lookup</span><span class="p">(</span><span class="n">iminor</span><span class="p">(</span><span class="n">inode</span><span class="p">)))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mbus</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">mon_bus0</span> <span class="o">&amp;&amp;</span> <span class="n">mbus</span><span class="o">-&gt;</span><span class="n">u_bus</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="n">TAG</span> <span class="s">&quot;: consistency error on open</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rp</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err_alloc</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">);</span>
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span> <span class="o">=</span> <span class="n">BUFF_DFL</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err_allocvec</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rc</span> <span class="o">=</span> <span class="n">mon_alloc_buff</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_allocbuff</span><span class="p">;</span>
+
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">m_bus</span> <span class="o">=</span> <span class="n">mbus</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">r_data</span> <span class="o">=</span> <span class="n">rp</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">rnf_submit</span> <span class="o">=</span> <span class="n">mon_bin_submit</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">rnf_error</span> <span class="o">=</span> <span class="n">mon_bin_error</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">rnf_complete</span> <span class="o">=</span> <span class="n">mon_bin_complete</span><span class="p">;</span>
+
+	<span class="n">mon_reader_add</span><span class="p">(</span><span class="n">mbus</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">);</span>
+
+	<span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">rp</span><span class="p">;</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">err_allocbuff:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">);</span>
+<span class="nl">err_allocvec:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rp</span><span class="p">);</span>
+<span class="nl">err_alloc:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Extract an event from buffer and copy it to user space.</span>
+<span class="cm"> * Wait if there is no event ready.</span>
+<span class="cm"> * Returns zero or error.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_get_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="n">__user</span> <span class="o">*</span><span class="n">hdr</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hdrbytes</span><span class="p">,</span>
+    <span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nbytes</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rc</span> <span class="o">=</span> <span class="n">mon_bin_wait_event</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">hdr</span><span class="p">,</span> <span class="n">ep</span><span class="p">,</span> <span class="n">hdrbytes</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">step_len</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">offset</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span> <span class="o">+</span> <span class="n">PKT_SIZE</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_buf</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">step_len</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">mon_buff_area_free</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">PKT_SIZE</span> <span class="o">+</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bus</span><span class="o">*</span> <span class="n">mbus</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">.</span><span class="n">m_bus</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mbus</span><span class="o">-&gt;</span><span class="n">nreaders</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="n">TAG</span> <span class="s">&quot;: consistency error on close</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mon_reader_del</span><span class="p">(</span><span class="n">mbus</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">r</span><span class="p">);</span>
+
+	<span class="n">mon_free_buff</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rp</span><span class="p">);</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">mon_bin_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+    <span class="kt">size_t</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hdrbytes</span> <span class="o">=</span> <span class="n">PKT_SZ_API0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">ptr</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">done</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rc</span> <span class="o">=</span> <span class="n">mon_bin_wait_event</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">&lt;</span> <span class="n">hdrbytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">step_len</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">nbytes</span><span class="p">,</span> <span class="p">(</span><span class="kt">size_t</span><span class="p">)(</span><span class="n">hdrbytes</span> <span class="o">-</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span><span class="p">));</span>
+		<span class="n">ptr</span> <span class="o">=</span> <span class="p">((</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">ep</span><span class="p">)</span> <span class="o">+</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">step_len</span> <span class="o">&amp;&amp;</span> <span class="n">copy_to_user</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">step_len</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">nbytes</span> <span class="o">-=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">buf</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">done</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">&gt;=</span> <span class="n">hdrbytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">step_len</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">;</span>
+		<span class="n">step_len</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">-</span> <span class="n">hdrbytes</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">step_len</span> <span class="o">&gt;</span> <span class="n">nbytes</span><span class="p">)</span>
+			<span class="n">step_len</span> <span class="o">=</span> <span class="n">nbytes</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span> <span class="o">+</span> <span class="n">PKT_SIZE</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">-</span> <span class="n">hdrbytes</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="n">offset</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_buf</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">step_len</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">nbytes</span> <span class="o">-=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">buf</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+		<span class="n">done</span> <span class="o">+=</span> <span class="n">step_len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check if whole packet was read, and if so, jump to the next one.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">&gt;=</span> <span class="n">hdrbytes</span> <span class="o">+</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">mon_buff_area_free</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">PKT_SIZE</span> <span class="o">+</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">done</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Remove at most nevents from chunked buffer.</span>
+<span class="cm"> * Returns the number of removed events.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">nevents</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nevents</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">MON_RING_EMPTY</span><span class="p">(</span><span class="n">rp</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">);</span>
+		<span class="n">mon_buff_area_free</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">PKT_SIZE</span> <span class="o">+</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Fetch at most max event offsets into the buffer and put them into vec.</span>
+<span class="cm"> * The events are usually freed later with mon_bin_flush.</span>
+<span class="cm"> * Return the effective number of events fetched.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_fetch</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">,</span>
+    <span class="n">u32</span> <span class="n">__user</span> <span class="o">*</span><span class="n">vec</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cur_out</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">bytes</span><span class="p">,</span> <span class="n">avail</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nevents</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rc</span> <span class="o">=</span> <span class="n">mon_bin_wait_event</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">avail</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">cur_out</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">;</span>
+	<span class="n">nevents</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">bytes</span> <span class="o">&lt;</span> <span class="n">avail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">nevents</span> <span class="o">&gt;=</span> <span class="n">max</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">cur_out</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">cur_out</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">vec</span><span class="p">[</span><span class="n">nevents</span><span class="p">]))</span> <span class="p">{</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">nevents</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">+</span> <span class="n">PKT_SIZE</span><span class="p">;</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">cur_out</span> <span class="o">+=</span> <span class="n">size</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="n">cur_out</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+		<span class="n">bytes</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">nevents</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Count events. This is almost the same as the above mon_bin_fetch,</span>
+<span class="cm"> * only we do not store offsets into user vector, and we have no limit.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_queued</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cur_out</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">bytes</span><span class="p">,</span> <span class="n">avail</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nevents</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">avail</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">cur_out</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">;</span>
+	<span class="n">nevents</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">bytes</span> <span class="o">&lt;</span> <span class="n">avail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">cur_out</span><span class="p">);</span>
+
+		<span class="n">nevents</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span> <span class="o">+</span> <span class="n">PKT_SIZE</span><span class="p">;</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PKT_ALIGN</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">cur_out</span> <span class="o">+=</span> <span class="n">size</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+			<span class="n">cur_out</span> <span class="o">-=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+		<span class="n">bytes</span> <span class="o">+=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">nevents</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">mon_bin_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cmd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span></pre></div></td></tr>
+
+
+<tr id="section-2"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-2">&#182;</a></div><p>struct mon<em>bus* mbus = rp->r.m</em>bus;</p></td><td class="code"><div class="highlight"><pre>	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mon_bin_hdr</span> <span class="o">*</span><span class="n">ep</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">cmd</span><span class="p">)</span> <span class="p">{</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCQ_URB_LEN</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * N.B. This only returns the size of data, without the header.</span>
+<span class="cm">		 */</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">MON_RING_EMPTY</span><span class="p">(</span><span class="n">rp</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ep</span> <span class="o">=</span> <span class="n">MON_OFF2HDR</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">len_cap</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCQ_RING_SIZE</span>:
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCT_RING_SIZE</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * Changing the buffer size will flush it&#39;s contents; the new</span>
+<span class="cm">		 * buffer is allocated before releasing the old one to be sure</span>
+<span class="cm">		 * the device will stay functional also in case of memory</span>
+<span class="cm">		 * pressure.</span>
+<span class="cm">		 */</span>
+		<span class="p">{</span>
+		<span class="kt">int</span> <span class="n">size</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">vec</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">arg</span> <span class="o">&lt;</span> <span class="n">BUFF_MIN</span> <span class="o">||</span> <span class="n">arg</span> <span class="o">&gt;</span> <span class="n">BUFF_MAX</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+		<span class="n">size</span> <span class="o">=</span> <span class="n">CHUNK_ALIGN</span><span class="p">(</span><span class="n">arg</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">vec</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">),</span>
+		    <span class="n">GFP_KERNEL</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_alloc_buff</span><span class="p">(</span><span class="n">vec</span><span class="p">,</span> <span class="n">size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">vec</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">mon_free_buff</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">,</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="o">/</span><span class="n">CHUNK_SIZE</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">);</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span>  <span class="o">=</span> <span class="n">vec</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_read</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_in</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_out</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_cnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">cnt_lost</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">fetch_lock</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCH_MFLUSH</span>:
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_flush</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">arg</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCX_GET</span>:
+	<span class="k">case</span> <span class="n">MON_IOCX_GETX</span>:
+		<span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mon_bin_get</span> <span class="n">getb</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">getb</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">,</span>
+					    <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_get</span><span class="p">)))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">getb</span><span class="p">.</span><span class="n">alloc</span> <span class="o">&gt;</span> <span class="mh">0x10000000</span><span class="p">)</span>	<span class="cm">/* Want to cast to u32 */</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_get_event</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">,</span> <span class="n">getb</span><span class="p">.</span><span class="n">hdr</span><span class="p">,</span>
+		    <span class="p">(</span><span class="n">cmd</span> <span class="o">==</span> <span class="n">MON_IOCX_GET</span><span class="p">)</span><span class="o">?</span> <span class="n">PKT_SZ_API0</span><span class="o">:</span> <span class="n">PKT_SZ_API1</span><span class="p">,</span>
+		    <span class="n">getb</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span><span class="n">getb</span><span class="p">.</span><span class="n">alloc</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCX_MFETCH</span>:
+		<span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mon_bin_mfetch</span> <span class="n">mfetch</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">mon_bin_mfetch</span> <span class="n">__user</span> <span class="o">*</span><span class="n">uptr</span><span class="p">;</span>
+
+		<span class="n">uptr</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_mfetch</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mfetch</span><span class="p">,</span> <span class="n">uptr</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">mfetch</span><span class="p">)))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">mfetch</span><span class="p">.</span><span class="n">nflush</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_flush</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">mfetch</span><span class="p">.</span><span class="n">nflush</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uptr</span><span class="o">-&gt;</span><span class="n">nflush</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_fetch</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">,</span> <span class="n">mfetch</span><span class="p">.</span><span class="n">offvec</span><span class="p">,</span> <span class="n">mfetch</span><span class="p">.</span><span class="n">nfetch</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uptr</span><span class="o">-&gt;</span><span class="n">nfetch</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCG_STATS</span>: <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mon_bin_stats</span> <span class="n">__user</span> <span class="o">*</span><span class="n">sp</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nevents</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ndropped</span><span class="p">;</span>
+
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">ndropped</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">cnt_lost</span><span class="p">;</span>
+		<span class="n">rp</span><span class="o">-&gt;</span><span class="n">cnt_lost</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">nevents</span> <span class="o">=</span> <span class="n">mon_bin_queued</span><span class="p">(</span><span class="n">rp</span><span class="p">);</span>
+
+		<span class="n">sp</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_stats</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">ndropped</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">dropped</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">nevents</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sp</span><span class="o">-&gt;</span><span class="n">queued</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOTTY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_COMPAT</span>
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">mon_bin_compat_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span>
+    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cmd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">cmd</span><span class="p">)</span> <span class="p">{</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCX_GET32</span>:
+	<span class="k">case</span> <span class="n">MON_IOCX_GETX32</span>:
+		<span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mon_bin_get32</span> <span class="n">getb</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">getb</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">,</span>
+					    <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_get32</span><span class="p">)))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_get_event</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">,</span> <span class="n">compat_ptr</span><span class="p">(</span><span class="n">getb</span><span class="p">.</span><span class="n">hdr32</span><span class="p">),</span>
+		    <span class="p">(</span><span class="n">cmd</span> <span class="o">==</span> <span class="n">MON_IOCX_GET32</span><span class="p">)</span><span class="o">?</span> <span class="n">PKT_SZ_API0</span><span class="o">:</span> <span class="n">PKT_SZ_API1</span><span class="p">,</span>
+		    <span class="n">compat_ptr</span><span class="p">(</span><span class="n">getb</span><span class="p">.</span><span class="n">data32</span><span class="p">),</span> <span class="n">getb</span><span class="p">.</span><span class="n">alloc32</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCX_MFETCH32</span>:
+		<span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mon_bin_mfetch32</span> <span class="n">mfetch</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">mon_bin_mfetch32</span> <span class="n">__user</span> <span class="o">*</span><span class="n">uptr</span><span class="p">;</span>
+
+		<span class="n">uptr</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">mon_bin_mfetch32</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span> <span class="n">compat_ptr</span><span class="p">(</span><span class="n">arg</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mfetch</span><span class="p">,</span> <span class="n">uptr</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">mfetch</span><span class="p">)))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">mfetch</span><span class="p">.</span><span class="n">nflush32</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_flush</span><span class="p">(</span><span class="n">rp</span><span class="p">,</span> <span class="n">mfetch</span><span class="p">.</span><span class="n">nflush32</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uptr</span><span class="o">-&gt;</span><span class="n">nflush32</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mon_bin_fetch</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">rp</span><span class="p">,</span> <span class="n">compat_ptr</span><span class="p">(</span><span class="n">mfetch</span><span class="p">.</span><span class="n">offvec32</span><span class="p">),</span>
+		    <span class="n">mfetch</span><span class="p">.</span><span class="n">nfetch32</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">put_user</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uptr</span><span class="o">-&gt;</span><span class="n">nfetch32</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCG_STATS</span>:
+		<span class="k">return</span> <span class="n">mon_bin_ioctl</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">compat_ptr</span><span class="p">(</span><span class="n">arg</span><span class="p">));</span>
+
+	<span class="k">case</span> <span class="n">MON_IOCQ_URB_LEN</span>:
+	<span class="k">case</span> <span class="n">MON_IOCQ_RING_SIZE</span>:
+	<span class="k">case</span> <span class="n">MON_IOCT_RING_SIZE</span>:
+	<span class="k">case</span> <span class="n">MON_IOCH_MFLUSH</span>:
+		<span class="k">return</span> <span class="n">mon_bin_ioctl</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">arg</span><span class="p">);</span>
+
+	<span class="nl">default:</span>
+		<span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ENOTTY</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif </span><span class="cm">/* CONFIG_COMPAT */</span><span class="cp"></span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span>
+<span class="nf">mon_bin_poll</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">poll_table_struct</span> <span class="o">*</span><span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">mask</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_READ</span><span class="p">)</span>
+		<span class="n">poll_wait</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">,</span> <span class="n">wait</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">MON_RING_EMPTY</span><span class="p">(</span><span class="n">rp</span><span class="p">))</span>
+		<span class="n">mask</span> <span class="o">|=</span> <span class="n">POLLIN</span> <span class="o">|</span> <span class="n">POLLRDNORM</span><span class="p">;</span>    <span class="cm">/* readable */</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mask</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * open and close: just keep track of how many times the device is</span>
+<span class="cm"> * mapped, to use the proper memory allocation function.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_vma_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">mmap_active</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_bin_vma_close</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span><span class="p">;</span>
+	<span class="n">rp</span><span class="o">-&gt;</span><span class="n">mmap_active</span><span class="o">--</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Map ring pages to user space.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_vma_fault</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_fault</span> <span class="o">*</span><span class="n">vmf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">,</span> <span class="n">chunk_idx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">pageptr</span><span class="p">;</span>
+
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">vmf</span><span class="o">-&gt;</span><span class="n">pgoff</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_size</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">VM_FAULT_SIGBUS</span><span class="p">;</span>
+	<span class="n">chunk_idx</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">/</span> <span class="n">CHUNK_SIZE</span><span class="p">;</span>
+	<span class="n">pageptr</span> <span class="o">=</span> <span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_vec</span><span class="p">[</span><span class="n">chunk_idx</span><span class="p">].</span><span class="n">pg</span><span class="p">;</span>
+	<span class="n">get_page</span><span class="p">(</span><span class="n">pageptr</span><span class="p">);</span>
+	<span class="n">vmf</span><span class="o">-&gt;</span><span class="n">page</span> <span class="o">=</span> <span class="n">pageptr</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">vm_operations_struct</span> <span class="n">mon_bin_vm_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span>     <span class="n">mon_bin_vma_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">close</span> <span class="o">=</span>    <span class="n">mon_bin_vma_close</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">fault</span> <span class="o">=</span>    <span class="n">mon_bin_vma_fault</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_mmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* don&#39;t do anything here: &quot;fault&quot; will set up page table entries */</span>
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mon_bin_vm_ops</span><span class="p">;</span>
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_flags</span> <span class="o">|=</span> <span class="n">VM_RESERVED</span><span class="p">;</span>
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="n">mon_bin_vma_open</span><span class="p">(</span><span class="n">vma</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">mon_fops_binary</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span> <span class="o">=</span>	<span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span>		<span class="n">mon_bin_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span> <span class="o">=</span>	<span class="n">no_llseek</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span> <span class="o">=</span>		<span class="n">mon_bin_read</span><span class="p">,</span>
+	<span class="cm">/* .write =	mon_text_write, */</span>
+	<span class="p">.</span><span class="n">poll</span> <span class="o">=</span>		<span class="n">mon_bin_poll</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span> <span class="o">=</span> <span class="n">mon_bin_ioctl</span><span class="p">,</span>
+<span class="cp">#ifdef CONFIG_COMPAT</span>
+	<span class="p">.</span><span class="n">compat_ioctl</span> <span class="o">=</span>	<span class="n">mon_bin_compat_ioctl</span><span class="p">,</span>
+<span class="cp">#endif</span>
+	<span class="p">.</span><span class="n">release</span> <span class="o">=</span>	<span class="n">mon_bin_release</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mmap</span> <span class="o">=</span>		<span class="n">mon_bin_mmap</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_bin_wait_event</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mon_reader_bin</span> <span class="o">*</span><span class="n">rp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DECLARE_WAITQUEUE</span><span class="p">(</span><span class="n">waita</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">add_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">waita</span><span class="p">);</span>
+	<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">MON_RING_EMPTY</span><span class="p">(</span><span class="n">rp</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_NONBLOCK</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+			<span class="n">remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">waita</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EWOULDBLOCK</span><span class="p">;</span> <span class="cm">/* Same as EAGAIN in Linux */</span>
+		<span class="p">}</span>
+		<span class="n">schedule</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">signal_pending</span><span class="p">(</span><span class="n">current</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">waita</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+	<span class="n">remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rp</span><span class="o">-&gt;</span><span class="n">b_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">waita</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mon_alloc_buff</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span> <span class="kt">int</span> <span class="n">npages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">n</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">npages</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">vaddr</span> <span class="o">=</span> <span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">while</span> <span class="p">(</span><span class="n">n</span><span class="o">--</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">free_page</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">map</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">ptr</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">map</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">ptr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="n">vaddr</span><span class="p">;</span>
+		<span class="n">map</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">pg</span> <span class="o">=</span> <span class="n">virt_to_page</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mon_free_buff</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_pgmap</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span> <span class="kt">int</span> <span class="n">npages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">n</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">npages</span><span class="p">;</span> <span class="n">n</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">map</span><span class="p">[</span><span class="n">n</span><span class="p">].</span><span class="n">ptr</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">mon_bin_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bus</span> <span class="o">*</span><span class="n">mbus</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">usb_bus</span> <span class="o">*</span><span class="n">ubus</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">ubus</span><span class="o">?</span> <span class="n">ubus</span><span class="o">-&gt;</span><span class="n">busnum</span><span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">minor</span> <span class="o">&gt;=</span> <span class="n">MON_BIN_MAX_MINOR</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dev</span> <span class="o">=</span> <span class="n">device_create</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">,</span> <span class="n">ubus</span> <span class="o">?</span> <span class="n">ubus</span><span class="o">-&gt;</span><span class="n">controller</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">,</span>
+			    <span class="n">MKDEV</span><span class="p">(</span><span class="n">MAJOR</span><span class="p">(</span><span class="n">mon_bin_dev0</span><span class="p">),</span> <span class="n">minor</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">,</span>
+			    <span class="s">&quot;usbmon%d&quot;</span><span class="p">,</span> <span class="n">minor</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">mbus</span><span class="o">-&gt;</span><span class="n">classdev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">mon_bin_del</span><span class="p">(</span><span class="k">struct</span> <span class="n">mon_bus</span> <span class="o">*</span><span class="n">mbus</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">device_destroy</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">,</span> <span class="n">mbus</span><span class="o">-&gt;</span><span class="n">classdev</span><span class="o">-&gt;</span><span class="n">devt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="nf">mon_bin_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">mon_bin_class</span> <span class="o">=</span> <span class="n">class_create</span><span class="p">(</span><span class="n">THIS_MODULE</span><span class="p">,</span> <span class="s">&quot;usbmon&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err_class</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">alloc_chrdev_region</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_bin_dev0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">MON_BIN_MAX_MINOR</span><span class="p">,</span> <span class="s">&quot;usbmon&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_dev</span><span class="p">;</span>
+
+	<span class="n">cdev_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_bin_cdev</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mon_fops_binary</span><span class="p">);</span>
+	<span class="n">mon_bin_cdev</span><span class="p">.</span><span class="n">owner</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">cdev_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_bin_cdev</span><span class="p">,</span> <span class="n">mon_bin_dev0</span><span class="p">,</span> <span class="n">MON_BIN_MAX_MINOR</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_add</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">err_add:</span>
+	<span class="n">unregister_chrdev_region</span><span class="p">(</span><span class="n">mon_bin_dev0</span><span class="p">,</span> <span class="n">MON_BIN_MAX_MINOR</span><span class="p">);</span>
+<span class="nl">err_dev:</span>
+	<span class="n">class_destroy</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">);</span>
+<span class="nl">err_class:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">mon_bin_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cdev_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mon_bin_cdev</span><span class="p">);</span>
+	<span class="n">unregister_chrdev_region</span><span class="p">(</span><span class="n">mon_bin_dev0</span><span class="p">,</span> <span class="n">MON_BIN_MAX_MINOR</span><span class="p">);</span>
+	<span class="n">class_destroy</span><span class="p">(</span><span class="n">mon_bin_class</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

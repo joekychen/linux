@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › misc › sgi-xp › xpnet.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>xpnet.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * This file is subject to the terms and conditions of the GNU General Public</span>
+<span class="cm"> * License.  See the file &quot;COPYING&quot; in the main directory of this archive</span>
+<span class="cm"> * for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 1999-2009 Silicon Graphics, Inc. All rights reserved.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Cross Partition Network Interface (XPNET) support</span>
+<span class="cm"> *</span>
+<span class="cm"> *	XPNET provides a virtual network layered on top of the Cross</span>
+<span class="cm"> *	Partition communication layer.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	XPNET provides direct point-to-point and broadcast-like support</span>
+<span class="cm"> *	for an ethernet-like device.  The ethernet broadcast medium is</span>
+<span class="cm"> *	replaced with a point-to-point message structure which passes</span>
+<span class="cm"> *	pointers to a DMA-capable block that a remote partition should</span>
+<span class="cm"> *	retrieve and pass to the upper level networking layer.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/etherdevice.h&gt;</span>
+<span class="cp">#include &quot;xp.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The message payload transferred by XPC.</span>
+<span class="cm"> *</span>
+<span class="cm"> * buf_pa is the physical address where the DMA should pull from.</span>
+<span class="cm"> *</span>
+<span class="cm"> * NOTE: for performance reasons, buf_pa should _ALWAYS_ begin on a</span>
+<span class="cm"> * cacheline boundary.  To accomplish this, we record the number of</span>
+<span class="cm"> * bytes from the beginning of the first cacheline to the first useful</span>
+<span class="cm"> * byte of the skb (leadin_ignore) and the number of bytes from the</span>
+<span class="cm"> * last useful byte of the skb to the end of the last cacheline</span>
+<span class="cm"> * (tailout_ignore).</span>
+<span class="cm"> *</span>
+<span class="cm"> * size is the number of bytes to transfer which includes the skb-&gt;len</span>
+<span class="cm"> * (useful bytes of the senders skb) plus the leadin and tailout</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">xpnet_message</span> <span class="p">{</span>
+	<span class="n">u16</span> <span class="n">version</span><span class="p">;</span>		<span class="cm">/* Version for this message */</span>
+	<span class="n">u16</span> <span class="n">embedded_bytes</span><span class="p">;</span>	<span class="cm">/* #of bytes embedded in XPC message */</span>
+	<span class="n">u32</span> <span class="n">magic</span><span class="p">;</span>		<span class="cm">/* Special number indicating this is xpnet */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buf_pa</span><span class="p">;</span>	<span class="cm">/* phys address of buffer to retrieve */</span>
+	<span class="n">u32</span> <span class="n">size</span><span class="p">;</span>		<span class="cm">/* #of bytes in buffer */</span>
+	<span class="n">u8</span> <span class="n">leadin_ignore</span><span class="p">;</span>	<span class="cm">/* #of bytes to ignore at the beginning */</span>
+	<span class="n">u8</span> <span class="n">tailout_ignore</span><span class="p">;</span>	<span class="cm">/* #of bytes to ignore at the end */</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">data</span><span class="p">;</span>	<span class="cm">/* body of small packets */</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Determine the size of our message, the cacheline aligned size,</span>
+<span class="cm"> * and then the number of message will request from XPC.</span>
+<span class="cm"> *</span>
+<span class="cm"> * XPC expects each message to exist in an individual cacheline.</span>
+<span class="cm"> */</span>
+<span class="cp">#define XPNET_MSG_SIZE		XPC_MSG_PAYLOAD_MAX_SIZE</span>
+<span class="cp">#define XPNET_MSG_DATA_MAX	\</span>
+<span class="cp">		(XPNET_MSG_SIZE - offsetof(struct xpnet_message, data))</span>
+<span class="cp">#define XPNET_MSG_NENTRIES	(PAGE_SIZE / XPC_MSG_MAX_SIZE)</span>
+
+<span class="cp">#define XPNET_MAX_KTHREADS	(XPNET_MSG_NENTRIES + 1)</span>
+<span class="cp">#define XPNET_MAX_IDLE_KTHREADS	(XPNET_MSG_NENTRIES + 1)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Version number of XPNET implementation. XPNET can always talk to versions</span>
+<span class="cm"> * with same major #, and never talk to versions with a different version.</span>
+<span class="cm"> */</span>
+<span class="cp">#define _XPNET_VERSION(_major, _minor)	(((_major) &lt;&lt; 4) | (_minor))</span>
+<span class="cp">#define XPNET_VERSION_MAJOR(_v)		((_v) &gt;&gt; 4)</span>
+<span class="cp">#define XPNET_VERSION_MINOR(_v)		((_v) &amp; 0xf)</span>
+
+<span class="cp">#define	XPNET_VERSION _XPNET_VERSION(1, 0)	</span><span class="cm">/* version 1.0 */</span><span class="cp"></span>
+<span class="cp">#define	XPNET_VERSION_EMBED _XPNET_VERSION(1, 1)	</span><span class="cm">/* version 1.1 */</span><span class="cp"></span>
+<span class="cp">#define XPNET_MAGIC	0x88786984	</span><span class="cm">/* &quot;XNET&quot; */</span><span class="cp"></span>
+
+<span class="cp">#define XPNET_VALID_MSG(_m)						     \</span>
+<span class="cp">   ((XPNET_VERSION_MAJOR(_m-&gt;version) == XPNET_VERSION_MAJOR(XPNET_VERSION)) \</span>
+<span class="cp">    &amp;&amp; (msg-&gt;magic == XPNET_MAGIC))</span>
+
+<span class="cp">#define XPNET_DEVICE_NAME		&quot;xp0&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When messages are queued with xpc_send_notify, a kmalloc&#39;d buffer</span>
+<span class="cm"> * of the following type is passed as a notification cookie.  When the</span>
+<span class="cm"> * notification function is called, we use the cookie to decide</span>
+<span class="cm"> * whether all outstanding message sends have completed.  The skb can</span>
+<span class="cm"> * then be released.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">xpnet_pending_msg</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="n">atomic_t</span> <span class="n">use_count</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">xpnet_device</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When we are notified of other partitions activating, we add them to</span>
+<span class="cm"> * our bitmask of partitions to which we broadcast.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">xpnet_broadcast_partitions</span><span class="p">;</span>
+<span class="cm">/* protect above */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">xpnet_broadcast_lock</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Since the Block Transfer Engine (BTE) is being used for the transfer</span>
+<span class="cm"> * and it relies upon cache-line size transfers, we need to reserve at</span>
+<span class="cm"> * least one cache-line for head and tail alignment.  The BTE is</span>
+<span class="cm"> * limited to 8MB transfers.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Testing has shown that changing MTU to greater than 64KB has no effect</span>
+<span class="cm"> * on TCP as the two sides negotiate a Max Segment Size that is limited</span>
+<span class="cm"> * to 64K.  Other protocols May use packets greater than this, but for</span>
+<span class="cm"> * now, the default is 64KB.</span>
+<span class="cm"> */</span>
+<span class="cp">#define XPNET_MAX_MTU (0x800000UL - L1_CACHE_BYTES)</span>
+<span class="cm">/* 32KB has been determined to be the ideal */</span>
+<span class="cp">#define XPNET_DEF_MTU (0x8000UL)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The partid is encapsulated in the MAC address beginning in the following</span>
+<span class="cm"> * octet and it consists of two octets.</span>
+<span class="cm"> */</span>
+<span class="cp">#define XPNET_PARTID_OCTET	2</span>
+
+<span class="cm">/* Define the XPNET debug device structures to be used with dev_dbg() et al */</span>
+
+<span class="k">struct</span> <span class="n">device_driver</span> <span class="n">xpnet_dbg_name</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;xpnet&quot;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">device</span> <span class="n">xpnet_dbg_subname</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">init_name</span> <span class="o">=</span> <span class="s">&quot;&quot;</span><span class="p">,</span>	<span class="cm">/* set to &quot;&quot; */</span>
+	<span class="p">.</span><span class="n">driver</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">xpnet_dbg_name</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">xpnet</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">xpnet_dbg_subname</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Packet was recevied by XPC and forwarded to us.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">xpnet_receive</span><span class="p">(</span><span class="kt">short</span> <span class="n">partid</span><span class="p">,</span> <span class="kt">int</span> <span class="n">channel</span><span class="p">,</span> <span class="k">struct</span> <span class="n">xpnet_message</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">dst</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">xp_retval</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">XPNET_VALID_MSG</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Packet with a different XPC version.  Ignore.</span>
+<span class="cm">		 */</span>
+		<span class="n">xpc_received</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">channel</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="p">);</span>
+
+		<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">rx_errors</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;received 0x%lx, %d, %d, %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span>
+		<span class="n">msg</span><span class="o">-&gt;</span><span class="n">leadin_ignore</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">tailout_ignore</span><span class="p">);</span>
+
+	<span class="cm">/* reserve an extra cache line */</span>
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">dev_alloc_skb</span><span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">+</span> <span class="n">L1_CACHE_BYTES</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;failed on dev_alloc_skb(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">+</span> <span class="n">L1_CACHE_BYTES</span><span class="p">);</span>
+
+		<span class="n">xpc_received</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">channel</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="p">);</span>
+
+		<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">rx_errors</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The allocated skb has some reserved space.</span>
+<span class="cm">	 * In order to use xp_remote_memcpy(), we need to get the</span>
+<span class="cm">	 * skb-&gt;data pointer moved forward.</span>
+<span class="cm">	 */</span>
+	<span class="n">skb_reserve</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="p">(</span><span class="n">L1_CACHE_BYTES</span> <span class="o">-</span> <span class="p">((</span><span class="n">u64</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">&amp;</span>
+					    <span class="p">(</span><span class="n">L1_CACHE_BYTES</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="o">+</span>
+			  <span class="n">msg</span><span class="o">-&gt;</span><span class="n">leadin_ignore</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Update the tail pointer to indicate data actually</span>
+<span class="cm">	 * transferred.</span>
+<span class="cm">	 */</span>
+	<span class="n">skb_put</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">-</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">leadin_ignore</span> <span class="o">-</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">tailout_ignore</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Move the data over from the other side.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">XPNET_VERSION_MINOR</span><span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">version</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">embedded_bytes</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;copying embedded message. memcpy(0x%p, 0x%p, &quot;</span>
+			<span class="s">&quot;%lu)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">size_t</span><span class="p">)</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">embedded_bytes</span><span class="p">);</span>
+
+		<span class="n">skb_copy_to_linear_data</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span>
+					<span class="p">(</span><span class="kt">size_t</span><span class="p">)</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">embedded_bytes</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dst</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)((</span><span class="n">u64</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">L1_CACHE_BYTES</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;transferring buffer to the skb-&gt;data area;</span><span class="se">\n\t</span><span class="s">&quot;</span>
+			<span class="s">&quot;xp_remote_memcpy(0x%p, 0x%p, %hu)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span>
+					  <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">xp_remote_memcpy</span><span class="p">(</span><span class="n">xp_pa</span><span class="p">(</span><span class="n">dst</span><span class="p">),</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="n">xpSuccess</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * !!! Need better way of cleaning skb.  Currently skb</span>
+<span class="cm">			 * !!! appears in_use and we can&#39;t just call</span>
+<span class="cm">			 * !!! dev_kfree_skb.</span>
+<span class="cm">			 */</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;xp_remote_memcpy(0x%p, 0x%p, 0x%hx) &quot;</span>
+				<span class="s">&quot;returned error=0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+			<span class="n">xpc_received</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">channel</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="p">);</span>
+
+			<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">rx_errors</span><span class="o">++</span><span class="p">;</span>
+
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;&lt;skb-&gt;head=0x%p skb-&gt;data=0x%p skb-&gt;tail=0x%p &quot;</span>
+		<span class="s">&quot;skb-&gt;end=0x%p skb-&gt;len=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span> <span class="n">skb_end_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">eth_type_trans</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">xpnet_device</span><span class="p">);</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span> <span class="o">=</span> <span class="n">CHECKSUM_UNNECESSARY</span><span class="p">;</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;passing skb to network layer</span><span class="se">\n</span><span class="s">&quot;</span>
+		<span class="s">&quot;</span><span class="se">\t</span><span class="s">skb-&gt;head=0x%p skb-&gt;data=0x%p skb-&gt;tail=0x%p &quot;</span>
+		<span class="s">&quot;skb-&gt;end=0x%p skb-&gt;len=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span>
+		<span class="n">skb_end_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">rx_packets</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">rx_bytes</span> <span class="o">+=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">+</span> <span class="n">ETH_HLEN</span><span class="p">;</span>
+
+	<span class="n">netif_rx_ni</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">xpc_received</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">channel</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">msg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the handler which XPC calls during any sort of change in</span>
+<span class="cm"> * state or message reception on a connection.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">xpnet_connection_activity</span><span class="p">(</span><span class="k">enum</span> <span class="n">xp_retval</span> <span class="n">reason</span><span class="p">,</span> <span class="kt">short</span> <span class="n">partid</span><span class="p">,</span> <span class="kt">int</span> <span class="n">channel</span><span class="p">,</span>
+			  <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">key</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DBUG_ON</span><span class="p">(</span><span class="n">partid</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">partid</span> <span class="o">&gt;=</span> <span class="n">xp_max_npartitions</span><span class="p">);</span>
+	<span class="n">DBUG_ON</span><span class="p">(</span><span class="n">channel</span> <span class="o">!=</span> <span class="n">XPC_NET_CHANNEL</span><span class="p">);</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">reason</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">xpMsgReceived</span>:	<span class="cm">/* message received */</span>
+		<span class="n">DBUG_ON</span><span class="p">(</span><span class="n">data</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="n">xpnet_receive</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">channel</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_message</span> <span class="o">*</span><span class="p">)</span><span class="n">data</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">xpConnected</span>:	<span class="cm">/* connection completed to a partition */</span>
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xpnet_broadcast_lock</span><span class="p">);</span>
+		<span class="n">__set_bit</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">xpnet_broadcast_partitions</span><span class="p">);</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xpnet_broadcast_lock</span><span class="p">);</span>
+
+		<span class="n">netif_carrier_on</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;%s connected to partition %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">partid</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xpnet_broadcast_lock</span><span class="p">);</span>
+		<span class="n">__clear_bit</span><span class="p">(</span><span class="n">partid</span><span class="p">,</span> <span class="n">xpnet_broadcast_partitions</span><span class="p">);</span>
+		<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xpnet_broadcast_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">bitmap_empty</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="p">)</span><span class="n">xpnet_broadcast_partitions</span><span class="p">,</span>
+				 <span class="n">xp_max_npartitions</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">netif_carrier_off</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;%s disconnected from partition %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">partid</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">xpnet_dev_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">enum</span> <span class="n">xp_retval</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;calling xpc_connect(%d, 0x%p, NULL, %ld, %ld, %ld, &quot;</span>
+		<span class="s">&quot;%ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">XPC_NET_CHANNEL</span><span class="p">,</span> <span class="n">xpnet_connection_activity</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">XPNET_MSG_SIZE</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">XPNET_MSG_NENTRIES</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">XPNET_MAX_KTHREADS</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">XPNET_MAX_IDLE_KTHREADS</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">xpc_connect</span><span class="p">(</span><span class="n">XPC_NET_CHANNEL</span><span class="p">,</span> <span class="n">xpnet_connection_activity</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span>
+			  <span class="n">XPNET_MSG_SIZE</span><span class="p">,</span> <span class="n">XPNET_MSG_NENTRIES</span><span class="p">,</span>
+			  <span class="n">XPNET_MAX_KTHREADS</span><span class="p">,</span> <span class="n">XPNET_MAX_IDLE_KTHREADS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="n">xpSuccess</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;ifconfig up of %s failed on XPC connect, &quot;</span>
+			<span class="s">&quot;ret=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;ifconfig up of %s; XPC connected</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">xpnet_dev_stop</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">xpc_disconnect</span><span class="p">(</span><span class="n">XPC_NET_CHANNEL</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;ifconfig down of %s; XPC disconnected</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">xpnet_dev_change_mtu</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">int</span> <span class="n">new_mtu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* 68 comes from min TCP+IP+MAC header */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">new_mtu</span> <span class="o">&lt;</span> <span class="mi">68</span><span class="p">)</span> <span class="o">||</span> <span class="p">(</span><span class="n">new_mtu</span> <span class="o">&gt;</span> <span class="n">XPNET_MAX_MTU</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;ifconfig %s mtu %d failed; value must be &quot;</span>
+			<span class="s">&quot;between 68 and %ld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">new_mtu</span><span class="p">,</span>
+			<span class="n">XPNET_MAX_MTU</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">mtu</span> <span class="o">=</span> <span class="n">new_mtu</span><span class="p">;</span>
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;ifconfig %s mtu set to %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">new_mtu</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Notification that the other end has received the message and</span>
+<span class="cm"> * DMA&#39;d the skb information.  At this point, they are done with</span>
+<span class="cm"> * our side.  When all recipients are done processing, we</span>
+<span class="cm"> * release the skb and then release our pending message structure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">xpnet_send_completed</span><span class="p">(</span><span class="k">enum</span> <span class="n">xp_retval</span> <span class="n">reason</span><span class="p">,</span> <span class="kt">short</span> <span class="n">partid</span><span class="p">,</span> <span class="kt">int</span> <span class="n">channel</span><span class="p">,</span>
+		     <span class="kt">void</span> <span class="o">*</span><span class="n">__qm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xpnet_pending_msg</span> <span class="o">*</span><span class="n">queued_msg</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_pending_msg</span> <span class="o">*</span><span class="p">)</span><span class="n">__qm</span><span class="p">;</span>
+
+	<span class="n">DBUG_ON</span><span class="p">(</span><span class="n">queued_msg</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;message to %d notified with reason %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">partid</span><span class="p">,</span> <span class="n">reason</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">use_count</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;all acks for skb-&gt;head=-x%p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">);</span>
+
+		<span class="n">dev_kfree_skb_any</span><span class="p">(</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">queued_msg</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">xpnet_send</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">xpnet_pending_msg</span> <span class="o">*</span><span class="n">queued_msg</span><span class="p">,</span>
+	   <span class="n">u64</span> <span class="n">start_addr</span><span class="p">,</span> <span class="n">u64</span> <span class="n">end_addr</span><span class="p">,</span> <span class="n">u16</span> <span class="n">embedded_bytes</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dest_partid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u8</span> <span class="n">msg_buffer</span><span class="p">[</span><span class="n">XPNET_MSG_SIZE</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">xpnet_message</span> <span class="o">*</span><span class="n">msg</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_message</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">msg_buffer</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">msg_size</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_message</span><span class="p">);</span>
+	<span class="k">enum</span> <span class="n">xp_retval</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">embedded_bytes</span> <span class="o">=</span> <span class="n">embedded_bytes</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">embedded_bytes</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">msg</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">XPNET_VERSION_EMBED</span><span class="p">;</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;calling memcpy(0x%p, 0x%p, 0x%lx)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="o">&amp;</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="p">(</span><span class="kt">size_t</span><span class="p">)</span><span class="n">embedded_bytes</span><span class="p">);</span>
+		<span class="n">skb_copy_from_linear_data</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span>
+					  <span class="p">(</span><span class="kt">size_t</span><span class="p">)</span><span class="n">embedded_bytes</span><span class="p">);</span>
+		<span class="n">msg_size</span> <span class="o">+=</span> <span class="n">embedded_bytes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">msg</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">=</span> <span class="n">XPNET_VERSION</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">magic</span> <span class="o">=</span> <span class="n">XPNET_MAGIC</span><span class="p">;</span>
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">end_addr</span> <span class="o">-</span> <span class="n">start_addr</span><span class="p">;</span>
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">leadin_ignore</span> <span class="o">=</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">-</span> <span class="n">start_addr</span><span class="p">;</span>
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">tailout_ignore</span> <span class="o">=</span> <span class="n">end_addr</span> <span class="o">-</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span> <span class="o">=</span> <span class="n">xp_pa</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">start_addr</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;sending XPC message to %d:%d</span><span class="se">\n</span><span class="s">&quot;</span>
+		<span class="s">&quot;msg-&gt;buf_pa=0x%lx, msg-&gt;size=%u, &quot;</span>
+		<span class="s">&quot;msg-&gt;leadin_ignore=%u, msg-&gt;tailout_ignore=%u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">dest_partid</span><span class="p">,</span> <span class="n">XPC_NET_CHANNEL</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">buf_pa</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span>
+		<span class="n">msg</span><span class="o">-&gt;</span><span class="n">leadin_ignore</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">tailout_ignore</span><span class="p">);</span>
+
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">use_count</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">xpc_send_notify</span><span class="p">(</span><span class="n">dest_partid</span><span class="p">,</span> <span class="n">XPC_NET_CHANNEL</span><span class="p">,</span> <span class="n">XPC_NOWAIT</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span>
+			      <span class="n">msg_size</span><span class="p">,</span> <span class="n">xpnet_send_completed</span><span class="p">,</span> <span class="n">queued_msg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="n">xpSuccess</span><span class="p">))</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">use_count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Network layer has formatted a packet (skb) and is ready to place it</span>
+<span class="cm"> * &quot;on the wire&quot;.  Prepare and send an xpnet_message to all partitions</span>
+<span class="cm"> * which have connected with us and are targets of this packet.</span>
+<span class="cm"> *</span>
+<span class="cm"> * MAC-NOTE:  For the XPNET driver, the MAC address contains the</span>
+<span class="cm"> * destination partid.  If the destination partid octets are 0xffff,</span>
+<span class="cm"> * this packet is to be broadcast to all connected partitions.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">xpnet_dev_hard_start_xmit</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xpnet_pending_msg</span> <span class="o">*</span><span class="n">queued_msg</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">start_addr</span><span class="p">,</span> <span class="n">end_addr</span><span class="p">;</span>
+	<span class="kt">short</span> <span class="n">dest_partid</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">embedded_bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;&gt;skb-&gt;head=0x%p skb-&gt;data=0x%p skb-&gt;tail=0x%p &quot;</span>
+		<span class="s">&quot;skb-&gt;end=0x%p skb-&gt;len=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span> <span class="n">skb_end_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">),</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0x33</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">NETDEV_TX_OK</span><span class="p">;</span>	<span class="cm">/* nothing needed to be done */</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The xpnet_pending_msg tracks how many outstanding</span>
+<span class="cm">	 * xpc_send_notifies are relying on this skb.  When none</span>
+<span class="cm">	 * remain, release the skb.</span>
+<span class="cm">	 */</span>
+	<span class="n">queued_msg</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_pending_msg</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">queued_msg</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_warn</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;failed to kmalloc %ld bytes; dropping &quot;</span>
+			 <span class="s">&quot;packet</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">xpnet_pending_msg</span><span class="p">));</span>
+
+		<span class="n">dev</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">tx_errors</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">dev_kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">NETDEV_TX_OK</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* get the beginning of the first cacheline and end of last */</span>
+	<span class="n">start_addr</span> <span class="o">=</span> <span class="p">((</span><span class="n">u64</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">L1_CACHE_BYTES</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+	<span class="n">end_addr</span> <span class="o">=</span> <span class="n">L1_CACHE_ALIGN</span><span class="p">((</span><span class="n">u64</span><span class="p">)</span><span class="n">skb_tail_pointer</span><span class="p">(</span><span class="n">skb</span><span class="p">));</span>
+
+	<span class="cm">/* calculate how many bytes to embed in the XPC message */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">&lt;=</span> <span class="n">XPNET_MSG_DATA_MAX</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* skb-&gt;data does fit so embed */</span>
+		<span class="n">embedded_bytes</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Since the send occurs asynchronously, we set the count to one</span>
+<span class="cm">	 * and begin sending.  Any sends that happen to complete before</span>
+<span class="cm">	 * we are done sending will not free the skb.  We will be left</span>
+<span class="cm">	 * with that task during exit.  This also handles the case of</span>
+<span class="cm">	 * a packet destined for a partition which is no longer up.</span>
+<span class="cm">	 */</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">use_count</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">skb</span> <span class="o">=</span> <span class="n">skb</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0xff</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* we are being asked to broadcast to all partitions */</span>
+		<span class="n">for_each_set_bit</span><span class="p">(</span><span class="n">dest_partid</span><span class="p">,</span> <span class="n">xpnet_broadcast_partitions</span><span class="p">,</span>
+			     <span class="n">xp_max_npartitions</span><span class="p">)</span> <span class="p">{</span>
+
+			<span class="n">xpnet_send</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">queued_msg</span><span class="p">,</span> <span class="n">start_addr</span><span class="p">,</span> <span class="n">end_addr</span><span class="p">,</span>
+				   <span class="n">embedded_bytes</span><span class="p">,</span> <span class="n">dest_partid</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dest_partid</span> <span class="o">=</span> <span class="p">(</span><span class="kt">short</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="n">XPNET_PARTID_OCTET</span> <span class="o">+</span> <span class="mi">1</span><span class="p">];</span>
+		<span class="n">dest_partid</span> <span class="o">|=</span> <span class="p">(</span><span class="kt">short</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="n">XPNET_PARTID_OCTET</span> <span class="o">+</span> <span class="mi">0</span><span class="p">]</span> <span class="o">&lt;&lt;</span> <span class="mi">8</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">dest_partid</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">dest_partid</span> <span class="o">&lt;</span> <span class="n">xp_max_npartitions</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">test_bit</span><span class="p">(</span><span class="n">dest_partid</span><span class="p">,</span> <span class="n">xpnet_broadcast_partitions</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+
+			<span class="n">xpnet_send</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">queued_msg</span><span class="p">,</span> <span class="n">start_addr</span><span class="p">,</span> <span class="n">end_addr</span><span class="p">,</span>
+				   <span class="n">embedded_bytes</span><span class="p">,</span> <span class="n">dest_partid</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">tx_packets</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">tx_bytes</span> <span class="o">+=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queued_msg</span><span class="o">-&gt;</span><span class="n">use_count</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">queued_msg</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">NETDEV_TX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Deal with transmit timeouts coming from the network layer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">xpnet_dev_tx_timeout</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">tx_errors</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="n">xpnet_netdev_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">ndo_open</span>		<span class="o">=</span> <span class="n">xpnet_dev_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_stop</span>		<span class="o">=</span> <span class="n">xpnet_dev_stop</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_start_xmit</span>		<span class="o">=</span> <span class="n">xpnet_dev_hard_start_xmit</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_change_mtu</span>		<span class="o">=</span> <span class="n">xpnet_dev_change_mtu</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_tx_timeout</span>		<span class="o">=</span> <span class="n">xpnet_dev_tx_timeout</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_set_mac_address</span> 	<span class="o">=</span> <span class="n">eth_mac_addr</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ndo_validate_addr</span>	<span class="o">=</span> <span class="n">eth_validate_addr</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span>
+<span class="nf">xpnet_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">is_shub</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">is_uv</span><span class="p">())</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">dev_info</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;registering network device %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">XPNET_DEVICE_NAME</span><span class="p">);</span>
+
+	<span class="n">xpnet_broadcast_partitions</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">BITS_TO_LONGS</span><span class="p">(</span><span class="n">xp_max_npartitions</span><span class="p">)</span> <span class="o">*</span>
+					     <span class="k">sizeof</span><span class="p">(</span><span class="kt">long</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xpnet_broadcast_partitions</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * use ether_setup() to init the majority of our device</span>
+<span class="cm">	 * structure and then override the necessary pieces.</span>
+<span class="cm">	 */</span>
+	<span class="n">xpnet_device</span> <span class="o">=</span> <span class="n">alloc_netdev</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">XPNET_DEVICE_NAME</span><span class="p">,</span> <span class="n">ether_setup</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xpnet_device</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">xpnet_broadcast_partitions</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">netif_carrier_off</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">netdev_ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">xpnet_netdev_ops</span><span class="p">;</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">mtu</span> <span class="o">=</span> <span class="n">XPNET_DEF_MTU</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Multicast assumes the LSB of the first octet is set for multicast</span>
+<span class="cm">	 * MAC addresses.  We chose the first octet of the MAC to be unlikely</span>
+<span class="cm">	 * to collide with any vendor&#39;s officially issued MAC.</span>
+<span class="cm">	 */</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mh">0x02</span><span class="p">;</span>     <span class="cm">/* locally administered, no OUI */</span>
+
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">[</span><span class="n">XPNET_PARTID_OCTET</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">xp_partition_id</span><span class="p">;</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">[</span><span class="n">XPNET_PARTID_OCTET</span> <span class="o">+</span> <span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">xp_partition_id</span> <span class="o">&gt;&gt;</span> <span class="mi">8</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * ether_setup() sets this to a multicast device.  We are</span>
+<span class="cm">	 * really not supporting multicast at this time.</span>
+<span class="cm">	 */</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">IFF_MULTICAST</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * No need to checksum as it is a DMA transfer.  The BTE will</span>
+<span class="cm">	 * report an error if the data is not retrievable and the</span>
+<span class="cm">	 * packet will be dropped.</span>
+<span class="cm">	 */</span>
+	<span class="n">xpnet_device</span><span class="o">-&gt;</span><span class="n">features</span> <span class="o">=</span> <span class="n">NETIF_F_HW_CSUM</span><span class="p">;</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">register_netdev</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">free_netdev</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">xpnet_broadcast_partitions</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">xpnet_init</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span>
+<span class="nf">xpnet_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dev_info</span><span class="p">(</span><span class="n">xpnet</span><span class="p">,</span> <span class="s">&quot;unregistering network device %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">xpnet_device</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="n">unregister_netdev</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+	<span class="n">free_netdev</span><span class="p">(</span><span class="n">xpnet_device</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">xpnet_broadcast_partitions</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_exit</span><span class="p">(</span><span class="n">xpnet_exit</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Silicon Graphics, Inc.&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Cross Partition Network adapter (XPNET)&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

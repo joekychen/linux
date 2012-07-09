@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › sched › sch_plug.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>sch_plug.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * sch_plug.c Queue traffic until an explicit release command</span>
+<span class="cm"> *</span>
+<span class="cm"> *             This program is free software; you can redistribute it and/or</span>
+<span class="cm"> *             modify it under the terms of the GNU General Public License</span>
+<span class="cm"> *             as published by the Free Software Foundation; either version</span>
+<span class="cm"> *             2 of the License, or (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There are two ways to use this qdisc:</span>
+<span class="cm"> * 1. A simple &quot;instantaneous&quot; plug/unplug operation, by issuing an alternating</span>
+<span class="cm"> *    sequence of TCQ_PLUG_BUFFER &amp; TCQ_PLUG_RELEASE_INDEFINITE commands.</span>
+<span class="cm"> *</span>
+<span class="cm"> * 2. For network output buffering (a.k.a output commit) functionality.</span>
+<span class="cm"> *    Output commit property is commonly used by applications using checkpoint</span>
+<span class="cm"> *    based fault-tolerance to ensure that the checkpoint from which a system</span>
+<span class="cm"> *    is being restored is consistent w.r.t outside world.</span>
+<span class="cm"> *</span>
+<span class="cm"> *    Consider for e.g. Remus - a Virtual Machine checkpointing system,</span>
+<span class="cm"> *    wherein a VM is checkpointed, say every 50ms. The checkpoint is replicated</span>
+<span class="cm"> *    asynchronously to the backup host, while the VM continues executing the</span>
+<span class="cm"> *    next epoch speculatively.</span>
+<span class="cm"> *</span>
+<span class="cm"> *    The following is a typical sequence of output buffer operations:</span>
+<span class="cm"> *       1.At epoch i, start_buffer(i)</span>
+<span class="cm"> *       2. At end of epoch i (i.e. after 50ms):</span>
+<span class="cm"> *          2.1 Stop VM and take checkpoint(i).</span>
+<span class="cm"> *          2.2 start_buffer(i+1) and Resume VM</span>
+<span class="cm"> *       3. While speculatively executing epoch(i+1), asynchronously replicate</span>
+<span class="cm"> *          checkpoint(i) to backup host.</span>
+<span class="cm"> *       4. When checkpoint_ack(i) is received from backup, release_buffer(i)</span>
+<span class="cm"> *    Thus, this Qdisc would receive the following sequence of commands:</span>
+<span class="cm"> *       TCQ_PLUG_BUFFER (epoch i)</span>
+<span class="cm"> *       .. TCQ_PLUG_BUFFER (epoch i+1)</span>
+<span class="cm"> *       ....TCQ_PLUG_RELEASE_ONE (epoch i)</span>
+<span class="cm"> *       ......TCQ_PLUG_BUFFER (epoch i+2)</span>
+<span class="cm"> *       ........</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;net/pkt_sched.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * State of the queue, when used for network output buffering:</span>
+<span class="cm"> *</span>
+<span class="cm"> *                 plug(i+1)            plug(i)          head</span>
+<span class="cm"> * ------------------+--------------------+----------------&gt;</span>
+<span class="cm"> *                   |                    |</span>
+<span class="cm"> *                   |                    |</span>
+<span class="cm"> * pkts_current_epoch| pkts_last_epoch    |pkts_to_release</span>
+<span class="cm"> * -----------------&gt;|&lt;--------+---------&gt;|+---------------&gt;</span>
+<span class="cm"> *                   v                    v</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">plug_sched_data</span> <span class="p">{</span>
+	<span class="cm">/* If true, the dequeue function releases all packets</span>
+<span class="cm">	 * from head to end of the queue. The queue turns into</span>
+<span class="cm">	 * a pass-through queue for newly arriving packets.</span>
+<span class="cm">	 */</span>
+	<span class="n">bool</span> <span class="n">unplug_indefinite</span><span class="p">;</span>
+
+	<span class="cm">/* Queue Limit in bytes */</span>
+	<span class="n">u32</span> <span class="n">limit</span><span class="p">;</span>
+
+	<span class="cm">/* Number of packets (output) from the current speculatively</span>
+<span class="cm">	 * executing epoch.</span>
+<span class="cm">	 */</span>
+	<span class="n">u32</span> <span class="n">pkts_current_epoch</span><span class="p">;</span>
+
+	<span class="cm">/* Number of packets corresponding to the recently finished</span>
+<span class="cm">	 * epoch. These will be released when we receive a</span>
+<span class="cm">	 * TCQ_PLUG_RELEASE_ONE command. This command is typically</span>
+<span class="cm">	 * issued after committing a checkpoint at the target.</span>
+<span class="cm">	 */</span>
+	<span class="n">u32</span> <span class="n">pkts_last_epoch</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Number of packets from the head of the queue, that can</span>
+<span class="cm">	 * be released (committed checkpoint).</span>
+<span class="cm">	 */</span>
+	<span class="n">u32</span> <span class="n">pkts_to_release</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">plug_enqueue</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">plug_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">+</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">&lt;=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span><span class="p">)</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_current_epoch</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">qdisc_enqueue_tail</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">qdisc_reshape_fail</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">plug_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">plug_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">qdisc_is_throttled</span><span class="p">(</span><span class="n">sch</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_to_release</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* No more packets to dequeue. Block the queue</span>
+<span class="cm">			 * and wait for the next release command.</span>
+<span class="cm">			 */</span>
+			<span class="n">qdisc_throttled</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_to_release</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">qdisc_dequeue_head</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">plug_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">plug_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_current_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_last_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_to_release</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* We will set a default limit of 100 pkts (~150kB)</span>
+<span class="cm">		 * in case tx_queue_len is not available. The</span>
+<span class="cm">		 * default value is completely arbitrary.</span>
+<span class="cm">		 */</span>
+		<span class="n">u32</span> <span class="n">pkt_limit</span> <span class="o">=</span> <span class="n">qdisc_dev</span><span class="p">(</span><span class="n">sch</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">tx_queue_len</span> <span class="o">?</span> <span class="o">:</span> <span class="mi">100</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">pkt_limit</span> <span class="o">*</span> <span class="n">psched_mtu</span><span class="p">(</span><span class="n">qdisc_dev</span><span class="p">(</span><span class="n">sch</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">tc_plug_qopt</span> <span class="o">*</span><span class="n">ctl</span> <span class="o">=</span> <span class="n">nla_data</span><span class="p">(</span><span class="n">opt</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nla_len</span><span class="p">(</span><span class="n">opt</span><span class="p">)</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ctl</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">qdisc_throttled</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Receives 4 types of messages:</span>
+<span class="cm"> * TCQ_PLUG_BUFFER: Inset a plug into the queue and</span>
+<span class="cm"> *  buffer any incoming packets</span>
+<span class="cm"> * TCQ_PLUG_RELEASE_ONE: Dequeue packets from queue head</span>
+<span class="cm"> *   to beginning of the next plug.</span>
+<span class="cm"> * TCQ_PLUG_RELEASE_INDEFINITE: Dequeue all packets from queue.</span>
+<span class="cm"> *   Stop buffering packets until the next TCQ_PLUG_BUFFER</span>
+<span class="cm"> *   command is received (just act as a pass-thru queue).</span>
+<span class="cm"> * TCQ_PLUG_LIMIT: Increase/decrease queue size</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">plug_change</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">plug_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tc_plug_qopt</span> <span class="o">*</span><span class="n">msg</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">msg</span> <span class="o">=</span> <span class="n">nla_data</span><span class="p">(</span><span class="n">opt</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nla_len</span><span class="p">(</span><span class="n">opt</span><span class="p">)</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">msg</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">action</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">TCQ_PLUG_BUFFER</span>:
+		<span class="cm">/* Save size of the current buffer */</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_last_epoch</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_current_epoch</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_current_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span><span class="p">)</span>
+			<span class="n">qdisc_throttled</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">TCQ_PLUG_RELEASE_ONE</span>:
+		<span class="cm">/* Add packets from the last complete buffer to the</span>
+<span class="cm">		 * packets to be released set.</span>
+<span class="cm">		 */</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_to_release</span> <span class="o">+=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_last_epoch</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_last_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">qdisc_unthrottled</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+		<span class="n">netif_schedule_queue</span><span class="p">(</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">dev_queue</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">TCQ_PLUG_RELEASE_INDEFINITE</span>:
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">unplug_indefinite</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_to_release</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_last_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">pkts_current_epoch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">qdisc_unthrottled</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+		<span class="n">netif_schedule_queue</span><span class="p">(</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">dev_queue</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">TCQ_PLUG_LIMIT</span>:
+		<span class="cm">/* Limit is supplied in bytes */</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">Qdisc_ops</span> <span class="n">plug_qdisc_ops</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">id</span>          <span class="o">=</span>       <span class="s">&quot;plug&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">priv_size</span>   <span class="o">=</span>       <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">plug_sched_data</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">enqueue</span>     <span class="o">=</span>       <span class="n">plug_enqueue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dequeue</span>     <span class="o">=</span>       <span class="n">plug_dequeue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">peek</span>        <span class="o">=</span>       <span class="n">qdisc_peek_head</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">init</span>        <span class="o">=</span>       <span class="n">plug_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">change</span>      <span class="o">=</span>       <span class="n">plug_change</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">owner</span>       <span class="o">=</span>       <span class="n">THIS_MODULE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">plug_module_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">register_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">plug_module_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unregister_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">module_init</span><span class="p">(</span><span class="n">plug_module_init</span><span class="p">)</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">plug_module_exit</span><span class="p">)</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

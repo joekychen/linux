@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › char › tpm › tpm.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>tpm.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2004 IBM Corporation</span>
+<span class="cm"> *</span>
+<span class="cm"> * Authors:</span>
+<span class="cm"> * Leendert van Doorn &lt;leendert@watson.ibm.com&gt;</span>
+<span class="cm"> * Dave Safford &lt;safford@watson.ibm.com&gt;</span>
+<span class="cm"> * Reiner Sailer &lt;sailer@watson.ibm.com&gt;</span>
+<span class="cm"> * Kylene Hall &lt;kjhall@us.ibm.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * Maintained by: &lt;tpmdd-devel@lists.sourceforge.net&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * Device driver for TCG/TCPA TPM (trusted platform module).</span>
+<span class="cm"> * Specifications at www.trustedcomputinggroup.org	 </span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public License as</span>
+<span class="cm"> * published by the Free Software Foundation, version 2 of the</span>
+<span class="cm"> * License.</span>
+<span class="cm"> * </span>
+<span class="cm"> * Note, the TPM chip is not interrupt driven (only polling)</span>
+<span class="cm"> * and can have very long timeouts (minutes!). Hence the unusual</span>
+<span class="cm"> * calls to msleep.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/poll.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+
+<span class="cp">#include &quot;tpm.h&quot;</span>
+
+<span class="k">enum</span> <span class="n">tpm_const</span> <span class="p">{</span>
+	<span class="n">TPM_MINOR</span> <span class="o">=</span> <span class="mi">224</span><span class="p">,</span>	<span class="cm">/* officially assigned */</span>
+	<span class="n">TPM_BUFSIZE</span> <span class="o">=</span> <span class="mi">4096</span><span class="p">,</span>
+	<span class="n">TPM_NUM_DEVICES</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">enum</span> <span class="n">tpm_duration</span> <span class="p">{</span>
+	<span class="n">TPM_SHORT</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cp">#define TPM_MAX_ORDINAL 243</span>
+<span class="cp">#define TPM_MAX_PROTECTED_ORDINAL 12</span>
+<span class="cp">#define TPM_PROTECTED_ORDINAL_MASK 0xFF</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Bug workaround - some TPM&#39;s don&#39;t flush the most</span>
+<span class="cm"> * recently changed pcr on suspend, so force the flush</span>
+<span class="cm"> * with an extend to the selected _unused_ non-volatile pcr.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">tpm_suspend_pcr</span><span class="p">;</span>
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">suspend_pcr</span><span class="p">,</span> <span class="n">tpm_suspend_pcr</span><span class="p">,</span> <span class="n">uint</span><span class="p">,</span> <span class="mo">0644</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">suspend_pcr</span><span class="p">,</span>
+		 <span class="s">&quot;PCR to use for dummy writes to faciltate flush on suspend.&quot;</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">tpm_chip_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">driver_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_BITMAP</span><span class="p">(</span><span class="n">dev_mask</span><span class="p">,</span> <span class="n">TPM_NUM_DEVICES</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Array with one entry per ordinal defining the maximum amount</span>
+<span class="cm"> * of time the chip could take to return the result.  The ordinal</span>
+<span class="cm"> * designation of short, medium or long is defined in a table in</span>
+<span class="cm"> * TCG Specification TPM Main Part 2 TPM Structures Section 17. The</span>
+<span class="cm"> * values of the SHORT, MEDIUM, and LONG durations are retrieved</span>
+<span class="cm"> * from the chip during initialization with a call to tpm_get_timeouts.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">const</span> <span class="n">u8</span> <span class="n">tpm_protected_ordinal_duration</span><span class="p">[</span><span class="n">TPM_MAX_PROTECTED_ORDINAL</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 0 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 5 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 10 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="n">u8</span> <span class="n">tpm_ordinal_duration</span><span class="p">[</span><span class="n">TPM_MAX_ORDINAL</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 0 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 5 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 10 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 15 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 20 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 25 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 30 */</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 35 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 40 */</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 45 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 50 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 55 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 60 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 65 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 70 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 75 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>		<span class="cm">/* 80 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 85 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 90 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 95 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 100 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 105 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 110 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 115 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>		<span class="cm">/* 120 */</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 125 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 130 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 135 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 140 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 145 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 150 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 155 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 160 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 165 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>		<span class="cm">/* 170 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 175 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 180 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 185 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 190 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 195 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 200 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 205 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>		<span class="cm">/* 210 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 215 */</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 220 */</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 225 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 230 */</span>
+	<span class="n">TPM_LONG</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>		<span class="cm">/* 235 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_SHORT</span><span class="p">,</span>		<span class="cm">/* 240 */</span>
+	<span class="n">TPM_UNDEFINED</span><span class="p">,</span>
+	<span class="n">TPM_MEDIUM</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">user_reader_timeout</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ptr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="p">)</span> <span class="n">ptr</span><span class="p">;</span>
+
+	<span class="n">schedule_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">timeout_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tpm_chip</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">TPM_BUFSIZE</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Returns max number of jiffies to wait</span>
+<span class="cm"> */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">tpm_calc_ordinal_duration</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">,</span>
+					   <span class="n">u32</span> <span class="n">ordinal</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">duration_idx</span> <span class="o">=</span> <span class="n">TPM_UNDEFINED</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">duration</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ordinal</span> <span class="o">&lt;</span> <span class="n">TPM_MAX_ORDINAL</span><span class="p">)</span>
+		<span class="n">duration_idx</span> <span class="o">=</span> <span class="n">tpm_ordinal_duration</span><span class="p">[</span><span class="n">ordinal</span><span class="p">];</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">((</span><span class="n">ordinal</span> <span class="o">&amp;</span> <span class="n">TPM_PROTECTED_ORDINAL_MASK</span><span class="p">)</span> <span class="o">&lt;</span>
+		 <span class="n">TPM_MAX_PROTECTED_ORDINAL</span><span class="p">)</span>
+		<span class="n">duration_idx</span> <span class="o">=</span>
+		    <span class="n">tpm_protected_ordinal_duration</span><span class="p">[</span><span class="n">ordinal</span> <span class="o">&amp;</span>
+						   <span class="n">TPM_PROTECTED_ORDINAL_MASK</span><span class="p">];</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration_idx</span> <span class="o">!=</span> <span class="n">TPM_UNDEFINED</span><span class="p">)</span>
+		<span class="n">duration</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">duration_idx</span><span class="p">];</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">duration</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">60</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="n">duration</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_calc_ordinal_duration</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Internal kernel interface to transmit TPM commands</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">tpm_transmit</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+			    <span class="kt">size_t</span> <span class="n">bufsiz</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">count</span><span class="p">,</span> <span class="n">ordinal</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">stop</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bufsiz</span> <span class="o">&gt;</span> <span class="n">TPM_BUFSIZE</span><span class="p">)</span>
+		<span class="n">bufsiz</span> <span class="o">=</span> <span class="n">TPM_BUFSIZE</span><span class="p">;</span>
+
+	<span class="n">count</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="o">*</span><span class="p">((</span><span class="n">__be32</span> <span class="o">*</span><span class="p">)</span> <span class="p">(</span><span class="n">buf</span> <span class="o">+</span> <span class="mi">2</span><span class="p">)));</span>
+	<span class="n">ordinal</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="o">*</span><span class="p">((</span><span class="n">__be32</span> <span class="o">*</span><span class="p">)</span> <span class="p">(</span><span class="n">buf</span> <span class="o">+</span> <span class="mi">6</span><span class="p">)));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODATA</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">bufsiz</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+			<span class="s">&quot;invalid count value %x %zx </span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">count</span><span class="p">,</span> <span class="n">bufsiz</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">E2BIG</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">tpm_mutex</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rc</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">send</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span> <span class="n">buf</span><span class="p">,</span> <span class="n">count</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+			<span class="s">&quot;tpm_transmit: tpm_send: error %zd</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">irq</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_recv</span><span class="p">;</span>
+
+	<span class="n">stop</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">tpm_calc_ordinal_duration</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">ordinal</span><span class="p">);</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">u8</span> <span class="n">status</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">status</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">status</span> <span class="o">&amp;</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">req_complete_mask</span><span class="p">)</span> <span class="o">==</span>
+		    <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">req_complete_val</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out_recv</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="n">status</span> <span class="o">==</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">req_canceled</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Operation Canceled</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ECANCELED</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">msleep</span><span class="p">(</span><span class="n">TPM_TIMEOUT</span><span class="p">);</span>	<span class="cm">/* CHECK */</span>
+		<span class="n">rmb</span><span class="p">();</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">stop</span><span class="p">));</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">cancel</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Operation Timed out</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ETIME</span><span class="p">;</span>
+	<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+<span class="nl">out_recv:</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">recv</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span> <span class="n">buf</span><span class="p">,</span> <span class="n">bufsiz</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+			<span class="s">&quot;tpm_transmit: tpm_recv: error %zd</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">tpm_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define TPM_DIGEST_SIZE 20</span>
+<span class="cp">#define TPM_RET_CODE_IDX 6</span>
+
+<span class="k">enum</span> <span class="n">tpm_capabilities</span> <span class="p">{</span>
+	<span class="n">TPM_CAP_FLAG</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">4</span><span class="p">),</span>
+	<span class="n">TPM_CAP_PROP</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">5</span><span class="p">),</span>
+	<span class="n">CAP_VERSION_1_1</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x06</span><span class="p">),</span>
+	<span class="n">CAP_VERSION_1_2</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x1A</span><span class="p">)</span>
+<span class="p">};</span>
+
+<span class="k">enum</span> <span class="n">tpm_sub_capabilities</span> <span class="p">{</span>
+	<span class="n">TPM_CAP_PROP_PCR</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x101</span><span class="p">),</span>
+	<span class="n">TPM_CAP_PROP_MANUFACTURER</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x103</span><span class="p">),</span>
+	<span class="n">TPM_CAP_FLAG_PERM</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x108</span><span class="p">),</span>
+	<span class="n">TPM_CAP_FLAG_VOL</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x109</span><span class="p">),</span>
+	<span class="n">TPM_CAP_PROP_OWNER</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x111</span><span class="p">),</span>
+	<span class="n">TPM_CAP_PROP_TIS_TIMEOUT</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x115</span><span class="p">),</span>
+	<span class="n">TPM_CAP_PROP_TIS_DURATION</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mh">0x120</span><span class="p">),</span>
+
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">transmit_cmd</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="o">*</span><span class="n">cmd</span><span class="p">,</span>
+			    <span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">desc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">tpm_transmit</span><span class="p">(</span><span class="n">chip</span><span class="p">,(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span>  <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span> <span class="n">TPM_HEADER_SIZE</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">cmd</span><span class="o">-&gt;</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">.</span><span class="n">return_code</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;A TPM error (%d) occurred %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">err</span><span class="p">,</span> <span class="n">desc</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define TPM_INTERNAL_RESULT_SIZE 200</span>
+<span class="cp">#define TPM_TAG_RQU_COMMAND cpu_to_be16(193)</span>
+<span class="cp">#define TPM_ORD_GET_CAP cpu_to_be32(101)</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">tpm_getcap_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">22</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">TPM_ORD_GET_CAP</span>
+<span class="p">};</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_getcap</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">__be32</span> <span class="n">subcap_id</span><span class="p">,</span> <span class="n">cap_t</span> <span class="o">*</span><span class="n">cap</span><span class="p">,</span>
+		   <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">desc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">tpm_cmd</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">tpm_getcap_header</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">subcap_id</span> <span class="o">==</span> <span class="n">CAP_VERSION_1_1</span> <span class="o">||</span> <span class="n">subcap_id</span> <span class="o">==</span> <span class="n">CAP_VERSION_1_2</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">subcap_id</span><span class="p">;</span>
+		<span class="cm">/*subcap field not necessary */</span>
+		<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap_size</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+		<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span><span class="p">.</span><span class="n">length</span> <span class="o">-=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">__be32</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">subcap_id</span> <span class="o">==</span> <span class="n">TPM_CAP_FLAG_PERM</span> <span class="o">||</span>
+		    <span class="n">subcap_id</span> <span class="o">==</span> <span class="n">TPM_CAP_FLAG_VOL</span><span class="p">)</span>
+			<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">TPM_CAP_FLAG</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP</span><span class="p">;</span>
+		<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap_size</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">4</span><span class="p">);</span>
+		<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap</span> <span class="o">=</span> <span class="n">subcap_id</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">,</span> <span class="n">TPM_INTERNAL_RESULT_SIZE</span><span class="p">,</span> <span class="n">desc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rc</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">cap</span> <span class="o">=</span> <span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_out</span><span class="p">.</span><span class="n">cap</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">tpm_gen_interrupt</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span>	<span class="n">tpm_cmd_t</span> <span class="n">tpm_cmd</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">tpm_getcap_header</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap_size</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">4</span><span class="p">);</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP_TIS_TIMEOUT</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">,</span> <span class="n">TPM_INTERNAL_RESULT_SIZE</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the timeouts&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_gen_interrupt</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">tpm_get_timeouts</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">tpm_cmd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timeout_t</span> <span class="o">*</span><span class="n">timeout_cap</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">duration_t</span> <span class="o">*</span><span class="n">duration_cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">timeout</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">scale</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">tpm_getcap_header</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap_size</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">4</span><span class="p">);</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP_TIS_TIMEOUT</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">,</span> <span class="n">TPM_INTERNAL_RESULT_SIZE</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the timeouts&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">duration</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">.</span><span class="n">return_code</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">||</span>
+	    <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">.</span><span class="n">length</span><span class="p">)</span>
+	    <span class="o">!=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">)</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">)</span> <span class="o">+</span> <span class="mi">4</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">timeout_cap</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_out</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">timeout</span><span class="p">;</span>
+	<span class="cm">/* Don&#39;t overwrite default if value is 0 */</span>
+	<span class="n">timeout</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">timeout_cap</span><span class="o">-&gt;</span><span class="n">a</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span> <span class="o">&amp;&amp;</span> <span class="n">timeout</span> <span class="o">&lt;</span> <span class="mi">1000</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* timeouts in msec rather usec */</span>
+		<span class="n">scale</span> <span class="o">=</span> <span class="mi">1000</span><span class="p">;</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_adjusted</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_a</span> <span class="o">=</span> <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">timeout</span> <span class="o">*</span> <span class="n">scale</span><span class="p">);</span>
+	<span class="n">timeout</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">timeout_cap</span><span class="o">-&gt;</span><span class="n">b</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_b</span> <span class="o">=</span> <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">timeout</span> <span class="o">*</span> <span class="n">scale</span><span class="p">);</span>
+	<span class="n">timeout</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">timeout_cap</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_c</span> <span class="o">=</span> <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">timeout</span> <span class="o">*</span> <span class="n">scale</span><span class="p">);</span>
+	<span class="n">timeout</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">timeout_cap</span><span class="o">-&gt;</span><span class="n">d</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_d</span> <span class="o">=</span> <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">timeout</span> <span class="o">*</span> <span class="n">scale</span><span class="p">);</span>
+
+<span class="nl">duration:</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">tpm_getcap_header</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">cap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP</span><span class="p">;</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap_size</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">4</span><span class="p">);</span>
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_in</span><span class="p">.</span><span class="n">subcap</span> <span class="o">=</span> <span class="n">TPM_CAP_PROP_TIS_DURATION</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">,</span> <span class="n">TPM_INTERNAL_RESULT_SIZE</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the durations&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">.</span><span class="n">return_code</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">||</span>
+	    <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">.</span><span class="n">length</span><span class="p">)</span>
+	    <span class="o">!=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">out</span><span class="p">)</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">)</span> <span class="o">+</span> <span class="mi">3</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">duration_cap</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">getcap_out</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">duration</span><span class="p">;</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_SHORT</span><span class="p">]</span> <span class="o">=</span>
+	    <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">duration_cap</span><span class="o">-&gt;</span><span class="n">tpm_short</span><span class="p">));</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_MEDIUM</span><span class="p">]</span> <span class="o">=</span>
+	    <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">duration_cap</span><span class="o">-&gt;</span><span class="n">tpm_medium</span><span class="p">));</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_LONG</span><span class="p">]</span> <span class="o">=</span>
+	    <span class="n">usecs_to_jiffies</span><span class="p">(</span><span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">duration_cap</span><span class="o">-&gt;</span><span class="n">tpm_long</span><span class="p">));</span>
+
+	<span class="cm">/* The Broadcom BCM0102 chipset in a Dell Latitude D820 gets the above</span>
+<span class="cm">	 * value wrong and apparently reports msecs rather than usecs. So we</span>
+<span class="cm">	 * fix up the resulting too-small TPM_SHORT value to make things work.</span>
+<span class="cm">	 * We also scale the TPM_MEDIUM and -_LONG values by 1000.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_SHORT</span><span class="p">]</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">HZ</span> <span class="o">/</span> <span class="mi">100</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_SHORT</span><span class="p">]</span> <span class="o">=</span> <span class="n">HZ</span><span class="p">;</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_MEDIUM</span><span class="p">]</span> <span class="o">*=</span> <span class="mi">1000</span><span class="p">;</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_LONG</span><span class="p">]</span> <span class="o">*=</span> <span class="mi">1000</span><span class="p">;</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration_adjusted</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="n">dev_info</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Adjusting TPM timeout parameters.&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_get_timeouts</span><span class="p">);</span>
+
+<span class="cp">#define TPM_ORD_CONTINUE_SELFTEST 83</span>
+<span class="cp">#define CONTINUE_SELFTEST_RESULT_SIZE 10</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">continue_selftest_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">TPM_ORD_CONTINUE_SELFTEST</span><span class="p">),</span>
+<span class="p">};</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * tpm_continue_selftest -- run TPM&#39;s selftest</span>
+<span class="cm"> * @chip: TPM chip to use</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, &lt; 0 in case of fatal error or a value &gt; 0 representing</span>
+<span class="cm"> * a TPM error code.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tpm_continue_selftest</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">cmd</span><span class="p">;</span>
+
+	<span class="n">cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">continue_selftest_header</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cmd</span><span class="p">,</span> <span class="n">CONTINUE_SELFTEST_RESULT_SIZE</span><span class="p">,</span>
+			  <span class="s">&quot;continue selftest&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_enabled</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span> <span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span> <span class="n">attr</span><span class="p">,</span>
+			<span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_FLAG_PERM</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			 <span class="s">&quot;attempting to determine the permanent enabled state&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">!</span><span class="n">cap</span><span class="p">.</span><span class="n">perm_flags</span><span class="p">.</span><span class="n">disable</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_enabled</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_active</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span> <span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span> <span class="n">attr</span><span class="p">,</span>
+			<span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_FLAG_PERM</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			 <span class="s">&quot;attempting to determine the permanent active state&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">!</span><span class="n">cap</span><span class="p">.</span><span class="n">perm_flags</span><span class="p">.</span><span class="n">deactivated</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_active</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_owned</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span> <span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span> <span class="n">attr</span><span class="p">,</span>
+			<span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_PROP_OWNER</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			 <span class="s">&quot;attempting to determine the owner state&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cap</span><span class="p">.</span><span class="n">owned</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_owned</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_temp_deactivated</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span> <span class="n">dev</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span> <span class="n">attr</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_FLAG_VOL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			 <span class="s">&quot;attempting to determine the temporary state&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cap</span><span class="p">.</span><span class="n">stclear_flags</span><span class="p">.</span><span class="n">deactivated</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_temp_deactivated</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * tpm_chip_find_get - return tpm_chip for given chip number</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="nf">tpm_chip_find_get</span><span class="p">(</span><span class="kt">int</span> <span class="n">chip_num</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">pos</span><span class="p">,</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">rcu_read_lock</span><span class="p">();</span>
+	<span class="n">list_for_each_entry_rcu</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_chip_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">chip_num</span> <span class="o">!=</span> <span class="n">TPM_ANY_NUM</span> <span class="o">&amp;&amp;</span> <span class="n">chip_num</span> <span class="o">!=</span> <span class="n">pos</span><span class="o">-&gt;</span><span class="n">dev_num</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">try_module_get</span><span class="p">(</span><span class="n">pos</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">chip</span> <span class="o">=</span> <span class="n">pos</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">rcu_read_unlock</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">chip</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define TPM_ORDINAL_PCRREAD cpu_to_be32(21)</span>
+<span class="cp">#define READ_PCR_RESULT_SIZE 30</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">pcrread_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">14</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">TPM_ORDINAL_PCRREAD</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__tpm_pcr_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">,</span> <span class="kt">int</span> <span class="n">pcr_idx</span><span class="p">,</span> <span class="n">u8</span> <span class="o">*</span><span class="n">res_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">cmd</span><span class="p">;</span>
+
+	<span class="n">cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">pcrread_header</span><span class="p">;</span>
+	<span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrread_in</span><span class="p">.</span><span class="n">pcr_idx</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">pcr_idx</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cmd</span><span class="p">,</span> <span class="n">READ_PCR_RESULT_SIZE</span><span class="p">,</span>
+			  <span class="s">&quot;attempting to read a pcr value&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">res_buf</span><span class="p">,</span> <span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrread_out</span><span class="p">.</span><span class="n">pcr_result</span><span class="p">,</span>
+		       <span class="n">TPM_DIGEST_SIZE</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * tpm_pcr_read - read a pcr value</span>
+<span class="cm"> * @chip_num: 	tpm idx # or ANY</span>
+<span class="cm"> * @pcr_idx:	pcr idx to retrieve</span>
+<span class="cm"> * @res_buf: 	TPM_PCR value</span>
+<span class="cm"> * 		size of res_buf is 20 bytes (or NULL if you don&#39;t care)</span>
+<span class="cm"> *</span>
+<span class="cm"> * The TPM driver should be built-in, but for whatever reason it</span>
+<span class="cm"> * isn&#39;t, protect against the chip disappearing, by incrementing</span>
+<span class="cm"> * the module usage count.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_pcr_read</span><span class="p">(</span><span class="n">u32</span> <span class="n">chip_num</span><span class="p">,</span> <span class="kt">int</span> <span class="n">pcr_idx</span><span class="p">,</span> <span class="n">u8</span> <span class="o">*</span><span class="n">res_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">chip</span> <span class="o">=</span> <span class="n">tpm_chip_find_get</span><span class="p">(</span><span class="n">chip_num</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">__tpm_pcr_read</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">pcr_idx</span><span class="p">,</span> <span class="n">res_buf</span><span class="p">);</span>
+	<span class="n">tpm_chip_put</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_pcr_read</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * tpm_pcr_extend - extend pcr value with hash</span>
+<span class="cm"> * @chip_num: 	tpm idx # or AN&amp;</span>
+<span class="cm"> * @pcr_idx:	pcr idx to extend</span>
+<span class="cm"> * @hash: 	hash value used to extend pcr value</span>
+<span class="cm"> *</span>
+<span class="cm"> * The TPM driver should be built-in, but for whatever reason it</span>
+<span class="cm"> * isn&#39;t, protect against the chip disappearing, by incrementing</span>
+<span class="cm"> * the module usage count.</span>
+<span class="cm"> */</span>
+<span class="cp">#define TPM_ORD_PCR_EXTEND cpu_to_be32(20)</span>
+<span class="cp">#define EXTEND_PCR_RESULT_SIZE 34</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">pcrextend_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">34</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">TPM_ORD_PCR_EXTEND</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="nf">tpm_pcr_extend</span><span class="p">(</span><span class="n">u32</span> <span class="n">chip_num</span><span class="p">,</span> <span class="kt">int</span> <span class="n">pcr_idx</span><span class="p">,</span> <span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">hash</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">cmd</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">;</span>
+
+	<span class="n">chip</span> <span class="o">=</span> <span class="n">tpm_chip_find_get</span><span class="p">(</span><span class="n">chip_num</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">pcrextend_header</span><span class="p">;</span>
+	<span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrextend_in</span><span class="p">.</span><span class="n">pcr_idx</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">pcr_idx</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrextend_in</span><span class="p">.</span><span class="n">hash</span><span class="p">,</span> <span class="n">hash</span><span class="p">,</span> <span class="n">TPM_DIGEST_SIZE</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cmd</span><span class="p">,</span> <span class="n">EXTEND_PCR_RESULT_SIZE</span><span class="p">,</span>
+			  <span class="s">&quot;attempting extend a PCR value&quot;</span><span class="p">);</span>
+
+	<span class="n">tpm_chip_put</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_pcr_extend</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * tpm_do_selftest - have the TPM continue its selftest and wait until it</span>
+<span class="cm"> *                   can receive further commands</span>
+<span class="cm"> * @chip: TPM chip to use</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, &lt; 0 in case of fatal error or a value &gt; 0 representing</span>
+<span class="cm"> * a TPM error code.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_do_selftest</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">digest</span><span class="p">[</span><span class="n">TPM_DIGEST_SIZE</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">loops</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">delay_msec</span> <span class="o">=</span> <span class="mi">1000</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">duration</span><span class="p">;</span>
+
+	<span class="n">duration</span> <span class="o">=</span> <span class="n">tpm_calc_ordinal_duration</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span>
+	                                     <span class="n">TPM_ORD_CONTINUE_SELFTEST</span><span class="p">);</span>
+
+	<span class="n">loops</span> <span class="o">=</span> <span class="n">jiffies_to_msecs</span><span class="p">(</span><span class="n">duration</span><span class="p">)</span> <span class="o">/</span> <span class="n">delay_msec</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_continue_selftest</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="cm">/* This may fail if there was no TPM driver during a suspend/resume</span>
+<span class="cm">	 * cycle; some may return 10 (BAD_ORDINAL), others 28 (FAILEDSELFTEST)</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">__tpm_pcr_read</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">digest</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="n">TPM_ERR_DISABLED</span> <span class="o">||</span> <span class="n">rc</span> <span class="o">==</span> <span class="n">TPM_ERR_DEACTIVATED</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_info</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+				 <span class="s">&quot;TPM is disabled/deactivated (0x%X)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+			<span class="cm">/* TPM is disabled and/or deactivated; driver can</span>
+<span class="cm">			 * proceed and TPM does handle commands for</span>
+<span class="cm">			 * suspend/resume correctly</span>
+<span class="cm">			 */</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">!=</span> <span class="n">TPM_WARN_DOING_SELFTEST</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+		<span class="n">msleep</span><span class="p">(</span><span class="n">delay_msec</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">--</span><span class="n">loops</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_do_selftest</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">tpm_send</span><span class="p">(</span><span class="n">u32</span> <span class="n">chip_num</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">cmd</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">buflen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">chip</span> <span class="o">=</span> <span class="n">tpm_chip_find_get</span><span class="p">(</span><span class="n">chip_num</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">buflen</span><span class="p">,</span> <span class="s">&quot;attempting tpm_cmd&quot;</span><span class="p">);</span>
+
+	<span class="n">tpm_chip_put</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_send</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_pcrs</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+		      <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">digest</span><span class="p">[</span><span class="n">TPM_DIGEST_SIZE</span><span class="p">];</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">num_pcrs</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">str</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_PROP_PCR</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the number of PCRS&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">num_pcrs</span> <span class="o">=</span> <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">cap</span><span class="p">.</span><span class="n">num_pcrs</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num_pcrs</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">__tpm_pcr_read</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">digest</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;PCR-%02d: &quot;</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">TPM_DIGEST_SIZE</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;%02X &quot;</span><span class="p">,</span> <span class="n">digest</span><span class="p">[</span><span class="n">j</span><span class="p">]);</span>
+		<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">str</span> <span class="o">-</span> <span class="n">buf</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_pcrs</span><span class="p">);</span>
+
+<span class="cp">#define  READ_PUBEK_RESULT_SIZE 314</span>
+<span class="cp">#define TPM_ORD_READPUBEK cpu_to_be32(124)</span>
+<span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">tpm_readpubek_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">30</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">TPM_ORD_READPUBEK</span>
+<span class="p">};</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_pubek</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+		       <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u8</span> <span class="o">*</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">tpm_cmd</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">err</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">str</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">tpm_cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">tpm_readpubek_header</span><span class="p">;</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_cmd</span><span class="p">,</span> <span class="n">READ_PUBEK_RESULT_SIZE</span><span class="p">,</span>
+			<span class="s">&quot;attempting to read the PUBEK&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* </span>
+<span class="cm">	   ignore header 10 bytes</span>
+<span class="cm">	   algorithm 32 bits (1 == RSA )</span>
+<span class="cm">	   encscheme 16 bits</span>
+<span class="cm">	   sigscheme 16 bits</span>
+<span class="cm">	   parameters (RSA 12-&gt;bytes: keybit, #primes, expbit)  </span>
+<span class="cm">	   keylenbytes 32 bits</span>
+<span class="cm">	   256 byte modulus</span>
+<span class="cm">	   ignore checksum 20 bytes</span>
+<span class="cm">	 */</span>
+	<span class="n">data</span> <span class="o">=</span> <span class="n">tpm_cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">readpubek_out_buffer</span><span class="p">;</span>
+	<span class="n">str</span> <span class="o">+=</span>
+	    <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span>
+		    <span class="s">&quot;Algorithm: %02X %02X %02X %02X</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;Encscheme: %02X %02X</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;Sigscheme: %02X %02X</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;Parameters: %02X %02X %02X %02X &quot;</span>
+		    <span class="s">&quot;%02X %02X %02X %02X &quot;</span>
+		    <span class="s">&quot;%02X %02X %02X %02X</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;Modulus length: %d</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;Modulus:</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">3</span><span class="p">],</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">4</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">5</span><span class="p">],</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">6</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">7</span><span class="p">],</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">12</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">13</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">14</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">15</span><span class="p">],</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">16</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">17</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">18</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">19</span><span class="p">],</span>
+		    <span class="n">data</span><span class="p">[</span><span class="mi">20</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">21</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">22</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="mi">23</span><span class="p">],</span>
+		    <span class="n">be32_to_cpu</span><span class="p">(</span><span class="o">*</span><span class="p">((</span><span class="n">__be32</span> <span class="o">*</span><span class="p">)</span> <span class="p">(</span><span class="n">data</span> <span class="o">+</span> <span class="mi">24</span><span class="p">))));</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">256</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;%02X &quot;</span><span class="p">,</span> <span class="n">data</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">28</span><span class="p">]);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="mi">16</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">str</span> <span class="o">-</span> <span class="n">buf</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_pubek</span><span class="p">);</span>
+
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_caps</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+		      <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">str</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_PROP_MANUFACTURER</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the manufacturer&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;Manufacturer: 0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">cap</span><span class="p">.</span><span class="n">manufacturer_id</span><span class="p">));</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">CAP_VERSION_1_1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+		        <span class="s">&quot;attempting to determine the 1.1 version&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span>
+		       <span class="s">&quot;TCG version: %d.%d</span><span class="se">\n</span><span class="s">Firmware version: %d.%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version</span><span class="p">.</span><span class="n">Major</span><span class="p">,</span> <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version</span><span class="p">.</span><span class="n">Minor</span><span class="p">,</span>
+		       <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version</span><span class="p">.</span><span class="n">revMajor</span><span class="p">,</span> <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version</span><span class="p">.</span><span class="n">revMinor</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">str</span> <span class="o">-</span> <span class="n">buf</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_caps</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_caps_1_2</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span> <span class="n">dev</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span> <span class="n">attr</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cap_t</span> <span class="n">cap</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">str</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">TPM_CAP_PROP_MANUFACTURER</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			<span class="s">&quot;attempting to determine the manufacturer&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;Manufacturer: 0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">be32_to_cpu</span><span class="p">(</span><span class="n">cap</span><span class="p">.</span><span class="n">manufacturer_id</span><span class="p">));</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">tpm_getcap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">CAP_VERSION_1_2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cap</span><span class="p">,</span>
+			 <span class="s">&quot;attempting to determine the 1.2 version&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">str</span> <span class="o">+=</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">str</span><span class="p">,</span>
+		       <span class="s">&quot;TCG version: %d.%d</span><span class="se">\n</span><span class="s">Firmware version: %d.%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version_1_2</span><span class="p">.</span><span class="n">Major</span><span class="p">,</span> <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version_1_2</span><span class="p">.</span><span class="n">Minor</span><span class="p">,</span>
+		       <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version_1_2</span><span class="p">.</span><span class="n">revMajor</span><span class="p">,</span>
+		       <span class="n">cap</span><span class="p">.</span><span class="n">tpm_version_1_2</span><span class="p">.</span><span class="n">revMinor</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">str</span> <span class="o">-</span> <span class="n">buf</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_caps_1_2</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_durations</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+			  <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_LONG</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d %d %d [%s]</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_SHORT</span><span class="p">]),</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_MEDIUM</span><span class="p">]),</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration</span><span class="p">[</span><span class="n">TPM_LONG</span><span class="p">]),</span>
+		       <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">duration_adjusted</span>
+		       <span class="o">?</span> <span class="s">&quot;adjusted&quot;</span> <span class="o">:</span> <span class="s">&quot;original&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_durations</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_show_timeouts</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+			  <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s">&quot;%d %d %d %d [%s]</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_a</span><span class="p">),</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_b</span><span class="p">),</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_c</span><span class="p">),</span>
+		       <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_d</span><span class="p">),</span>
+		       <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">timeout_adjusted</span>
+		       <span class="o">?</span> <span class="s">&quot;adjusted&quot;</span> <span class="o">:</span> <span class="s">&quot;original&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_show_timeouts</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_store_cancel</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+			<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">cancel</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_store_cancel</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">wait_for_tpm_stat</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">,</span> <span class="n">u8</span> <span class="n">mask</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">timeout</span><span class="p">,</span>
+			 <span class="n">wait_queue_head_t</span> <span class="o">*</span><span class="n">queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">stop</span><span class="p">;</span>
+	<span class="kt">long</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">status</span><span class="p">;</span>
+
+	<span class="cm">/* check current status */</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">status</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">status</span> <span class="o">&amp;</span> <span class="n">mask</span><span class="p">)</span> <span class="o">==</span> <span class="n">mask</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">stop</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">timeout</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">irq</span><span class="p">)</span> <span class="p">{</span>
+<span class="nl">again:</span>
+		<span class="n">timeout</span> <span class="o">=</span> <span class="n">stop</span> <span class="o">-</span> <span class="n">jiffies</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">timeout</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ETIME</span><span class="p">;</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">wait_event_interruptible_timeout</span><span class="p">(</span><span class="o">*</span><span class="n">queue</span><span class="p">,</span>
+						      <span class="p">((</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">status</span><span class="p">(</span><span class="n">chip</span><span class="p">)</span>
+						      <span class="o">&amp;</span> <span class="n">mask</span><span class="p">)</span> <span class="o">==</span> <span class="n">mask</span><span class="p">),</span>
+						      <span class="n">timeout</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="o">-</span><span class="n">ERESTARTSYS</span> <span class="o">&amp;&amp;</span> <span class="n">freezing</span><span class="p">(</span><span class="n">current</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">clear_thread_flag</span><span class="p">(</span><span class="n">TIF_SIGPENDING</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="n">msleep</span><span class="p">(</span><span class="n">TPM_TIMEOUT</span><span class="p">);</span>
+			<span class="n">status</span> <span class="o">=</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">status</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">((</span><span class="n">status</span> <span class="o">&amp;</span> <span class="n">mask</span><span class="p">)</span> <span class="o">==</span> <span class="n">mask</span><span class="p">)</span>
+				<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">stop</span><span class="p">));</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ETIME</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">wait_for_tpm_stat</span><span class="p">);</span>
+<span class="cm">/*</span>
+<span class="cm"> * Device file system interface to the TPM</span>
+<span class="cm"> *</span>
+<span class="cm"> * It&#39;s assured that the chip will be opened just once,</span>
+<span class="cm"> * by the check of is_open variable, which is protected</span>
+<span class="cm"> * by driver_lock.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">iminor</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+
+	<span class="n">rcu_read_lock</span><span class="p">();</span>
+	<span class="n">list_for_each_entry_rcu</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_chip_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pos</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">minor</span> <span class="o">==</span> <span class="n">minor</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">chip</span> <span class="o">=</span> <span class="n">pos</span><span class="p">;</span>
+			<span class="n">get_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">rcu_read_unlock</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">chip</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">is_open</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Another process owns this TPM</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">TPM_BUFSIZE</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">is_open</span><span class="p">);</span>
+		<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">chip</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_open</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called on file close</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+
+	<span class="n">del_singleshot_timer_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">user_read_timer</span><span class="p">);</span>
+	<span class="n">flush_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+	<span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">);</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">is_open</span><span class="p">);</span>
+	<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_release</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+		  <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">off</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">in_size</span> <span class="o">=</span> <span class="n">size</span><span class="p">,</span> <span class="n">out_size</span><span class="p">;</span>
+
+	<span class="cm">/* cannot perform a write until the read has cleared</span>
+<span class="cm">	   either via tpm_read or a user_read_timer timeout */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">msleep</span><span class="p">(</span><span class="n">TPM_TIMEOUT</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">in_size</span> <span class="o">&gt;</span> <span class="n">TPM_BUFSIZE</span><span class="p">)</span>
+		<span class="n">in_size</span> <span class="o">=</span> <span class="n">TPM_BUFSIZE</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span>
+	    <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span> <span class="n">buf</span><span class="p">,</span> <span class="n">in_size</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* atomic tpm command send and result receive */</span>
+	<span class="n">out_size</span> <span class="o">=</span> <span class="n">tpm_transmit</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">,</span> <span class="n">TPM_BUFSIZE</span><span class="p">);</span>
+
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">,</span> <span class="n">out_size</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+
+	<span class="cm">/* Set a timeout by which the reader must come claim the result */</span>
+	<span class="n">mod_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">user_read_timer</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="p">(</span><span class="mi">60</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">in_size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_write</span><span class="p">);</span>
+
+<span class="kt">ssize_t</span> <span class="nf">tpm_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+		 <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">off</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">ret_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">del_singleshot_timer_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">user_read_timer</span><span class="p">);</span>
+	<span class="n">flush_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+	<span class="n">ret_size</span> <span class="o">=</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>	<span class="cm">/* relay data */</span>
+		<span class="kt">ssize_t</span> <span class="n">orig_ret_size</span> <span class="o">=</span> <span class="n">ret_size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="n">ret_size</span><span class="p">)</span>
+			<span class="n">ret_size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">copy_to_user</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">,</span> <span class="n">ret_size</span><span class="p">);</span>
+		<span class="n">memset</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">data_buffer</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">orig_ret_size</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+			<span class="n">ret_size</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret_size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_read</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">tpm_remove_hardware</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;No device data found</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">driver_lock</span><span class="p">);</span>
+	<span class="n">list_del_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">driver_lock</span><span class="p">);</span>
+	<span class="n">synchronize_rcu</span><span class="p">();</span>
+
+	<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">);</span>
+	<span class="n">sysfs_remove_group</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">attr_group</span><span class="p">);</span>
+	<span class="n">tpm_bios_log_teardown</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">bios_dir</span><span class="p">);</span>
+
+	<span class="cm">/* write it this way to be explicit (chip-&gt;dev == dev) */</span>
+	<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_remove_hardware</span><span class="p">);</span>
+
+<span class="cp">#define TPM_ORD_SAVESTATE cpu_to_be32(152)</span>
+<span class="cp">#define SAVESTATE_RESULT_SIZE 10</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tpm_input_header</span> <span class="n">savestate_header</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">tag</span> <span class="o">=</span> <span class="n">TPM_TAG_RQU_COMMAND</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">ordinal</span> <span class="o">=</span> <span class="n">TPM_ORD_SAVESTATE</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We are about to suspend. Save the TPM state</span>
+<span class="cm"> * so that it can be restored.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_pm_suspend</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">pm_message_t</span> <span class="n">pm_state</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tpm_cmd_t</span> <span class="n">cmd</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">u8</span> <span class="n">dummy_hash</span><span class="p">[</span><span class="n">TPM_DIGEST_SIZE</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="cm">/* for buggy tpm, flush pcrs with extend to selected dummy */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tpm_suspend_pcr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">pcrextend_header</span><span class="p">;</span>
+		<span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrextend_in</span><span class="p">.</span><span class="n">pcr_idx</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">tpm_suspend_pcr</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">cmd</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">pcrextend_in</span><span class="p">.</span><span class="n">hash</span><span class="p">,</span> <span class="n">dummy_hash</span><span class="p">,</span>
+		       <span class="n">TPM_DIGEST_SIZE</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cmd</span><span class="p">,</span> <span class="n">EXTEND_PCR_RESULT_SIZE</span><span class="p">,</span>
+				  <span class="s">&quot;extending dummy pcr before suspend&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* now do the actual savestate */</span>
+	<span class="n">cmd</span><span class="p">.</span><span class="n">header</span><span class="p">.</span><span class="n">in</span> <span class="o">=</span> <span class="n">savestate_header</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">transmit_cmd</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cmd</span><span class="p">,</span> <span class="n">SAVESTATE_RESULT_SIZE</span><span class="p">,</span>
+			  <span class="s">&quot;sending savestate before suspend&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_pm_suspend</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Resume from a power safe. The BIOS already restored</span>
+<span class="cm"> * the TPM state.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tpm_pm_resume</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_pm_resume</span><span class="p">);</span>
+
+<span class="cm">/* In case vendor provided release function, call it too.*/</span>
+
+<span class="kt">void</span> <span class="nf">tpm_dev_vendor_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">release</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">release</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span><span class="p">,</span> <span class="n">dev_mask</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_dev_vendor_release</span><span class="p">);</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Once all references to platform device are down to 0,</span>
+<span class="cm"> * release all allocated structures.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">tpm_dev_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span> <span class="o">=</span> <span class="n">dev_get_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">tpm_dev_vendor_release</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">release</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_dev_release</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called from tpm_&lt;specific&gt;.c probe function only for devices </span>
+<span class="cm"> * the driver has determined it should claim.  Prior to calling</span>
+<span class="cm"> * this function the specific probe function has called pci_enable_device</span>
+<span class="cm"> * upon errant exit from this function specific probe function should call</span>
+<span class="cm"> * pci_disable_device</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="nf">tpm_register_hardware</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+					<span class="k">const</span> <span class="k">struct</span> <span class="n">tpm_vendor_specific</span> <span class="o">*</span><span class="n">entry</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#define DEVNAME_SIZE 7</span>
+
+	<span class="kt">char</span> <span class="o">*</span><span class="n">devname</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tpm_chip</span> <span class="o">*</span><span class="n">chip</span><span class="p">;</span>
+
+	<span class="cm">/* Driver specific per-device data */</span>
+	<span class="n">chip</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">chip</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="n">devname</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">DEVNAME_SIZE</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span> <span class="o">==</span> <span class="nb">NULL</span> <span class="o">||</span> <span class="n">devname</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">buffer_mutex</span><span class="p">);</span>
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">tpm_mutex</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">,</span> <span class="n">timeout_work</span><span class="p">);</span>
+
+	<span class="n">setup_timer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">user_read_timer</span><span class="p">,</span> <span class="n">user_reader_timeout</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">chip</span><span class="p">);</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">,</span> <span class="n">entry</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tpm_vendor_specific</span><span class="p">));</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span> <span class="o">=</span> <span class="n">find_first_zero_bit</span><span class="p">(</span><span class="n">dev_mask</span><span class="p">,</span> <span class="n">TPM_NUM_DEVICES</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span> <span class="o">&gt;=</span> <span class="n">TPM_NUM_DEVICES</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;No available tpm device numbers</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">minor</span> <span class="o">=</span> <span class="n">TPM_MINOR</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">minor</span> <span class="o">=</span> <span class="n">MISC_DYNAMIC_MINOR</span><span class="p">;</span>
+
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span><span class="p">,</span> <span class="n">dev_mask</span><span class="p">);</span>
+
+	<span class="n">scnprintf</span><span class="p">(</span><span class="n">devname</span><span class="p">,</span> <span class="n">DEVNAME_SIZE</span><span class="p">,</span> <span class="s">&quot;%s%d&quot;</span><span class="p">,</span> <span class="s">&quot;tpm&quot;</span><span class="p">,</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev_num</span><span class="p">);</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">devname</span><span class="p">;</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">parent</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">get_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">release</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">release</span><span class="p">;</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">release</span> <span class="o">=</span> <span class="n">tpm_dev_release</span><span class="p">;</span>
+	<span class="n">dev_set_drvdata</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">chip</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">misc_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+			<span class="s">&quot;unable to misc_register %s, minor %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">name</span><span class="p">,</span>
+			<span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">.</span><span class="n">minor</span><span class="p">);</span>
+		<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sysfs_create_group</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">attr_group</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">vendor</span><span class="p">.</span><span class="n">miscdev</span><span class="p">);</span>
+		<span class="n">put_device</span><span class="p">(</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">chip</span><span class="o">-&gt;</span><span class="n">bios_dir</span> <span class="o">=</span> <span class="n">tpm_bios_log_setup</span><span class="p">(</span><span class="n">devname</span><span class="p">);</span>
+
+	<span class="cm">/* Make chip available */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">driver_lock</span><span class="p">);</span>
+	<span class="n">list_add_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">chip</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tpm_chip_list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">driver_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">chip</span><span class="p">;</span>
+
+<span class="nl">out_free:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">chip</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">devname</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">tpm_register_hardware</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Leendert van Doorn (leendert@watson.ibm.com)&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;TPM Driver&quot;</span><span class="p">);</span>
+<span class="n">MODULE_VERSION</span><span class="p">(</span><span class="s">&quot;2.0&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

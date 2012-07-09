@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › base › dd.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>dd.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * drivers/base/dd.c - The core device/driver interactions.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file contains the (sometimes tricky) code that controls the</span>
+<span class="cm"> * interactions between devices and drivers, which primarily includes</span>
+<span class="cm"> * driver binding and unbinding.</span>
+<span class="cm"> *</span>
+<span class="cm"> * All of this code used to exist in drivers/base/bus.c, but was</span>
+<span class="cm"> * relocated to here in the name of compartmentalization (since it wasn&#39;t</span>
+<span class="cm"> * strictly code just for the &#39;struct bus_type&#39;.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2002-5 Patrick Mochel</span>
+<span class="cm"> * Copyright (c) 2002-3 Open Source Development Labs</span>
+<span class="cm"> * Copyright (c) 2007-2009 Greg Kroah-Hartman &lt;gregkh@suse.de&gt;</span>
+<span class="cm"> * Copyright (c) 2007-2009 Novell Inc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPLv2</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/wait.h&gt;</span>
+<span class="cp">#include &lt;linux/async.h&gt;</span>
+<span class="cp">#include &lt;linux/pm_runtime.h&gt;</span>
+
+<span class="cp">#include &quot;base.h&quot;</span>
+<span class="cp">#include &quot;power/power.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Deferred Probe infrastructure.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Sometimes driver probe order matters, but the kernel doesn&#39;t always have</span>
+<span class="cm"> * dependency information which means some drivers will get probed before a</span>
+<span class="cm"> * resource it depends on is available.  For example, an SDHCI driver may</span>
+<span class="cm"> * first need a GPIO line from an i2c GPIO controller before it can be</span>
+<span class="cm"> * initialized.  If a required resource is not available yet, a driver can</span>
+<span class="cm"> * request probing to be deferred by returning -EPROBE_DEFER from its probe hook</span>
+<span class="cm"> *</span>
+<span class="cm"> * Deferred probe maintains two lists of devices, a pending list and an active</span>
+<span class="cm"> * list.  A driver returning -EPROBE_DEFER causes the device to be added to the</span>
+<span class="cm"> * pending list.  A successful driver probe will trigger moving all devices</span>
+<span class="cm"> * from the pending to the active list so that the workqueue will eventually</span>
+<span class="cm"> * retry them.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The deferred_probe_mutex must be held any time the deferred_probe_*_list</span>
+<span class="cm"> * of the (struct device*)-&gt;p-&gt;deferred_probe pointers are manipulated</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">deferred_probe_pending_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">deferred_probe_active_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">deferred_wq</span><span class="p">;</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * deferred_probe_work_func() - Retry probing devices in the active list.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">deferred_probe_work_func</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">device_private</span> <span class="o">*</span><span class="n">private</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * This block processes every device in the deferred &#39;active&#39; list.</span>
+<span class="cm">	 * Each device is removed from the active list and passed to</span>
+<span class="cm">	 * bus_probe_device() to re-attempt the probe.  The loop continues</span>
+<span class="cm">	 * until every device in the active list is removed and retried.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Note: Once the device is removed from the list and the mutex is</span>
+<span class="cm">	 * released, it is possible for the device get freed by another thread</span>
+<span class="cm">	 * and cause a illegal pointer dereference.  This code uses</span>
+<span class="cm">	 * get/put_device() to ensure the device structure cannot disappear</span>
+<span class="cm">	 * from under our feet.</span>
+<span class="cm">	 */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_active_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">private</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_active_list</span><span class="p">,</span>
+					<span class="n">typeof</span><span class="p">(</span><span class="o">*</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">),</span> <span class="n">deferred_probe</span><span class="p">);</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">private</span><span class="o">-&gt;</span><span class="n">device</span><span class="p">;</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">private</span><span class="o">-&gt;</span><span class="n">deferred_probe</span><span class="p">);</span>
+
+		<span class="n">get_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Drop the mutex while probing each device; the probe path may</span>
+<span class="cm">		 * manipulate the deferred list</span>
+<span class="cm">		 */</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Retrying from deferred list</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">bus_probe_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+
+		<span class="n">put_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="k">static</span> <span class="n">DECLARE_WORK</span><span class="p">(</span><span class="n">deferred_probe_work</span><span class="p">,</span> <span class="n">deferred_probe_work_func</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">driver_deferred_probe_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">deferred_probe</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Added to deferred list</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">deferred_probe</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">deferred_probe_pending_list</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">driver_deferred_probe_del</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">deferred_probe</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Removed from deferred list</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">deferred_probe</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="n">driver_deferred_probe_enable</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+<span class="cm">/**</span>
+<span class="cm"> * driver_deferred_probe_trigger() - Kick off re-probing deferred devices</span>
+<span class="cm"> *</span>
+<span class="cm"> * This functions moves all devices from the pending list to the active</span>
+<span class="cm"> * list and schedules the deferred probe workqueue to process them.  It</span>
+<span class="cm"> * should be called anytime a driver is successfully bound to a device.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">driver_deferred_probe_trigger</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">driver_deferred_probe_enable</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * A successful probe means that all the devices in the pending list</span>
+<span class="cm">	 * should be triggered to be reprobed.  Move all the deferred devices</span>
+<span class="cm">	 * into the active list so they can be retried by the workqueue</span>
+<span class="cm">	 */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+	<span class="n">list_splice_tail_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_pending_list</span><span class="p">,</span>
+			      <span class="o">&amp;</span><span class="n">deferred_probe_active_list</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">deferred_probe_mutex</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Kick the re-probe thread.  It may already be scheduled, but it is</span>
+<span class="cm">	 * safe to kick it again.</span>
+<span class="cm">	 */</span>
+	<span class="n">queue_work</span><span class="p">(</span><span class="n">deferred_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">deferred_probe_work</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * deferred_probe_initcall() - Enable probing of deferred devices</span>
+<span class="cm"> *</span>
+<span class="cm"> * We don&#39;t want to get in the way when the bulk of drivers are getting probed.</span>
+<span class="cm"> * Instead, this initcall makes sure that deferred probing is delayed until</span>
+<span class="cm"> * late_initcall time.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">deferred_probe_initcall</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">deferred_wq</span> <span class="o">=</span> <span class="n">create_singlethread_workqueue</span><span class="p">(</span><span class="s">&quot;deferwq&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">deferred_wq</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">driver_deferred_probe_enable</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">driver_deferred_probe_trigger</span><span class="p">();</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">late_initcall</span><span class="p">(</span><span class="n">deferred_probe_initcall</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">driver_bound</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">klist_node_attached</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">knode_driver</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;%s: device %s already bound</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">__func__</span><span class="p">,</span> <span class="n">kobject_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">));</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;driver: &#39;%s&#39;: %s: bound to device &#39;%s&#39;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span>
+		 <span class="n">__func__</span><span class="p">,</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="n">klist_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">knode_driver</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Make sure the device is no longer in one of the deferred lists and</span>
+<span class="cm">	 * kick off retrying all pending devices</span>
+<span class="cm">	 */</span>
+	<span class="n">driver_deferred_probe_del</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">driver_deferred_probe_trigger</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">)</span>
+		<span class="n">blocking_notifier_call_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">bus_notifier</span><span class="p">,</span>
+					     <span class="n">BUS_NOTIFY_BOUND_DRIVER</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">driver_sysfs_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">)</span>
+		<span class="n">blocking_notifier_call_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">bus_notifier</span><span class="p">,</span>
+					     <span class="n">BUS_NOTIFY_BIND_DRIVER</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">sysfs_create_link</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span>
+			  <span class="n">kobject_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">sysfs_create_link</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span>
+					<span class="s">&quot;driver&quot;</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="n">sysfs_remove_link</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span>
+					<span class="n">kobject_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">));</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">driver_sysfs_remove</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">drv</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sysfs_remove_link</span><span class="p">(</span><span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="n">kobject_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">));</span>
+		<span class="n">sysfs_remove_link</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">kobj</span><span class="p">,</span> <span class="s">&quot;driver&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * device_bind_driver - bind a driver to one device.</span>
+<span class="cm"> * @dev: device.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Allow manual attachment of a driver to a device.</span>
+<span class="cm"> * Caller must have already set @dev-&gt;driver.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that this does not modify the bus reference count</span>
+<span class="cm"> * nor take the bus&#39;s rwsem. Please verify those are accounted</span>
+<span class="cm"> * for before calling this. (It is ok to call with no other effort</span>
+<span class="cm"> * from a driver&#39;s probe() method.)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function must be called with the device lock held.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">device_bind_driver</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">driver_sysfs_add</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">driver_bound</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">device_bind_driver</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">probe_count</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">probe_waitqueue</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">really_probe</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_count</span><span class="p">);</span>
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;bus: &#39;%s&#39;: %s: probing driver %s with device %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">drv</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">));</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">devres_head</span><span class="p">));</span>
+
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span> <span class="o">=</span> <span class="n">drv</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">driver_sysfs_add</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;%s: driver_sysfs_add(%s) failed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">__func__</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">));</span>
+		<span class="k">goto</span> <span class="n">probe_failed</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">probe</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">probe</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">probe_failed</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">probe</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">probe</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">probe_failed</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">driver_bound</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;bus: &#39;%s&#39;: %s: bound device %s to driver %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">drv</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+	<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+
+<span class="nl">probe_failed:</span>
+	<span class="n">devres_release_all</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">driver_sysfs_remove</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EPROBE_DEFER</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Driver requested deferred probing */</span>
+		<span class="n">dev_info</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Driver %s requests probe deferral</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+		<span class="n">driver_deferred_probe_add</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ENODEV</span> <span class="o">&amp;&amp;</span> <span class="n">ret</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* driver matched but the probe failed */</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span>
+		       <span class="s">&quot;%s: probe of %s failed with error %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: probe of %s rejects match %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Ignore errors returned by -&gt;probe so that the next driver can try</span>
+<span class="cm">	 * its luck.</span>
+<span class="cm">	 */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">done:</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_count</span><span class="p">);</span>
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_waitqueue</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * driver_probe_done</span>
+<span class="cm"> * Determine if the probe sequence is finished or not.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Should somehow figure out how to use a semaphore, not an atomic variable...</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">driver_probe_done</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: probe_count = %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span>
+		 <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_count</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_count</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * wait_for_device_probe</span>
+<span class="cm"> * Wait for device probing to be completed.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">wait_for_device_probe</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* wait for the known devices to complete their probing */</span>
+	<span class="n">wait_event</span><span class="p">(</span><span class="n">probe_waitqueue</span><span class="p">,</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">probe_count</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">async_synchronize_full</span><span class="p">();</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">wait_for_device_probe</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * driver_probe_device - attempt to bind device &amp; driver together</span>
+<span class="cm"> * @drv: driver to bind a device to</span>
+<span class="cm"> * @dev: device to try to bind to the driver</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function returns -ENODEV if the device is not registered,</span>
+<span class="cm"> * 1 if the device is bound successfully and 0 otherwise.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function must be called with @dev lock held.  When called for a</span>
+<span class="cm"> * USB interface, @dev-&gt;parent lock must be held as well.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">driver_probe_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device_is_registered</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;bus: &#39;%s&#39;: %s: matched device %s with driver %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		 <span class="n">drv</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">drv</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+
+	<span class="n">pm_runtime_get_noresume</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">pm_runtime_barrier</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">really_probe</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">drv</span><span class="p">);</span>
+	<span class="n">pm_runtime_put_sync</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__device_attach</span><span class="p">(</span><span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">driver_match_device</span><span class="p">(</span><span class="n">drv</span><span class="p">,</span> <span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">driver_probe_device</span><span class="p">(</span><span class="n">drv</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * device_attach - try to attach device to a driver.</span>
+<span class="cm"> * @dev: device.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Walk the list of drivers that the bus has and call</span>
+<span class="cm"> * driver_probe_device() for each pair. If a compatible</span>
+<span class="cm"> * pair is found, break out and return.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 1 if the device was bound to a driver;</span>
+<span class="cm"> * 0 if no matching driver was found;</span>
+<span class="cm"> * -ENODEV if the device is not registered.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When called for a USB interface, @dev-&gt;parent lock must be held.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">device_attach</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">klist_node_attached</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">knode_driver</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">device_bind_driver</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">pm_runtime_get_noresume</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">bus_for_each_drv</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="n">__device_attach</span><span class="p">);</span>
+		<span class="n">pm_runtime_put_sync</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out_unlock:</span>
+	<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">device_attach</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__driver_attach</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Lock device and try to bind to it. We drop the error</span>
+<span class="cm">	 * here and always return 0, because we need to keep trying</span>
+<span class="cm">	 * to bind to devices and some drivers will return an error</span>
+<span class="cm">	 * simply if it didn&#39;t support the device.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * driver_probe_device() will spit a warning if there</span>
+<span class="cm">	 * is an error.</span>
+<span class="cm">	 */</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">driver_match_device</span><span class="p">(</span><span class="n">drv</span><span class="p">,</span> <span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">)</span>	<span class="cm">/* Needed for USB */</span>
+		<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+	<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="p">)</span>
+		<span class="n">driver_probe_device</span><span class="p">(</span><span class="n">drv</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+	<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">)</span>
+		<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * driver_attach - try to bind driver to devices.</span>
+<span class="cm"> * @drv: driver.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Walk the list of devices that the bus has on it and try to</span>
+<span class="cm"> * match the driver with each one.  If driver_probe_device()</span>
+<span class="cm"> * returns 0 and the @dev-&gt;driver is set, we&#39;ve found a</span>
+<span class="cm"> * compatible pair.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">driver_attach</span><span class="p">(</span><span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">bus_for_each_dev</span><span class="p">(</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">drv</span><span class="p">,</span> <span class="n">__driver_attach</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">driver_attach</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * __device_release_driver() must be called with @dev lock held.</span>
+<span class="cm"> * When called for a USB interface, @dev-&gt;parent lock must be held as well.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__device_release_driver</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">;</span>
+
+	<span class="n">drv</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">drv</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pm_runtime_get_sync</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="n">driver_sysfs_remove</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">)</span>
+			<span class="n">blocking_notifier_call_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">bus_notifier</span><span class="p">,</span>
+						     <span class="n">BUS_NOTIFY_UNBIND_DRIVER</span><span class="p">,</span>
+						     <span class="n">dev</span><span class="p">);</span>
+
+		<span class="n">pm_runtime_put_sync</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span> <span class="o">&amp;&amp;</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">remove</span><span class="p">)</span>
+			<span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">remove</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">remove</span><span class="p">)</span>
+			<span class="n">drv</span><span class="o">-&gt;</span><span class="n">remove</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">devres_release_all</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">klist_remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">knode_driver</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="p">)</span>
+			<span class="n">blocking_notifier_call_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">bus</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">bus_notifier</span><span class="p">,</span>
+						     <span class="n">BUS_NOTIFY_UNBOUND_DRIVER</span><span class="p">,</span>
+						     <span class="n">dev</span><span class="p">);</span>
+
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * device_release_driver - manually detach device from driver.</span>
+<span class="cm"> * @dev: device.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Manually detach device from driver.</span>
+<span class="cm"> * When called for a USB interface, @dev-&gt;parent lock must be held.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">device_release_driver</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * If anyone calls device_release_driver() recursively from</span>
+<span class="cm">	 * within their -&gt;remove callback for the same device, they</span>
+<span class="cm">	 * will deadlock right here.</span>
+<span class="cm">	 */</span>
+	<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">__device_release_driver</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">device_release_driver</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * driver_detach - detach driver from all devices it controls.</span>
+<span class="cm"> * @drv: driver.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">driver_detach</span><span class="p">(</span><span class="k">struct</span> <span class="n">device_driver</span> <span class="o">*</span><span class="n">drv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device_private</span> <span class="o">*</span><span class="n">dev_prv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">.</span><span class="n">k_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">.</span><span class="n">k_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">.</span><span class="n">k_lock</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dev_prv</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">.</span><span class="n">k_list</span><span class="p">.</span><span class="n">prev</span><span class="p">,</span>
+				     <span class="k">struct</span> <span class="n">device_private</span><span class="p">,</span>
+				     <span class="n">knode_driver</span><span class="p">.</span><span class="n">n_node</span><span class="p">);</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">dev_prv</span><span class="o">-&gt;</span><span class="n">device</span><span class="p">;</span>
+		<span class="n">get_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">drv</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">klist_devices</span><span class="p">.</span><span class="n">k_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">)</span>	<span class="cm">/* Needed for USB */</span>
+			<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+		<span class="n">device_lock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">driver</span> <span class="o">==</span> <span class="n">drv</span><span class="p">)</span>
+			<span class="n">__device_release_driver</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">)</span>
+			<span class="n">device_unlock</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">parent</span><span class="p">);</span>
+		<span class="n">put_device</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * These exports can&#39;t be _GPL due to .h files using this within them, and it</span>
+<span class="cm"> * might break something that was previously working...</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dev_get_drvdata</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span> <span class="o">&amp;&amp;</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dev_get_drvdata</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">dev_set_drvdata</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">error</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">error</span> <span class="o">=</span> <span class="n">device_private_init</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">error</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">error</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dev</span><span class="o">-&gt;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dev_set_drvdata</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

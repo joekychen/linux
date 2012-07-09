@@ -1,0 +1,1314 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » block › blk-throttle.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>blk-throttle.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Interface for controlling IO bandwidth on a request queue</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2010 Vivek Goyal &lt;vgoyal@redhat.com&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/blkdev.h&gt;</span>
+<span class="cp">#include &lt;linux/bio.h&gt;</span>
+<span class="cp">#include &lt;linux/blktrace_api.h&gt;</span>
+<span class="cp">#include &quot;blk-cgroup.h&quot;</span>
+<span class="cp">#include &quot;blk.h&quot;</span>
+
+<span class="cm">/* Max dispatch from a group in 1 round */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">throtl_grp_quantum</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+
+<span class="cm">/* Total max dispatch from all groups in one round */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">throtl_quantum</span> <span class="o">=</span> <span class="mi">32</span><span class="p">;</span>
+
+<span class="cm">/* Throttling is performed over 100ms slice and after that slice is renewed */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">throtl_slice</span> <span class="o">=</span> <span class="n">HZ</span><span class="o">/</span><span class="mi">10</span><span class="p">;</span>	<span class="cm">/* 100 ms */</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">blkcg_policy</span> <span class="n">blkcg_policy_throtl</span><span class="p">;</span>
+
+<span class="cm">/* A workqueue to queue throttle related work */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">kthrotld_workqueue</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">throtl_schedule_delayed_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+				<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">delay</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_root</span> <span class="n">rb</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">left</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">count</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">min_disptime</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cp">#define THROTL_RB_ROOT	(struct throtl_rb_root) { .rb = RB_ROOT, .left = NULL, \</span>
+<span class="cp">			.count = 0, .min_disptime = 0}</span>
+
+<span class="cp">#define rb_entry_tg(node)	rb_entry((node), struct throtl_grp, rb_node)</span>
+
+<span class="cm">/* Per-cpu group stats */</span>
+<span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="p">{</span>
+	<span class="cm">/* total bytes transferred */</span>
+	<span class="k">struct</span> <span class="n">blkg_rwstat</span>		<span class="n">service_bytes</span><span class="p">;</span>
+	<span class="cm">/* total IOs serviced, post merge */</span>
+	<span class="k">struct</span> <span class="n">blkg_rwstat</span>		<span class="n">serviced</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="p">{</span>
+	<span class="cm">/* must be the first member */</span>
+	<span class="k">struct</span> <span class="n">blkg_policy_data</span> <span class="n">pd</span><span class="p">;</span>
+
+	<span class="cm">/* active throtl group service_tree member */</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="n">rb_node</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Dispatch time in jiffies. This is the estimated time when group</span>
+<span class="cm">	 * will unthrottle and is ready to dispatch more bio. It is used as</span>
+<span class="cm">	 * key to sort active groups in service tree.</span>
+<span class="cm">	 */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">disptime</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="cm">/* Two lists for READ and WRITE */</span>
+	<span class="k">struct</span> <span class="n">bio_list</span> <span class="n">bio_lists</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* Number of queued bios on READ and WRITE lists */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_queued</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* bytes per second rate limits */</span>
+	<span class="kt">uint64_t</span> <span class="n">bps</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* IOPS limits */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">iops</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* Number of bytes disptached in current slice */</span>
+	<span class="kt">uint64_t</span> <span class="n">bytes_disp</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+	<span class="cm">/* Number of bio&#39;s dispatched in current slice */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">io_disp</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* When did we start a new slice */</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">slice_start</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">slice_end</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/* Some throttle limits got updated for the group */</span>
+	<span class="kt">int</span> <span class="n">limits_changed</span><span class="p">;</span>
+
+	<span class="cm">/* Per cpu stats pointer */</span>
+	<span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="n">__percpu</span> <span class="o">*</span><span class="n">stats_cpu</span><span class="p">;</span>
+
+	<span class="cm">/* List of tgs waiting for per cpu stats memory to be allocated */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">stats_alloc_node</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">throtl_data</span>
+<span class="p">{</span>
+	<span class="cm">/* service tree for active throtl groups */</span>
+	<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="n">tg_service_tree</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">queue</span><span class="p">;</span>
+
+	<span class="cm">/* Total Number of queued bios on READ and WRITE lists */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_queued</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * number of total undestroyed groups</span>
+<span class="cm">	 */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_undestroyed_grps</span><span class="p">;</span>
+
+	<span class="cm">/* Work for dispatching throttled bios */</span>
+	<span class="k">struct</span> <span class="n">delayed_work</span> <span class="n">throtl_work</span><span class="p">;</span>
+
+	<span class="kt">int</span> <span class="n">limits_changed</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/* list and work item to allocate percpu group stats */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">tg_stats_alloc_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">tg_stats_alloc_list</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">tg_stats_alloc_fn</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_DELAYED_WORK</span><span class="p">(</span><span class="n">tg_stats_alloc_work</span><span class="p">,</span> <span class="n">tg_stats_alloc_fn</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">pd_to_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkg_policy_data</span> <span class="o">*</span><span class="n">pd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">pd</span> <span class="o">?</span> <span class="n">container_of</span><span class="p">(</span><span class="n">pd</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span> <span class="n">pd</span><span class="p">)</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">blkg_to_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">pd_to_tg</span><span class="p">(</span><span class="n">blkg_to_pd</span><span class="p">(</span><span class="n">blkg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="nf">tg_to_blkg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">pd_to_blkg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">pd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">td_root_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span><span class="o">-&gt;</span><span class="n">root_blkg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">enum</span> <span class="n">tg_state_flags</span> <span class="p">{</span>
+	<span class="n">THROTL_TG_FLAG_on_rr</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>	<span class="cm">/* on round-robin busy list */</span>
+<span class="p">};</span>
+
+<span class="cp">#define THROTL_TG_FNS(name)						\</span>
+<span class="cp">static inline void throtl_mark_tg_##name(struct throtl_grp *tg)		\</span>
+<span class="cp">{									\</span>
+<span class="cp">	(tg)-&gt;flags |= (1 &lt;&lt; THROTL_TG_FLAG_##name);			\</span>
+<span class="cp">}									\</span>
+<span class="cp">static inline void throtl_clear_tg_##name(struct throtl_grp *tg)	\</span>
+<span class="cp">{									\</span>
+<span class="cp">	(tg)-&gt;flags &amp;= ~(1 &lt;&lt; THROTL_TG_FLAG_##name);			\</span>
+<span class="cp">}									\</span>
+<span class="cp">static inline int throtl_tg_##name(const struct throtl_grp *tg)		\</span>
+<span class="cp">{									\</span>
+<span class="cp">	return ((tg)-&gt;flags &amp; (1 &lt;&lt; THROTL_TG_FLAG_##name)) != 0;	\</span>
+<span class="cp">}</span>
+
+<span class="n">THROTL_TG_FNS</span><span class="p">(</span><span class="n">on_rr</span><span class="p">);</span>
+
+<span class="cp">#define throtl_log_tg(td, tg, fmt, args...)	do {			\</span>
+<span class="cp">	char __pbuf[128];						\</span>
+<span class="cp">									\</span>
+<span class="cp">	blkg_path(tg_to_blkg(tg), __pbuf, sizeof(__pbuf));		\</span>
+<span class="cp">	blk_add_trace_msg((td)-&gt;queue, &quot;throtl %s &quot; fmt, __pbuf, ##args); \</span>
+<span class="cp">} while (0)</span>
+
+<span class="cp">#define throtl_log(td, fmt, args...)	\</span>
+<span class="cp">	blk_add_trace_msg((td)-&gt;queue, &quot;throtl &quot; fmt, ##args)</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">total_nr_queued</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="mi">1</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Worker for allocating per cpu stat for tgs. This is scheduled on the</span>
+<span class="cm"> * system_nrt_wq once there are some groups on the alloc_list waiting for</span>
+<span class="cm"> * allocation.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tg_stats_alloc_fn</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">static</span> <span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="o">*</span><span class="n">stats_cpu</span><span class="p">;</span>	<span class="cm">/* this fn is non-reentrant */</span>
+	<span class="k">struct</span> <span class="n">delayed_work</span> <span class="o">*</span><span class="n">dwork</span> <span class="o">=</span> <span class="n">to_delayed_work</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+	<span class="n">bool</span> <span class="n">empty</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+<span class="nl">alloc_stats:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">stats_cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">stats_cpu</span> <span class="o">=</span> <span class="n">alloc_percpu</span><span class="p">(</span><span class="k">struct</span> <span class="n">tg_stats_cpu</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">stats_cpu</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* allocation failed, try again after some time */</span>
+			<span class="n">queue_delayed_work</span><span class="p">(</span><span class="n">system_nrt_wq</span><span class="p">,</span> <span class="n">dwork</span><span class="p">,</span>
+					   <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="mi">10</span><span class="p">));</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_list</span><span class="p">,</span>
+							 <span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span>
+							 <span class="n">stats_alloc_node</span><span class="p">);</span>
+		<span class="n">swap</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span><span class="p">,</span> <span class="n">stats_cpu</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_alloc_node</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">empty</span> <span class="o">=</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_list</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">empty</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">alloc_stats</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_pd_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">RB_CLEAR_NODE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">);</span>
+	<span class="n">bio_list_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+	<span class="n">bio_list_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="mi">1</span><span class="p">]);</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">limits_changed</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">READ</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">READ</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ugh... We need to perform per-cpu allocation for tg-&gt;stats_cpu</span>
+<span class="cm">	 * but percpu allocator can&#39;t be called from IO path.  Queue tg on</span>
+<span class="cm">	 * tg_stats_alloc_list and allocate from work item.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_alloc_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tg_stats_alloc_list</span><span class="p">);</span>
+	<span class="n">queue_delayed_work</span><span class="p">(</span><span class="n">system_nrt_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tg_stats_alloc_work</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_pd_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_alloc_node</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg_stats_alloc_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">free_percpu</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_pd_reset_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="o">*</span><span class="n">sc</span> <span class="o">=</span> <span class="n">per_cpu_ptr</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+
+		<span class="n">blkg_rwstat_reset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sc</span><span class="o">-&gt;</span><span class="n">service_bytes</span><span class="p">);</span>
+		<span class="n">blkg_rwstat_reset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sc</span><span class="o">-&gt;</span><span class="n">serviced</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">throtl_lookup_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+					   <span class="k">struct</span> <span class="n">blkcg</span> <span class="o">*</span><span class="n">blkcg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * This is the common case when there are no blkcgs.  Avoid lookup</span>
+<span class="cm">	 * in this case</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">blkcg</span> <span class="o">==</span> <span class="o">&amp;</span><span class="n">blkcg_root</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">td_root_tg</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg_lookup</span><span class="p">(</span><span class="n">blkcg</span><span class="p">,</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">throtl_lookup_create_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+						  <span class="k">struct</span> <span class="n">blkcg</span> <span class="o">*</span><span class="n">blkcg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This is the common case when there are no blkcgs.  Avoid lookup</span>
+<span class="cm">	 * in this case</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">blkcg</span> <span class="o">==</span> <span class="o">&amp;</span><span class="n">blkcg_root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tg</span> <span class="o">=</span> <span class="n">td_root_tg</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">;</span>
+
+		<span class="n">blkg</span> <span class="o">=</span> <span class="n">blkg_lookup_create</span><span class="p">(</span><span class="n">blkcg</span><span class="p">,</span> <span class="n">q</span><span class="p">);</span>
+
+		<span class="cm">/* if %NULL and @q is alive, fall back to root_tg */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">blkg</span><span class="p">))</span>
+			<span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">blk_queue_dead</span><span class="p">(</span><span class="n">q</span><span class="p">))</span>
+			<span class="n">tg</span> <span class="o">=</span> <span class="n">td_root_tg</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">tg</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="nf">throtl_rb_first</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">root</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Service tree is empty */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span><span class="p">)</span>
+		<span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span> <span class="o">=</span> <span class="n">rb_first</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">rb</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">rb_entry_tg</span><span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rb_erase_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">n</span><span class="p">,</span> <span class="k">struct</span> <span class="n">rb_root</span> <span class="o">*</span><span class="n">root</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">rb_erase</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">root</span><span class="p">);</span>
+	<span class="n">RB_CLEAR_NODE</span><span class="p">(</span><span class="n">n</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_rb_erase</span><span class="p">(</span><span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">n</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">root</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span> <span class="o">==</span> <span class="n">n</span><span class="p">)</span>
+		<span class="n">root</span><span class="o">-&gt;</span><span class="n">left</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">rb_erase_init</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">rb</span><span class="p">);</span>
+	<span class="o">--</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">update_min_dispatch_time</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">;</span>
+
+	<span class="n">tg</span> <span class="o">=</span> <span class="n">throtl_rb_first</span><span class="p">(</span><span class="n">st</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tg</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">st</span><span class="o">-&gt;</span><span class="n">min_disptime</span> <span class="o">=</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">disptime</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">tg_service_tree_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">**</span><span class="n">node</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">st</span><span class="o">-&gt;</span><span class="n">rb</span><span class="p">.</span><span class="n">rb_node</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">__tg</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">key</span> <span class="o">=</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">disptime</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">left</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">*</span><span class="n">node</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">parent</span> <span class="o">=</span> <span class="o">*</span><span class="n">node</span><span class="p">;</span>
+		<span class="n">__tg</span> <span class="o">=</span> <span class="n">rb_entry_tg</span><span class="p">(</span><span class="n">parent</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">__tg</span><span class="o">-&gt;</span><span class="n">disptime</span><span class="p">))</span>
+			<span class="n">node</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">node</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+			<span class="n">left</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">left</span><span class="p">)</span>
+		<span class="n">st</span><span class="o">-&gt;</span><span class="n">left</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">;</span>
+
+	<span class="n">rb_link_node</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="n">parent</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+	<span class="n">rb_insert_color</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">st</span><span class="o">-&gt;</span><span class="n">rb</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__throtl_enqueue_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span><span class="p">;</span>
+
+	<span class="n">tg_service_tree_add</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+	<span class="n">throtl_mark_tg_on_rr</span><span class="p">(</span><span class="n">tg</span><span class="p">);</span>
+	<span class="n">st</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_enqueue_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">throtl_tg_on_rr</span><span class="p">(</span><span class="n">tg</span><span class="p">))</span>
+		<span class="n">__throtl_enqueue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__throtl_dequeue_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">throtl_rb_erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span><span class="p">);</span>
+	<span class="n">throtl_clear_tg_on_rr</span><span class="p">(</span><span class="n">tg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_dequeue_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">throtl_tg_on_rr</span><span class="p">(</span><span class="n">tg</span><span class="p">))</span>
+		<span class="n">__throtl_dequeue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_schedule_next_dispatch</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If there are more bios pending, schedule more work.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">total_nr_queued</span><span class="p">(</span><span class="n">td</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">st</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">);</span>
+
+	<span class="n">update_min_dispatch_time</span><span class="p">(</span><span class="n">st</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">time_before_eq</span><span class="p">(</span><span class="n">st</span><span class="o">-&gt;</span><span class="n">min_disptime</span><span class="p">,</span> <span class="n">jiffies</span><span class="p">))</span>
+		<span class="n">throtl_schedule_delayed_work</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">throtl_schedule_delayed_work</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="p">(</span><span class="n">st</span><span class="o">-&gt;</span><span class="n">min_disptime</span> <span class="o">-</span> <span class="n">jiffies</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span>
+<span class="nf">throtl_start_new_slice</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">throtl_slice</span><span class="p">;</span>
+	<span class="n">throtl_log_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="s">&quot;[%c] new slice start=%lu end=%lu jiffies=%lu&quot;</span><span class="p">,</span>
+			<span class="n">rw</span> <span class="o">==</span> <span class="n">READ</span> <span class="o">?</span> <span class="sc">&#39;R&#39;</span> <span class="o">:</span> <span class="sc">&#39;W&#39;</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">jiffies</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">throtl_set_slice_end</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">jiffy_end</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="n">roundup</span><span class="p">(</span><span class="n">jiffy_end</span><span class="p">,</span> <span class="n">throtl_slice</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">throtl_extend_slice</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">jiffy_end</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="n">roundup</span><span class="p">(</span><span class="n">jiffy_end</span><span class="p">,</span> <span class="n">throtl_slice</span><span class="p">);</span>
+	<span class="n">throtl_log_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="s">&quot;[%c] extend slice start=%lu end=%lu jiffies=%lu&quot;</span><span class="p">,</span>
+			<span class="n">rw</span> <span class="o">==</span> <span class="n">READ</span> <span class="o">?</span> <span class="sc">&#39;R&#39;</span> <span class="o">:</span> <span class="sc">&#39;W&#39;</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">jiffies</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Determine if previously allocated or extended slice is complete or not */</span>
+<span class="k">static</span> <span class="n">bool</span>
+<span class="nf">throtl_slice_used</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">time_in_range</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">]))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Trim the used slices and adjust slice start accordingly */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span>
+<span class="nf">throtl_trim_slice</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_slices</span><span class="p">,</span> <span class="n">time_elapsed</span><span class="p">,</span> <span class="n">io_trim</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">bytes_trim</span><span class="p">,</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">]));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If bps are unlimited (-1), then time slice don&#39;t get</span>
+<span class="cm">	 * renewed. Don&#39;t try to trim the slice if slice is used. A new</span>
+<span class="cm">	 * slice will start when appropriate.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">throtl_slice_used</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * A bio has been dispatched. Also adjust slice_end. It might happen</span>
+<span class="cm">	 * that initially cgroup limit was very low resulting in high</span>
+<span class="cm">	 * slice_end, but later limit was bumped up and bio was dispached</span>
+<span class="cm">	 * sooner, then we need to reduce slice_end. A high bogus slice_end</span>
+<span class="cm">	 * is bad because it does not allow new slice to start.</span>
+<span class="cm">	 */</span>
+
+	<span class="n">throtl_set_slice_end</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">throtl_slice</span><span class="p">);</span>
+
+	<span class="n">time_elapsed</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">-</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">];</span>
+
+	<span class="n">nr_slices</span> <span class="o">=</span> <span class="n">time_elapsed</span> <span class="o">/</span> <span class="n">throtl_slice</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">nr_slices</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">*</span> <span class="n">throtl_slice</span> <span class="o">*</span> <span class="n">nr_slices</span><span class="p">;</span>
+	<span class="n">do_div</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">HZ</span><span class="p">);</span>
+	<span class="n">bytes_trim</span> <span class="o">=</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">io_trim</span> <span class="o">=</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">*</span> <span class="n">throtl_slice</span> <span class="o">*</span> <span class="n">nr_slices</span><span class="p">)</span><span class="o">/</span><span class="n">HZ</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bytes_trim</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">io_trim</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">bytes_trim</span><span class="p">)</span>
+		<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">-=</span> <span class="n">bytes_trim</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">io_trim</span><span class="p">)</span>
+		<span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">-=</span> <span class="n">io_trim</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+=</span> <span class="n">nr_slices</span> <span class="o">*</span> <span class="n">throtl_slice</span><span class="p">;</span>
+
+	<span class="n">throtl_log_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="s">&quot;[%c] trim slice nr=%lu bytes=%llu io=%lu&quot;</span>
+			<span class="s">&quot; start=%lu end=%lu jiffies=%lu&quot;</span><span class="p">,</span>
+			<span class="n">rw</span> <span class="o">==</span> <span class="n">READ</span> <span class="o">?</span> <span class="sc">&#39;R&#39;</span> <span class="o">:</span> <span class="sc">&#39;W&#39;</span><span class="p">,</span> <span class="n">nr_slices</span><span class="p">,</span> <span class="n">bytes_trim</span><span class="p">,</span> <span class="n">io_trim</span><span class="p">,</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">jiffies</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">tg_with_in_iops_limit</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">io_allowed</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">jiffy_elapsed</span><span class="p">,</span> <span class="n">jiffy_wait</span><span class="p">,</span> <span class="n">jiffy_elapsed_rnd</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">jiffy_elapsed</span> <span class="o">=</span> <span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">-</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">];</span>
+
+	<span class="cm">/* Slice has just started. Consider one slice interval */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">jiffy_elapsed</span><span class="p">)</span>
+		<span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">throtl_slice</span><span class="p">;</span>
+
+	<span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">roundup</span><span class="p">(</span><span class="n">jiffy_elapsed_rnd</span><span class="p">,</span> <span class="n">throtl_slice</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * jiffy_elapsed_rnd should not be a big value as minimum iops can be</span>
+<span class="cm">	 * 1 then at max jiffy elapsed should be equivalent of 1 second as we</span>
+<span class="cm">	 * will allow dispatch after 1 second and after that slice should</span>
+<span class="cm">	 * have been trimmed.</span>
+<span class="cm">	 */</span>
+
+	<span class="n">tmp</span> <span class="o">=</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">*</span> <span class="n">jiffy_elapsed_rnd</span><span class="p">;</span>
+	<span class="n">do_div</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">HZ</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tmp</span> <span class="o">&gt;</span> <span class="n">UINT_MAX</span><span class="p">)</span>
+		<span class="n">io_allowed</span> <span class="o">=</span> <span class="n">UINT_MAX</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">io_allowed</span> <span class="o">=</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&lt;=</span> <span class="n">io_allowed</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Calc approx time to dispatch */</span>
+	<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="p">((</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">)</span><span class="o">/</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">jiffy_wait</span> <span class="o">&gt;</span> <span class="n">jiffy_elapsed</span><span class="p">)</span>
+		<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="n">jiffy_wait</span> <span class="o">-</span> <span class="n">jiffy_elapsed</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="n">jiffy_wait</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">tg_with_in_bps_limit</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="n">u64</span> <span class="n">bytes_allowed</span><span class="p">,</span> <span class="n">extra_bytes</span><span class="p">,</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">jiffy_elapsed</span><span class="p">,</span> <span class="n">jiffy_wait</span><span class="p">,</span> <span class="n">jiffy_elapsed_rnd</span><span class="p">;</span>
+
+	<span class="n">jiffy_elapsed</span> <span class="o">=</span> <span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">-</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_start</span><span class="p">[</span><span class="n">rw</span><span class="p">];</span>
+
+	<span class="cm">/* Slice has just started. Consider one slice interval */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">jiffy_elapsed</span><span class="p">)</span>
+		<span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">throtl_slice</span><span class="p">;</span>
+
+	<span class="n">jiffy_elapsed_rnd</span> <span class="o">=</span> <span class="n">roundup</span><span class="p">(</span><span class="n">jiffy_elapsed_rnd</span><span class="p">,</span> <span class="n">throtl_slice</span><span class="p">);</span>
+
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">*</span> <span class="n">jiffy_elapsed_rnd</span><span class="p">;</span>
+	<span class="n">do_div</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">HZ</span><span class="p">);</span>
+	<span class="n">bytes_allowed</span> <span class="o">=</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span> <span class="o">&lt;=</span> <span class="n">bytes_allowed</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Calc approx time to dispatch */</span>
+	<span class="n">extra_bytes</span> <span class="o">=</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span> <span class="o">-</span> <span class="n">bytes_allowed</span><span class="p">;</span>
+	<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="n">div64_u64</span><span class="p">(</span><span class="n">extra_bytes</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">]);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">jiffy_wait</span><span class="p">)</span>
+		<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This wait time is without taking into consideration the rounding</span>
+<span class="cm">	 * up we did. Add that time also.</span>
+<span class="cm">	 */</span>
+	<span class="n">jiffy_wait</span> <span class="o">=</span> <span class="n">jiffy_wait</span> <span class="o">+</span> <span class="p">(</span><span class="n">jiffy_elapsed_rnd</span> <span class="o">-</span> <span class="n">jiffy_elapsed</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="n">jiffy_wait</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">tg_no_rule_group</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rw</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span> <span class="o">&amp;&amp;</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Returns whether one can dispatch a bio or not. Also returns approx number</span>
+<span class="cm"> * of jiffies to wait before this bio is with-in IO rate and can be dispatched</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">tg_may_dispatch</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">bps_wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">iops_wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">max_wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm"> 	 * Currently whole state machine of group depends on first bio</span>
+<span class="cm">	 * queued in the group bio list. So one should not be calling</span>
+<span class="cm">	 * this function with a different bio if there are other bios</span>
+<span class="cm">	 * queued.</span>
+<span class="cm">	 */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">&amp;&amp;</span> <span class="n">bio</span> <span class="o">!=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">rw</span><span class="p">]));</span>
+
+	<span class="cm">/* If tg-&gt;bps = -1, then BW is unlimited */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span> <span class="o">&amp;&amp;</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If previous slice expired, start a new one otherwise renew/extend</span>
+<span class="cm">	 * existing slice to make sure it is at least throtl_slice interval</span>
+<span class="cm">	 * long since now.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">throtl_slice_used</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">))</span>
+		<span class="n">throtl_start_new_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">);</span>
+	<span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">throtl_slice</span><span class="p">))</span>
+			<span class="n">throtl_extend_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">throtl_slice</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg_with_in_bps_limit</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bps_wait</span><span class="p">)</span>
+	    <span class="o">&amp;&amp;</span> <span class="n">tg_with_in_iops_limit</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iops_wait</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">max_wait</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">bps_wait</span><span class="p">,</span> <span class="n">iops_wait</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">wait</span> <span class="o">=</span> <span class="n">max_wait</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">slice_end</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">max_wait</span><span class="p">))</span>
+		<span class="n">throtl_extend_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">max_wait</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_update_dispatch_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">,</span> <span class="n">u64</span> <span class="n">bytes</span><span class="p">,</span>
+					 <span class="kt">int</span> <span class="n">rw</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="o">*</span><span class="n">stats_cpu</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="cm">/* If per cpu stats are not allocated yet, don&#39;t do any accounting. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Disabling interrupts to provide mutual exclusion between two</span>
+<span class="cm">	 * writes on same cpu. It probably is not needed for 64bit. Not</span>
+<span class="cm">	 * optimizing that case yet.</span>
+<span class="cm">	 */</span>
+	<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">stats_cpu</span> <span class="o">=</span> <span class="n">this_cpu_ptr</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span><span class="p">);</span>
+
+	<span class="n">blkg_rwstat_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">stats_cpu</span><span class="o">-&gt;</span><span class="n">serviced</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">blkg_rwstat_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">stats_cpu</span><span class="o">-&gt;</span><span class="n">service_bytes</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">bytes</span><span class="p">);</span>
+
+	<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_charge_bio</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+
+	<span class="cm">/* Charge the bio to the group */</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">+=</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span><span class="p">;</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="n">throtl_update_dispatch_stats</span><span class="p">(</span><span class="n">tg_to_blkg</span><span class="p">(</span><span class="n">tg</span><span class="p">),</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span><span class="p">,</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_add_bio_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+
+	<span class="n">bio_list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="cm">/* Take a bio reference on tg */</span>
+	<span class="n">blkg_get</span><span class="p">(</span><span class="n">tg_to_blkg</span><span class="p">(</span><span class="n">tg</span><span class="p">));</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">throtl_enqueue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tg_update_disptime</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">read_wait</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">write_wait</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">min_wait</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">disptime</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">READ</span><span class="p">])))</span>
+		<span class="n">tg_may_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">read_wait</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">WRITE</span><span class="p">])))</span>
+		<span class="n">tg_may_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">write_wait</span><span class="p">);</span>
+
+	<span class="n">min_wait</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">read_wait</span><span class="p">,</span> <span class="n">write_wait</span><span class="p">);</span>
+	<span class="n">disptime</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">min_wait</span><span class="p">;</span>
+
+	<span class="cm">/* Update dispatch time */</span>
+	<span class="n">throtl_dequeue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">disptime</span> <span class="o">=</span> <span class="n">disptime</span><span class="p">;</span>
+	<span class="n">throtl_enqueue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tg_dispatch_one_bio</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+				<span class="n">bool</span> <span class="n">rw</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+
+	<span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_pop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">rw</span><span class="p">]);</span>
+	<span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span><span class="o">--</span><span class="p">;</span>
+	<span class="cm">/* Drop bio reference on blkg */</span>
+	<span class="n">blkg_put</span><span class="p">(</span><span class="n">tg_to_blkg</span><span class="p">(</span><span class="n">tg</span><span class="p">));</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">]</span><span class="o">--</span><span class="p">;</span>
+
+	<span class="n">throtl_charge_bio</span><span class="p">(</span><span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="n">bio_list_add</span><span class="p">(</span><span class="n">bl</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span> <span class="o">|=</span> <span class="n">REQ_THROTTLED</span><span class="p">;</span>
+
+	<span class="n">throtl_trim_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">throtl_dispatch_tg</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_reads</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">nr_writes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max_nr_reads</span> <span class="o">=</span> <span class="n">throtl_grp_quantum</span><span class="o">*</span><span class="mi">3</span><span class="o">/</span><span class="mi">4</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max_nr_writes</span> <span class="o">=</span> <span class="n">throtl_grp_quantum</span> <span class="o">-</span> <span class="n">max_nr_reads</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+
+	<span class="cm">/* Try to dispatch 75% READS and 25% WRITES */</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">READ</span><span class="p">]))</span>
+		<span class="o">&amp;&amp;</span> <span class="n">tg_may_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+
+		<span class="n">tg_dispatch_one_bio</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">),</span> <span class="n">bl</span><span class="p">);</span>
+		<span class="n">nr_reads</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nr_reads</span> <span class="o">&gt;=</span> <span class="n">max_nr_reads</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]))</span>
+		<span class="o">&amp;&amp;</span> <span class="n">tg_may_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+
+		<span class="n">tg_dispatch_one_bio</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">),</span> <span class="n">bl</span><span class="p">);</span>
+		<span class="n">nr_writes</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nr_writes</span> <span class="o">&gt;=</span> <span class="n">max_nr_writes</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">nr_reads</span> <span class="o">+</span> <span class="n">nr_writes</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">throtl_select_dispatch</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio_list</span> <span class="o">*</span><span class="n">bl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_disp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tg</span> <span class="o">=</span> <span class="n">throtl_rb_first</span><span class="p">(</span><span class="n">st</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tg</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">disptime</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">throtl_dequeue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+
+		<span class="n">nr_disp</span> <span class="o">+=</span> <span class="n">throtl_dispatch_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bl</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">||</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="p">{</span>
+			<span class="n">tg_update_disptime</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+			<span class="n">throtl_enqueue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nr_disp</span> <span class="o">&gt;=</span> <span class="n">throtl_quantum</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">nr_disp</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_process_limit_change</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">blkcg_gq</span> <span class="o">*</span><span class="n">blkg</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+
+	<span class="n">throtl_log</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="s">&quot;limits changed&quot;</span><span class="p">);</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">blkg</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">blkg_list</span><span class="p">,</span> <span class="n">q_node</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">blkg</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">,</span> <span class="nb">false</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">throtl_log_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="s">&quot;limit change rbps=%llu wbps=%llu&quot;</span>
+			<span class="s">&quot; riops=%u wiops=%u&quot;</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">READ</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">WRITE</span><span class="p">],</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">READ</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Restart the slices for both READ and WRITES. It</span>
+<span class="cm">		 * might happen that a group&#39;s limit are dropped</span>
+<span class="cm">		 * suddenly and we don&#39;t want to account recently</span>
+<span class="cm">		 * dispatched IO with new low rate</span>
+<span class="cm">		 */</span>
+		<span class="n">throtl_start_new_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">throtl_start_new_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">throtl_tg_on_rr</span><span class="p">(</span><span class="n">tg</span><span class="p">))</span>
+			<span class="n">tg_update_disptime</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* Dispatch throttled bios. Should be called without queue lock held. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">throtl_dispatch</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_disp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio_list</span> <span class="n">bio_list_on_stack</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">blk_plug</span> <span class="n">plug</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+
+	<span class="n">throtl_process_limit_change</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">total_nr_queued</span><span class="p">(</span><span class="n">td</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">bio_list_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bio_list_on_stack</span><span class="p">);</span>
+
+	<span class="n">throtl_log</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="s">&quot;dispatch nr_queued=%u read=%u write=%u&quot;</span><span class="p">,</span>
+			<span class="n">total_nr_queued</span><span class="p">(</span><span class="n">td</span><span class="p">),</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">READ</span><span class="p">],</span>
+			<span class="n">td</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]);</span>
+
+	<span class="n">nr_disp</span> <span class="o">=</span> <span class="n">throtl_select_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bio_list_on_stack</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_disp</span><span class="p">)</span>
+		<span class="n">throtl_log</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="s">&quot;bios disp=%u&quot;</span><span class="p">,</span> <span class="n">nr_disp</span><span class="p">);</span>
+
+	<span class="n">throtl_schedule_next_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If we dispatched some requests, unplug the queue to make sure</span>
+<span class="cm">	 * immediate dispatch</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_disp</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">blk_start_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+		<span class="k">while</span><span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_pop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bio_list_on_stack</span><span class="p">)))</span>
+			<span class="n">generic_make_request</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+		<span class="n">blk_finish_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">nr_disp</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">blk_throtl_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">throtl_data</span><span class="p">,</span>
+					<span class="n">throtl_work</span><span class="p">.</span><span class="n">work</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">;</span>
+
+	<span class="n">throtl_dispatch</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Call with queue lock held */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">throtl_schedule_delayed_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">delay</span><span class="p">)</span>
+<span class="p">{</span>
+
+	<span class="k">struct</span> <span class="n">delayed_work</span> <span class="o">*</span><span class="n">dwork</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">throtl_work</span><span class="p">;</span>
+
+	<span class="cm">/* schedule work if limits changed even if no bio is queued */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">total_nr_queued</span><span class="p">(</span><span class="n">td</span><span class="p">)</span> <span class="o">||</span> <span class="n">td</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * We might have a work scheduled to be executed in future.</span>
+<span class="cm">		 * Cancel that and schedule a new one.</span>
+<span class="cm">		 */</span>
+		<span class="n">__cancel_delayed_work</span><span class="p">(</span><span class="n">dwork</span><span class="p">);</span>
+		<span class="n">queue_delayed_work</span><span class="p">(</span><span class="n">kthrotld_workqueue</span><span class="p">,</span> <span class="n">dwork</span><span class="p">,</span> <span class="n">delay</span><span class="p">);</span>
+		<span class="n">throtl_log</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="s">&quot;schedule work. delay=%lu jiffies=%lu&quot;</span><span class="p">,</span>
+				<span class="n">delay</span><span class="p">,</span> <span class="n">jiffies</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">tg_prfill_cpu_rwstat</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">blkg_policy_data</span> <span class="o">*</span><span class="n">pd</span><span class="p">,</span> <span class="kt">int</span> <span class="n">off</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">pd_to_tg</span><span class="p">(</span><span class="n">pd</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">blkg_rwstat</span> <span class="n">rwstat</span> <span class="o">=</span> <span class="p">{</span> <span class="p">},</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">tg_stats_cpu</span> <span class="o">*</span><span class="n">sc</span> <span class="o">=</span> <span class="n">per_cpu_ptr</span><span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">stats_cpu</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">blkg_rwstat_read</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">sc</span> <span class="o">+</span> <span class="n">off</span><span class="p">);</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">BLKG_RWSTAT_NR</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">rwstat</span><span class="p">.</span><span class="n">cnt</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">+=</span> <span class="n">tmp</span><span class="p">.</span><span class="n">cnt</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">__blkg_prfill_rwstat</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">pd</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rwstat</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_print_cpu_rwstat</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">blkcg</span> <span class="o">*</span><span class="n">blkcg</span> <span class="o">=</span> <span class="n">cgroup_to_blkcg</span><span class="p">(</span><span class="n">cgrp</span><span class="p">);</span>
+
+	<span class="n">blkcg_print_blkgs</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">blkcg</span><span class="p">,</span> <span class="n">tg_prfill_cpu_rwstat</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">,</span>
+			  <span class="n">cft</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">tg_prfill_conf_u64</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">,</span> <span class="k">struct</span> <span class="n">blkg_policy_data</span> <span class="o">*</span><span class="n">pd</span><span class="p">,</span>
+			      <span class="kt">int</span> <span class="n">off</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">pd_to_tg</span><span class="p">(</span><span class="n">pd</span><span class="p">);</span>
+	<span class="n">u64</span> <span class="n">v</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="n">u64</span> <span class="o">*</span><span class="p">)((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">tg</span> <span class="o">+</span> <span class="n">off</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">v</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">__blkg_prfill_u64</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">pd</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">tg_prfill_conf_uint</span><span class="p">(</span><span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">,</span> <span class="k">struct</span> <span class="n">blkg_policy_data</span> <span class="o">*</span><span class="n">pd</span><span class="p">,</span>
+			       <span class="kt">int</span> <span class="n">off</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span> <span class="o">=</span> <span class="n">pd_to_tg</span><span class="p">(</span><span class="n">pd</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">v</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">tg</span> <span class="o">+</span> <span class="n">off</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">v</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">__blkg_prfill_u64</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">pd</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_print_conf_u64</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">blkcg_print_blkgs</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">cgroup_to_blkcg</span><span class="p">(</span><span class="n">cgrp</span><span class="p">),</span> <span class="n">tg_prfill_conf_u64</span><span class="p">,</span>
+			  <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">,</span> <span class="n">cft</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_print_conf_uint</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">seq_file</span> <span class="o">*</span><span class="n">sf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">blkcg_print_blkgs</span><span class="p">(</span><span class="n">sf</span><span class="p">,</span> <span class="n">cgroup_to_blkcg</span><span class="p">(</span><span class="n">cgrp</span><span class="p">),</span> <span class="n">tg_prfill_conf_uint</span><span class="p">,</span>
+			  <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">,</span> <span class="n">cft</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_set_conf</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+		       <span class="n">bool</span> <span class="n">is_u64</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">blkcg</span> <span class="o">*</span><span class="n">blkcg</span> <span class="o">=</span> <span class="n">cgroup_to_blkcg</span><span class="p">(</span><span class="n">cgrp</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">blkg_conf_ctx</span> <span class="n">ctx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">blkg_conf_prep</span><span class="p">(</span><span class="n">blkcg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">tg</span> <span class="o">=</span> <span class="n">blkg_to_tg</span><span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">blkg</span><span class="p">);</span>
+	<span class="n">td</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">blkg</span><span class="o">-&gt;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="p">.</span><span class="n">v</span><span class="p">)</span>
+		<span class="n">ctx</span><span class="p">.</span><span class="n">v</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_u64</span><span class="p">)</span>
+		<span class="o">*</span><span class="p">(</span><span class="n">u64</span> <span class="o">*</span><span class="p">)((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">tg</span> <span class="o">+</span> <span class="n">cft</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">)</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">v</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="o">*</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">tg</span> <span class="o">+</span> <span class="n">cft</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">)</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">v</span><span class="p">;</span>
+
+	<span class="cm">/* XXX: we don&#39;t need the following deferred processing */</span>
+	<span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">limits_changed</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="n">throtl_schedule_delayed_work</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">blkg_conf_finish</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_set_conf_u64</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span>
+			   <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tg_set_conf</span><span class="p">(</span><span class="n">cgrp</span><span class="p">,</span> <span class="n">cft</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tg_set_conf_uint</span><span class="p">(</span><span class="k">struct</span> <span class="n">cgroup</span> <span class="o">*</span><span class="n">cgrp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="o">*</span><span class="n">cft</span><span class="p">,</span>
+			    <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tg_set_conf</span><span class="p">(</span><span class="n">cgrp</span><span class="p">,</span> <span class="n">cft</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">cftype</span> <span class="n">throtl_files</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.read_bps_device&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span> <span class="n">bps</span><span class="p">[</span><span class="n">READ</span><span class="p">]),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_conf_u64</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">write_string</span> <span class="o">=</span> <span class="n">tg_set_conf_u64</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">max_write_len</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.write_bps_device&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span> <span class="n">bps</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_conf_u64</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">write_string</span> <span class="o">=</span> <span class="n">tg_set_conf_u64</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">max_write_len</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.read_iops_device&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span> <span class="n">iops</span><span class="p">[</span><span class="n">READ</span><span class="p">]),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_conf_uint</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">write_string</span> <span class="o">=</span> <span class="n">tg_set_conf_uint</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">max_write_len</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.write_iops_device&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">,</span> <span class="n">iops</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_conf_uint</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">write_string</span> <span class="o">=</span> <span class="n">tg_set_conf_uint</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">max_write_len</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.io_service_bytes&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tg_stats_cpu</span><span class="p">,</span> <span class="n">service_bytes</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_cpu_rwstat</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;throttle.io_serviced&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">private</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tg_stats_cpu</span><span class="p">,</span> <span class="n">serviced</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">read_seq_string</span> <span class="o">=</span> <span class="n">tg_print_cpu_rwstat</span><span class="p">,</span>
+	<span class="p">},</span>
+	<span class="p">{</span> <span class="p">}</span>	<span class="cm">/* terminate */</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">throtl_shutdown_wq</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">;</span>
+
+	<span class="n">cancel_delayed_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">throtl_work</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">blkcg_policy</span> <span class="n">blkcg_policy_throtl</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">pd_size</span>		<span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">throtl_grp</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">cftypes</span>		<span class="o">=</span> <span class="n">throtl_files</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">pd_init_fn</span>		<span class="o">=</span> <span class="n">throtl_pd_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">pd_exit_fn</span>		<span class="o">=</span> <span class="n">throtl_pd_exit</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">pd_reset_stats_fn</span>	<span class="o">=</span> <span class="n">throtl_pd_reset_stats</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="n">bool</span> <span class="nf">blk_throtl_bio</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">),</span> <span class="n">update_disptime</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">blkcg</span> <span class="o">*</span><span class="n">blkcg</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">throttled</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span> <span class="o">&amp;</span> <span class="n">REQ_THROTTLED</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">REQ_THROTTLED</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* bio_associate_current() needs ioc, try creating */</span>
+	<span class="n">create_io_context</span><span class="p">(</span><span class="n">GFP_ATOMIC</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">node</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * A throtl_grp pointer retrieved under rcu can be used to access</span>
+<span class="cm">	 * basic fields like stats and io rates. If a group has no rules,</span>
+<span class="cm">	 * just update the dispatch stats in lockless manner and return.</span>
+<span class="cm">	 */</span>
+	<span class="n">rcu_read_lock</span><span class="p">();</span>
+	<span class="n">blkcg</span> <span class="o">=</span> <span class="n">bio_blkcg</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="n">tg</span> <span class="o">=</span> <span class="n">throtl_lookup_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">blkcg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">tg_no_rule_group</span><span class="p">(</span><span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">throtl_update_dispatch_stats</span><span class="p">(</span><span class="n">tg_to_blkg</span><span class="p">(</span><span class="n">tg</span><span class="p">),</span>
+						     <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span><span class="p">,</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_rw</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out_unlock_rcu</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Either group has not been allocated yet or it is not an unlimited</span>
+<span class="cm">	 * IO group</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+	<span class="n">tg</span> <span class="o">=</span> <span class="n">throtl_lookup_create_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">blkcg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">tg</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">rw</span><span class="p">])</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * There is already another bio queued in same dir. No</span>
+<span class="cm">		 * need to update dispatch time.</span>
+<span class="cm">		 */</span>
+		<span class="n">update_disptime</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">queue_bio</span><span class="p">;</span>
+
+	<span class="p">}</span>
+
+	<span class="cm">/* Bio is with-in rate limit of group */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tg_may_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">throtl_charge_bio</span><span class="p">(</span><span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * We need to trim slice even when bios are not being queued</span>
+<span class="cm">		 * otherwise it might happen that a bio is not queued for</span>
+<span class="cm">		 * a long time and slice keeps on extending and trim is not</span>
+<span class="cm">		 * called for a long time. Now if limits are reduced suddenly</span>
+<span class="cm">		 * we take into account all the IO dispatched so far at new</span>
+<span class="cm">		 * low rate and * newly queued IO gets a really long dispatch</span>
+<span class="cm">		 * time.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * So keep on trimming slice even if bio is not queued.</span>
+<span class="cm">		 */</span>
+		<span class="n">throtl_trim_slice</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">rw</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">queue_bio:</span>
+	<span class="n">throtl_log_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="s">&quot;[%c] bio. bdisp=%llu sz=%u bps=%llu&quot;</span>
+			<span class="s">&quot; iodisp=%u iops=%u queued=%d/%d&quot;</span><span class="p">,</span>
+			<span class="n">rw</span> <span class="o">==</span> <span class="n">READ</span> <span class="o">?</span> <span class="sc">&#39;R&#39;</span> <span class="o">:</span> <span class="sc">&#39;W&#39;</span><span class="p">,</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">bytes_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">bio</span><span class="o">-&gt;</span><span class="n">bi_size</span><span class="p">,</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">bps</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">io_disp</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">iops</span><span class="p">[</span><span class="n">rw</span><span class="p">],</span>
+			<span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">READ</span><span class="p">],</span> <span class="n">tg</span><span class="o">-&gt;</span><span class="n">nr_queued</span><span class="p">[</span><span class="n">WRITE</span><span class="p">]);</span>
+
+	<span class="n">bio_associate_current</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+	<span class="n">throtl_add_bio_tg</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+	<span class="n">throttled</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">update_disptime</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tg_update_disptime</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+		<span class="n">throtl_schedule_next_dispatch</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="p">}</span>
+
+<span class="nl">out_unlock:</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+<span class="nl">out_unlock_rcu:</span>
+	<span class="n">rcu_read_unlock</span><span class="p">();</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">throttled</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * blk_throtl_drain - drain throttled bios</span>
+<span class="cm"> * @q: request_queue to drain throttled bios for</span>
+<span class="cm"> *</span>
+<span class="cm"> * Dispatch all currently throttled bios on @q through -&gt;make_request_fn().</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">blk_throtl_drain</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+	<span class="n">__releases</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">)</span> <span class="n">__acquires</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_rb_root</span> <span class="o">*</span><span class="n">st</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">throtl_grp</span> <span class="o">*</span><span class="n">tg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio_list</span> <span class="n">bl</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">;</span>
+
+	<span class="n">queue_lockdep_assert_held</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+
+	<span class="n">bio_list_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bl</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">tg</span> <span class="o">=</span> <span class="n">throtl_rb_first</span><span class="p">(</span><span class="n">st</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">throtl_dequeue_tg</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">);</span>
+
+		<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">READ</span><span class="p">])))</span>
+			<span class="n">tg_dispatch_one_bio</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">bl</span><span class="p">);</span>
+		<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_peek</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tg</span><span class="o">-&gt;</span><span class="n">bio_lists</span><span class="p">[</span><span class="n">WRITE</span><span class="p">])))</span>
+			<span class="n">tg_dispatch_one_bio</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="n">tg</span><span class="p">,</span> <span class="n">bio_data_dir</span><span class="p">(</span><span class="n">bio</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">bl</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">bio</span> <span class="o">=</span> <span class="n">bio_list_pop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bl</span><span class="p">)))</span>
+		<span class="n">generic_make_request</span><span class="p">(</span><span class="n">bio</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">queue_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">blk_throtl_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">throtl_data</span> <span class="o">*</span><span class="n">td</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">td</span> <span class="o">=</span> <span class="n">kzalloc_node</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">td</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">node</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">td</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">tg_service_tree</span> <span class="o">=</span> <span class="n">THROTL_RB_ROOT</span><span class="p">;</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">limits_changed</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="n">INIT_DELAYED_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">td</span><span class="o">-&gt;</span><span class="n">throtl_work</span><span class="p">,</span> <span class="n">blk_throtl_work</span><span class="p">);</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span> <span class="o">=</span> <span class="n">td</span><span class="p">;</span>
+	<span class="n">td</span><span class="o">-&gt;</span><span class="n">queue</span> <span class="o">=</span> <span class="n">q</span><span class="p">;</span>
+
+	<span class="cm">/* activate policy */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">blkcg_activate_policy</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">td</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">blk_throtl_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">request_queue</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">);</span>
+	<span class="n">throtl_shutdown_wq</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+	<span class="n">blkcg_deactivate_policy</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">td</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">throtl_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kthrotld_workqueue</span> <span class="o">=</span> <span class="n">alloc_workqueue</span><span class="p">(</span><span class="s">&quot;kthrotld&quot;</span><span class="p">,</span> <span class="n">WQ_MEM_RECLAIM</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">kthrotld_workqueue</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Failed to create kthrotld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">blkcg_policy_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blkcg_policy_throtl</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">throtl_init</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

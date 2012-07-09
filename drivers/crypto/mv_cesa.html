@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › crypto › mv_cesa.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>mv_cesa.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Support for Marvell&#39;s crypto engine which can be found on some Orion5X</span>
+<span class="cm"> * boards.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Author: Sebastian Andrzej Siewior &lt; sebastian at breakpoint dot cc &gt;</span>
+<span class="cm"> * License: GPLv2</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;crypto/aes.h&gt;</span>
+<span class="cp">#include &lt;crypto/algapi.h&gt;</span>
+<span class="cp">#include &lt;linux/crypto.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/io.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/platform_device.h&gt;</span>
+<span class="cp">#include &lt;linux/scatterlist.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/clk.h&gt;</span>
+<span class="cp">#include &lt;crypto/internal/hash.h&gt;</span>
+<span class="cp">#include &lt;crypto/sha.h&gt;</span>
+
+<span class="cp">#include &quot;mv_cesa.h&quot;</span>
+
+<span class="cp">#define MV_CESA	&quot;MV-CESA:&quot;</span>
+<span class="cp">#define MAX_HW_HASH_SIZE	0xFFFF</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * STM:</span>
+<span class="cm"> *   /---------------------------------------\</span>
+<span class="cm"> *   |					     | request complete</span>
+<span class="cm"> *  \./					     |</span>
+<span class="cm"> * IDLE -&gt; new request -&gt; BUSY -&gt; done -&gt; DEQUEUE</span>
+<span class="cm"> *                         /°\               |</span>
+<span class="cm"> *			    |		     | more scatter entries</span>
+<span class="cm"> *			    \________________/</span>
+<span class="cm"> */</span>
+<span class="k">enum</span> <span class="n">engine_status</span> <span class="p">{</span>
+	<span class="n">ENGINE_IDLE</span><span class="p">,</span>
+	<span class="n">ENGINE_BUSY</span><span class="p">,</span>
+	<span class="n">ENGINE_W_DEQUEUE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * struct req_progress - used for every crypt request</span>
+<span class="cm"> * @src_sg_it:		sg iterator for src</span>
+<span class="cm"> * @dst_sg_it:		sg iterator for dst</span>
+<span class="cm"> * @sg_src_left:	bytes left in src to process (scatter list)</span>
+<span class="cm"> * @src_start:		offset to add to src start position (scatter list)</span>
+<span class="cm"> * @crypt_len:		length of current hw crypt/hash process</span>
+<span class="cm"> * @hw_nbytes:		total bytes to process in hw for this request</span>
+<span class="cm"> * @copy_back:		whether to copy data back (crypt) or not (hash)</span>
+<span class="cm"> * @sg_dst_left:	bytes left dst to process in this scatter list</span>
+<span class="cm"> * @dst_start:		offset to add to dst start position (scatter list)</span>
+<span class="cm"> * @hw_processed_bytes:	number of bytes processed by hw (request).</span>
+<span class="cm"> *</span>
+<span class="cm"> * sg helper are used to iterate over the scatterlist. Since the size of the</span>
+<span class="cm"> * SRAM may be less than the scatter size, this struct struct is used to keep</span>
+<span class="cm"> * track of progress within current scatterlist.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">req_progress</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sg_mapping_iter</span> <span class="n">src_sg_it</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sg_mapping_iter</span> <span class="n">dst_sg_it</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">complete</span><span class="p">)</span> <span class="p">(</span><span class="kt">void</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">process</span><span class="p">)</span> <span class="p">(</span><span class="kt">int</span> <span class="n">is_first</span><span class="p">);</span>
+
+	<span class="cm">/* src mostly */</span>
+	<span class="kt">int</span> <span class="n">sg_src_left</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">src_start</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">crypt_len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">hw_nbytes</span><span class="p">;</span>
+	<span class="cm">/* dst mostly */</span>
+	<span class="kt">int</span> <span class="n">copy_back</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">sg_dst_left</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">dst_start</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">hw_processed_bytes</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">crypto_priv</span> <span class="p">{</span>
+	<span class="kt">void</span> <span class="n">__iomem</span> <span class="o">*</span><span class="n">reg</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="n">__iomem</span> <span class="o">*</span><span class="n">sram</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">irq</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">clk</span> <span class="o">*</span><span class="n">clk</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">queue_th</span><span class="p">;</span>
+
+	<span class="cm">/* the lock protects queue and eng_st */</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_queue</span> <span class="n">queue</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">engine_status</span> <span class="n">eng_st</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">cur_req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">req_progress</span> <span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">max_req_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">sram_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">has_sha1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">has_hmac_sha1</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">crypto_priv</span> <span class="o">*</span><span class="n">cpg</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">mv_ctx</span> <span class="p">{</span>
+	<span class="n">u8</span> <span class="n">aes_enc_key</span><span class="p">[</span><span class="n">AES_KEY_LEN</span><span class="p">];</span>
+	<span class="n">u32</span> <span class="n">aes_dec_key</span><span class="p">[</span><span class="mi">8</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">key_len</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">need_calc_aes_dkey</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">enum</span> <span class="n">crypto_op</span> <span class="p">{</span>
+	<span class="n">COP_AES_ECB</span><span class="p">,</span>
+	<span class="n">COP_AES_CBC</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="p">{</span>
+	<span class="k">enum</span> <span class="n">crypto_op</span> <span class="n">op</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">decrypt</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">enum</span> <span class="n">hash_op</span> <span class="p">{</span>
+	<span class="n">COP_SHA1</span><span class="p">,</span>
+	<span class="n">COP_HMAC_SHA1</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_shash</span> <span class="o">*</span><span class="n">fallback</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_shash</span> <span class="o">*</span><span class="n">base_hash</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">ivs</span><span class="p">[</span><span class="mi">2</span> <span class="o">*</span> <span class="n">SHA1_DIGEST_SIZE</span> <span class="o">/</span> <span class="mi">4</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">count_add</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">hash_op</span> <span class="n">op</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="p">{</span>
+	<span class="n">u64</span> <span class="n">count</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">state</span><span class="p">[</span><span class="n">SHA1_DIGEST_SIZE</span> <span class="o">/</span> <span class="mi">4</span><span class="p">];</span>
+	<span class="n">u8</span> <span class="n">buffer</span><span class="p">[</span><span class="n">SHA1_BLOCK_SIZE</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">first_hash</span><span class="p">;</span>		<span class="cm">/* marks that we don&#39;t have previous state */</span>
+	<span class="kt">int</span> <span class="n">last_chunk</span><span class="p">;</span>		<span class="cm">/* marks that this is the &#39;final&#39; request */</span>
+	<span class="kt">int</span> <span class="n">extra_bytes</span><span class="p">;</span>	<span class="cm">/* unprocessed bytes in buffer */</span>
+	<span class="k">enum</span> <span class="n">hash_op</span> <span class="n">op</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count_add</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">compute_aes_dec_key</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_aes_ctx</span> <span class="n">gen_aes_key</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">key_pos</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">need_calc_aes_dkey</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">crypto_aes_expand_key</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gen_aes_key</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_enc_key</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key_len</span><span class="p">);</span>
+
+	<span class="n">key_pos</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key_len</span> <span class="o">+</span> <span class="mi">24</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_dec_key</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gen_aes_key</span><span class="p">.</span><span class="n">key_enc</span><span class="p">[</span><span class="n">key_pos</span><span class="p">],</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">4</span><span class="p">);</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key_len</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_256</span>:
+		<span class="n">key_pos</span> <span class="o">-=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="cm">/* fall */</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_192</span>:
+		<span class="n">key_pos</span> <span class="o">-=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_dec_key</span><span class="p">[</span><span class="mi">4</span><span class="p">],</span> <span class="o">&amp;</span><span class="n">gen_aes_key</span><span class="p">.</span><span class="n">key_enc</span><span class="p">[</span><span class="n">key_pos</span><span class="p">],</span>
+				<span class="mi">4</span> <span class="o">*</span> <span class="mi">4</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">need_calc_aes_dkey</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_setkey_aes</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_ablkcipher</span> <span class="o">*</span><span class="n">cipher</span><span class="p">,</span> <span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">key</span><span class="p">,</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span> <span class="o">=</span> <span class="n">crypto_ablkcipher_tfm</span><span class="p">(</span><span class="n">cipher</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">len</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_128</span>:
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_192</span>:
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_256</span>:
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">crypto_ablkcipher_set_flags</span><span class="p">(</span><span class="n">cipher</span><span class="p">,</span> <span class="n">CRYPTO_TFM_RES_BAD_KEY_LEN</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key_len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">need_calc_aes_dkey</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_enc_key</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">AES_KEY_LEN</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">copy_src_to_buf</span><span class="p">(</span><span class="k">struct</span> <span class="n">req_progress</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dbuf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">sbuf</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">copy_len</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">len</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">sg_src_left</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">sg_miter_next</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">);</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">);</span>
+			<span class="n">p</span><span class="o">-&gt;</span><span class="n">sg_src_left</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">.</span><span class="n">length</span><span class="p">;</span>
+			<span class="n">p</span><span class="o">-&gt;</span><span class="n">src_start</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">sbuf</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">.</span><span class="n">addr</span> <span class="o">+</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">src_start</span><span class="p">;</span>
+
+		<span class="n">copy_len</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">sg_src_left</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">dbuf</span><span class="p">,</span> <span class="n">sbuf</span><span class="p">,</span> <span class="n">copy_len</span><span class="p">);</span>
+
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">src_start</span> <span class="o">+=</span> <span class="n">copy_len</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">sg_src_left</span> <span class="o">-=</span> <span class="n">copy_len</span><span class="p">;</span>
+
+		<span class="n">len</span> <span class="o">-=</span> <span class="n">copy_len</span><span class="p">;</span>
+		<span class="n">dbuf</span> <span class="o">+=</span> <span class="n">copy_len</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">setup_data_in</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">req_progress</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">data_in_sram</span> <span class="o">=</span>
+	    <span class="n">min</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_nbytes</span> <span class="o">-</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_processed_bytes</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">max_req_size</span><span class="p">);</span>
+	<span class="n">copy_src_to_buf</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_IN_START</span> <span class="o">+</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span><span class="p">,</span>
+			<span class="n">data_in_sram</span> <span class="o">-</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span><span class="p">);</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span> <span class="o">=</span> <span class="n">data_in_sram</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_process_current_q</span><span class="p">(</span><span class="kt">int</span> <span class="n">first_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">ablkcipher_request_cast</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sec_accel_config</span> <span class="n">op</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">COP_AES_ECB</span>:
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">CFG_OP_CRYPT_ONLY</span> <span class="o">|</span> <span class="n">CFG_ENCM_AES</span> <span class="o">|</span> <span class="n">CFG_ENC_MODE_ECB</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">COP_AES_CBC</span>:
+	<span class="nl">default:</span>
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">CFG_OP_CRYPT_ONLY</span> <span class="o">|</span> <span class="n">CFG_ENCM_AES</span> <span class="o">|</span> <span class="n">CFG_ENC_MODE_CBC</span><span class="p">;</span>
+		<span class="n">op</span><span class="p">.</span><span class="n">enc_iv</span> <span class="o">=</span> <span class="n">ENC_IV_POINT</span><span class="p">(</span><span class="n">SRAM_DATA_IV</span><span class="p">)</span> <span class="o">|</span>
+			<span class="n">ENC_IV_BUF_POINT</span><span class="p">(</span><span class="n">SRAM_DATA_IV_BUF</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">first_block</span><span class="p">)</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_IV</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="mi">16</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">decrypt</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_DIR_DEC</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_KEY_P</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_dec_key</span><span class="p">,</span>
+				<span class="n">AES_KEY_LEN</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_DIR_ENC</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_KEY_P</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">aes_enc_key</span><span class="p">,</span>
+				<span class="n">AES_KEY_LEN</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key_len</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_128</span>:
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_AES_LEN_128</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_192</span>:
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_AES_LEN_192</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">AES_KEYSIZE_256</span>:
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_AES_LEN_256</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">enc_p</span> <span class="o">=</span> <span class="n">ENC_P_SRC</span><span class="p">(</span><span class="n">SRAM_DATA_IN_START</span><span class="p">)</span> <span class="o">|</span>
+		<span class="n">ENC_P_DST</span><span class="p">(</span><span class="n">SRAM_DATA_OUT_START</span><span class="p">);</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">enc_key_p</span> <span class="o">=</span> <span class="n">SRAM_DATA_KEY_P</span><span class="p">;</span>
+
+	<span class="n">setup_data_in</span><span class="p">();</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">enc_len</span> <span class="o">=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">crypt_len</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_CONFIG</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">op</span><span class="p">,</span>
+			<span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sec_accel_config</span><span class="p">));</span>
+
+	<span class="cm">/* GO */</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">SEC_CMD_EN_SEC_ACCL0</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_CMD</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * XXX: add timer if the interrupt does not occur for some mystery</span>
+<span class="cm">	 * reason</span>
+<span class="cm">	 */</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_crypto_algo_completion</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">ablkcipher_request_cast</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">sg_miter_stop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">src_sg_it</span><span class="p">);</span>
+	<span class="n">sg_miter_stop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_sg_it</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">!=</span> <span class="n">COP_AES_CBC</span><span class="p">)</span>
+		<span class="k">return</span> <span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_IV_BUF</span><span class="p">,</span> <span class="mi">16</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_process_hash_current</span><span class="p">(</span><span class="kt">int</span> <span class="n">first_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">ahash_request_cast</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span><span class="p">);</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">tfm_ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">req_progress</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sec_accel_config</span> <span class="n">op</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+	<span class="kt">int</span> <span class="n">is_last</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">COP_SHA1</span>:
+	<span class="nl">default:</span>
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">CFG_OP_MAC_ONLY</span> <span class="o">|</span> <span class="n">CFG_MACM_SHA1</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">COP_HMAC_SHA1</span>:
+		<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">CFG_OP_MAC_ONLY</span> <span class="o">|</span> <span class="n">CFG_MACM_HMAC_SHA1</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_HMAC_IV_IN</span><span class="p">,</span>
+				<span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">ivs</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">ivs</span><span class="p">));</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">op</span><span class="p">.</span><span class="n">mac_src_p</span> <span class="o">=</span>
+		<span class="n">MAC_SRC_DATA_P</span><span class="p">(</span><span class="n">SRAM_DATA_IN_START</span><span class="p">)</span> <span class="o">|</span> <span class="n">MAC_SRC_TOTAL_LEN</span><span class="p">((</span><span class="n">u32</span><span class="p">)</span>
+		<span class="n">req_ctx</span><span class="o">-&gt;</span>
+		<span class="n">count</span><span class="p">);</span>
+
+	<span class="n">setup_data_in</span><span class="p">();</span>
+
+	<span class="n">op</span><span class="p">.</span><span class="n">mac_digest</span> <span class="o">=</span>
+		<span class="n">MAC_DIGEST_P</span><span class="p">(</span><span class="n">SRAM_DIGEST_BUF</span><span class="p">)</span> <span class="o">|</span> <span class="n">MAC_FRAG_LEN</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span><span class="p">);</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">mac_iv</span> <span class="o">=</span>
+		<span class="n">MAC_INNER_IV_P</span><span class="p">(</span><span class="n">SRAM_HMAC_IV_IN</span><span class="p">)</span> <span class="o">|</span>
+		<span class="n">MAC_OUTER_IV_P</span><span class="p">(</span><span class="n">SRAM_HMAC_IV_OUT</span><span class="p">);</span>
+
+	<span class="n">is_last</span> <span class="o">=</span> <span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span>
+		<span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_processed_bytes</span> <span class="o">+</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span> <span class="o">&gt;=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_nbytes</span><span class="p">)</span>
+		<span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;=</span> <span class="n">MAX_HW_HASH_SIZE</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">first_hash</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_last</span><span class="p">)</span>
+			<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_NOT_FRAG</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_FIRST_FRAG</span><span class="p">;</span>
+
+		<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">first_hash</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_last</span><span class="p">)</span>
+			<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_LAST_FRAG</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">op</span><span class="p">.</span><span class="n">config</span> <span class="o">|=</span> <span class="n">CFG_MID_FRAG</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">first_block</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">writel</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_A</span><span class="p">);</span>
+			<span class="n">writel</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_B</span><span class="p">);</span>
+			<span class="n">writel</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_C</span><span class="p">);</span>
+			<span class="n">writel</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">3</span><span class="p">],</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_D</span><span class="p">);</span>
+			<span class="n">writel</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">4</span><span class="p">],</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_E</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_CONFIG</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sec_accel_config</span><span class="p">));</span>
+
+	<span class="cm">/* GO */</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">SEC_CMD_EN_SEC_ACCL0</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_CMD</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	* XXX: add timer if the interrupt does not occur for some mystery</span>
+<span class="cm">	* reason</span>
+<span class="cm">	*/</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">mv_hash_import_sha1_ctx</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">shash_desc</span> <span class="o">*</span><span class="n">desc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sha1_state</span> <span class="n">shash_state</span><span class="p">;</span>
+
+	<span class="n">shash_state</span><span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">+</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count_add</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">5</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">shash_state</span><span class="p">.</span><span class="n">state</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">shash_state</span><span class="p">.</span><span class="n">buffer</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">shash_state</span><span class="p">.</span><span class="n">buffer</span><span class="p">));</span>
+	<span class="k">return</span> <span class="n">crypto_shash_import</span><span class="p">(</span><span class="n">desc</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">shash_state</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_final_fallback</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">tfm_ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">shash_desc</span> <span class="n">shash</span><span class="p">;</span>
+		<span class="kt">char</span> <span class="n">ctx</span><span class="p">[</span><span class="n">crypto_shash_descsize</span><span class="p">(</span><span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">fallback</span><span class="p">)];</span>
+	<span class="p">}</span> <span class="n">desc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">.</span><span class="n">tfm</span> <span class="o">=</span> <span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">fallback</span><span class="p">;</span>
+	<span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">CRYPTO_TFM_REQ_MAY_SLEEP</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">first_hash</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">crypto_shash_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">);</span>
+		<span class="n">crypto_shash_update</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span>
+				    <span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* only SHA1 for now....</span>
+<span class="cm">		 */</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">mv_hash_import_sha1_ctx</span><span class="p">(</span><span class="n">req_ctx</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">crypto_shash_final</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">result</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_hash_algo_completion</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">ahash_request_cast</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">)</span>
+		<span class="n">copy_src_to_buf</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">);</span>
+	<span class="n">sg_miter_stop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">src_sg_it</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;=</span> <span class="n">MAX_HW_HASH_SIZE</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">result</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DIGEST_BUF</span><span class="p">,</span>
+			       <span class="n">crypto_ahash_digestsize</span><span class="p">(</span><span class="n">crypto_ahash_reqtfm</span>
+						       <span class="p">(</span><span class="n">req</span><span class="p">)));</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">mv_hash_final_fallback</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_A</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_B</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_C</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_D</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">DIGEST_INITIAL_VAL_E</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dequeue_complete_req</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">buf</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">hw_processed_bytes</span> <span class="o">+=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">crypt_len</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">copy_back</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">need_copy_len</span> <span class="o">=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">crypt_len</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">sram_offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">dst_copy</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">sg_dst_left</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="n">sg_miter_next</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_sg_it</span><span class="p">);</span>
+				<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">);</span>
+				<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">sg_dst_left</span> <span class="o">=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_sg_it</span><span class="p">.</span><span class="n">length</span><span class="p">;</span>
+				<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_start</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">buf</span> <span class="o">=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_sg_it</span><span class="p">.</span><span class="n">addr</span><span class="p">;</span>
+			<span class="n">buf</span> <span class="o">+=</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_start</span><span class="p">;</span>
+
+			<span class="n">dst_copy</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">need_copy_len</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">sg_dst_left</span><span class="p">);</span>
+
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span>
+			       <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_OUT_START</span> <span class="o">+</span> <span class="n">sram_offset</span><span class="p">,</span>
+			       <span class="n">dst_copy</span><span class="p">);</span>
+			<span class="n">sram_offset</span> <span class="o">+=</span> <span class="n">dst_copy</span><span class="p">;</span>
+			<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">sg_dst_left</span> <span class="o">-=</span> <span class="n">dst_copy</span><span class="p">;</span>
+			<span class="n">need_copy_len</span> <span class="o">-=</span> <span class="n">dst_copy</span><span class="p">;</span>
+			<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">dst_start</span> <span class="o">+=</span> <span class="n">dst_copy</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">need_copy_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">crypt_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">!=</span> <span class="n">ENGINE_W_DEQUEUE</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">hw_processed_bytes</span> <span class="o">&lt;</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">hw_nbytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* process next scatter list entry */</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_BUSY</span><span class="p">;</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">process</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">.</span><span class="n">complete</span><span class="p">();</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_IDLE</span><span class="p">;</span>
+		<span class="n">local_bh_disable</span><span class="p">();</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">complete</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">local_bh_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">count_sgs</span><span class="p">(</span><span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sl</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">total_bytes</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">cur_len</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">sl</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cur_len</span> <span class="o">=</span> <span class="n">sl</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">length</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">i</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">total_bytes</span> <span class="o">&gt;</span> <span class="n">cur_len</span><span class="p">)</span>
+			<span class="n">total_bytes</span> <span class="o">-=</span> <span class="n">cur_len</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_start_new_crypt_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">req_progress</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">num_sgs</span><span class="p">;</span>
+
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">req_progress</span><span class="p">));</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_nbytes</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">;</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">complete</span> <span class="o">=</span> <span class="n">mv_crypto_algo_completion</span><span class="p">;</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">process</span> <span class="o">=</span> <span class="n">mv_process_current_q</span><span class="p">;</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">copy_back</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">num_sgs</span> <span class="o">=</span> <span class="n">count_sgs</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">);</span>
+	<span class="n">sg_miter_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span><span class="p">,</span> <span class="n">num_sgs</span><span class="p">,</span> <span class="n">SG_MITER_FROM_SG</span><span class="p">);</span>
+
+	<span class="n">num_sgs</span> <span class="o">=</span> <span class="n">count_sgs</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">dst</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">);</span>
+	<span class="n">sg_miter_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">dst_sg_it</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">dst</span><span class="p">,</span> <span class="n">num_sgs</span><span class="p">,</span> <span class="n">SG_MITER_TO_SG</span><span class="p">);</span>
+
+	<span class="n">mv_process_current_q</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_start_new_hash_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">req_progress</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">p</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">num_sgs</span><span class="p">,</span> <span class="n">hw_bytes</span><span class="p">,</span> <span class="n">old_extra_bytes</span><span class="p">,</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">cur_req</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">req_progress</span><span class="p">));</span>
+	<span class="n">hw_bytes</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span> <span class="o">+</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">;</span>
+	<span class="n">old_extra_bytes</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span> <span class="o">=</span> <span class="n">hw_bytes</span> <span class="o">%</span> <span class="n">SHA1_BLOCK_SIZE</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span> <span class="o">!=</span> <span class="mi">0</span>
+	    <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span> <span class="o">||</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">MAX_HW_HASH_SIZE</span><span class="p">))</span>
+		<span class="n">hw_bytes</span> <span class="o">-=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">num_sgs</span> <span class="o">=</span> <span class="n">count_sgs</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">);</span>
+	<span class="n">sg_miter_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span><span class="p">,</span> <span class="n">num_sgs</span><span class="p">,</span> <span class="n">SG_MITER_FROM_SG</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hw_bytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">hw_nbytes</span> <span class="o">=</span> <span class="n">hw_bytes</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">complete</span> <span class="o">=</span> <span class="n">mv_hash_algo_completion</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">process</span> <span class="o">=</span> <span class="n">mv_process_hash_current</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">old_extra_bytes</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">+</span> <span class="n">SRAM_DATA_IN_START</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">,</span>
+			       <span class="n">old_extra_bytes</span><span class="p">);</span>
+			<span class="n">p</span><span class="o">-&gt;</span><span class="n">crypt_len</span> <span class="o">=</span> <span class="n">old_extra_bytes</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mv_process_hash_current</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">copy_src_to_buf</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">buffer</span> <span class="o">+</span> <span class="n">old_extra_bytes</span><span class="p">,</span>
+				<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">extra_bytes</span> <span class="o">-</span> <span class="n">old_extra_bytes</span><span class="p">);</span>
+		<span class="n">sg_miter_stop</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">src_sg_it</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span><span class="p">)</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="n">mv_hash_final_fallback</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_IDLE</span><span class="p">;</span>
+		<span class="n">local_bh_disable</span><span class="p">();</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+		<span class="n">local_bh_enable</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">queue_manag</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_IDLE</span><span class="p">;</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">async_req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">backlog</span><span class="p">;</span>
+
+		<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">==</span> <span class="n">ENGINE_W_DEQUEUE</span><span class="p">)</span>
+			<span class="n">dequeue_complete_req</span><span class="p">();</span>
+
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">==</span> <span class="n">ENGINE_IDLE</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">backlog</span> <span class="o">=</span> <span class="n">crypto_get_backlog</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+			<span class="n">async_req</span> <span class="o">=</span> <span class="n">crypto_dequeue_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">async_req</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">BUG_ON</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">!=</span> <span class="n">ENGINE_IDLE</span><span class="p">);</span>
+				<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_BUSY</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">backlog</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">backlog</span><span class="o">-&gt;</span><span class="n">complete</span><span class="p">(</span><span class="n">backlog</span><span class="p">,</span> <span class="o">-</span><span class="n">EINPROGRESS</span><span class="p">);</span>
+			<span class="n">backlog</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">async_req</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">async_req</span><span class="o">-&gt;</span><span class="n">tfm</span><span class="o">-&gt;</span><span class="n">__crt_alg</span><span class="o">-&gt;</span><span class="n">cra_type</span> <span class="o">!=</span>
+			    <span class="o">&amp;</span><span class="n">crypto_ahash_type</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span>
+				    <span class="n">ablkcipher_request_cast</span><span class="p">(</span><span class="n">async_req</span><span class="p">);</span>
+				<span class="n">mv_start_new_crypt_req</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span>
+				    <span class="n">ahash_request_cast</span><span class="p">(</span><span class="n">async_req</span><span class="p">);</span>
+				<span class="n">mv_start_new_hash_req</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="n">async_req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">schedule</span><span class="p">();</span>
+
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">());</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_handle_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">crypto_enqueue_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">wake_up_process</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_enc_aes_ecb</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">COP_AES_ECB</span><span class="p">;</span>
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">decrypt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_dec_aes_ecb</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">COP_AES_ECB</span><span class="p">;</span>
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">decrypt</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">compute_aes_dec_key</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_enc_aes_cbc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">COP_AES_CBC</span><span class="p">;</span>
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">decrypt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_dec_aes_cbc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">mv_req_ctx</span> <span class="o">*</span><span class="n">req_ctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">COP_AES_CBC</span><span class="p">;</span>
+	<span class="n">req_ctx</span><span class="o">-&gt;</span><span class="n">decrypt</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">compute_aes_dec_key</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_cra_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tfm</span><span class="o">-&gt;</span><span class="n">crt_ablkcipher</span><span class="p">.</span><span class="n">reqsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_req_ctx</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_init_hash_req_ctx</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">,</span> <span class="kt">int</span> <span class="n">op</span><span class="p">,</span>
+				 <span class="kt">int</span> <span class="n">is_last</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">req_len</span><span class="p">,</span>
+				 <span class="kt">int</span> <span class="n">count_add</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ctx</span><span class="p">));</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">op</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">req_len</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">first_hash</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span> <span class="o">=</span> <span class="n">is_last</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count_add</span> <span class="o">=</span> <span class="n">count_add</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_update_hash_req_ctx</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">,</span> <span class="kt">int</span> <span class="n">is_last</span><span class="p">,</span>
+				   <span class="kt">unsigned</span> <span class="n">req_len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">last_chunk</span> <span class="o">=</span> <span class="n">is_last</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">+=</span> <span class="n">req_len</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">tfm_ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="n">mv_init_hash_req_ctx</span><span class="p">(</span><span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">),</span> <span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">op</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+			     <span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">count_add</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_update</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">mv_update_hash_req_ctx</span><span class="p">(</span><span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">),</span> <span class="mi">0</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_final</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_req_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+
+	<span class="n">ahash_request_set_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">result</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">mv_update_hash_req_ctx</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_finup</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mv_update_hash_req_ctx</span><span class="p">(</span><span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">),</span> <span class="mi">1</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_digest</span><span class="p">(</span><span class="k">struct</span> <span class="n">ahash_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">tfm_ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="n">mv_init_hash_req_ctx</span><span class="p">(</span><span class="n">ahash_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">),</span> <span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">op</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span>
+			     <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">tfm_ctx</span><span class="o">-&gt;</span><span class="n">count_add</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">mv_handle_req</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_hash_init_ivs</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">,</span> <span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">istate</span><span class="p">,</span>
+			     <span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">ostate</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">sha1_state</span> <span class="o">*</span><span class="n">isha1_state</span> <span class="o">=</span> <span class="n">istate</span><span class="p">,</span> <span class="o">*</span><span class="n">osha1_state</span> <span class="o">=</span> <span class="n">ostate</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">5</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ivs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">isha1_state</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ivs</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">5</span><span class="p">]</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">osha1_state</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_hash_setkey</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_ahash</span> <span class="o">*</span><span class="n">tfm</span><span class="p">,</span> <span class="k">const</span> <span class="n">u8</span> <span class="o">*</span> <span class="n">key</span><span class="p">,</span>
+			  <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">keylen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tfm</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">bs</span><span class="p">,</span> <span class="n">ds</span><span class="p">,</span> <span class="n">ss</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">crypto_shash_setkey</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">fallback</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">keylen</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* Can&#39;t see a way to extract the ipad/opad from the fallback tfm</span>
+<span class="cm">	   so I&#39;m basically copying code from the hmac module */</span>
+	<span class="n">bs</span> <span class="o">=</span> <span class="n">crypto_shash_blocksize</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">);</span>
+	<span class="n">ds</span> <span class="o">=</span> <span class="n">crypto_shash_digestsize</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">);</span>
+	<span class="n">ss</span> <span class="o">=</span> <span class="n">crypto_shash_statesize</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">);</span>
+
+	<span class="p">{</span>
+		<span class="k">struct</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">shash_desc</span> <span class="n">shash</span><span class="p">;</span>
+			<span class="kt">char</span> <span class="n">ctx</span><span class="p">[</span><span class="n">crypto_shash_descsize</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">)];</span>
+		<span class="p">}</span> <span class="n">desc</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+		<span class="kt">char</span> <span class="n">ipad</span><span class="p">[</span><span class="n">ss</span><span class="p">];</span>
+		<span class="kt">char</span> <span class="n">opad</span><span class="p">[</span><span class="n">ss</span><span class="p">];</span>
+
+		<span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">.</span><span class="n">tfm</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">;</span>
+		<span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">crypto_shash_get_flags</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">)</span> <span class="o">&amp;</span>
+		    <span class="n">CRYPTO_TFM_REQ_MAY_SLEEP</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">keylen</span> <span class="o">&gt;</span> <span class="n">bs</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+			<span class="n">err</span> <span class="o">=</span>
+			    <span class="n">crypto_shash_digest</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">keylen</span><span class="p">,</span> <span class="n">ipad</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+
+			<span class="n">keylen</span> <span class="o">=</span> <span class="n">ds</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">ipad</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">keylen</span><span class="p">);</span>
+
+		<span class="n">memset</span><span class="p">(</span><span class="n">ipad</span> <span class="o">+</span> <span class="n">keylen</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">bs</span> <span class="o">-</span> <span class="n">keylen</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">opad</span><span class="p">,</span> <span class="n">ipad</span><span class="p">,</span> <span class="n">bs</span><span class="p">);</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">bs</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ipad</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">^=</span> <span class="mh">0x36</span><span class="p">;</span>
+			<span class="n">opad</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">^=</span> <span class="mh">0x5c</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">crypto_shash_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">)</span> <span class="o">?</span> <span class="o">:</span>
+		    <span class="n">crypto_shash_update</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">ipad</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span> <span class="o">?</span> <span class="o">:</span>
+		    <span class="n">crypto_shash_export</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">ipad</span><span class="p">)</span> <span class="o">?</span> <span class="o">:</span>
+		    <span class="n">crypto_shash_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">)</span> <span class="o">?</span> <span class="o">:</span>
+		    <span class="n">crypto_shash_update</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">opad</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span> <span class="o">?</span> <span class="o">:</span>
+		    <span class="n">crypto_shash_export</span><span class="p">(</span><span class="o">&amp;</span><span class="n">desc</span><span class="p">.</span><span class="n">shash</span><span class="p">,</span> <span class="n">opad</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">mv_hash_init_ivs</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">ipad</span><span class="p">,</span> <span class="n">opad</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_cra_hash_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">base_hash_name</span><span class="p">,</span>
+			    <span class="k">enum</span> <span class="n">hash_op</span> <span class="n">op</span><span class="p">,</span> <span class="kt">int</span> <span class="n">count_add</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">fallback_driver_name</span> <span class="o">=</span> <span class="n">tfm</span><span class="o">-&gt;</span><span class="n">__crt_alg</span><span class="o">-&gt;</span><span class="n">cra_name</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">crypto_shash</span> <span class="o">*</span><span class="n">fallback_tfm</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_shash</span> <span class="o">*</span><span class="n">base_hash</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">op</span> <span class="o">=</span> <span class="n">op</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">count_add</span> <span class="o">=</span> <span class="n">count_add</span><span class="p">;</span>
+
+	<span class="cm">/* Allocate a fallback and abort if it failed. */</span>
+	<span class="n">fallback_tfm</span> <span class="o">=</span> <span class="n">crypto_alloc_shash</span><span class="p">(</span><span class="n">fallback_driver_name</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+					  <span class="n">CRYPTO_ALG_NEED_FALLBACK</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">fallback_tfm</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span>
+		       <span class="s">&quot;Fallback driver &#39;%s&#39; could not be loaded!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">fallback_driver_name</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">fallback_tfm</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">fallback</span> <span class="o">=</span> <span class="n">fallback_tfm</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">base_hash_name</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Allocate a hash to compute the ipad/opad of hmac. */</span>
+		<span class="n">base_hash</span> <span class="o">=</span> <span class="n">crypto_alloc_shash</span><span class="p">(</span><span class="n">base_hash_name</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+					       <span class="n">CRYPTO_ALG_NEED_FALLBACK</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">base_hash</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span>
+			       <span class="s">&quot;Base driver &#39;%s&#39; could not be loaded!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">base_hash_name</span><span class="p">);</span>
+			<span class="n">err</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">base_hash</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">err_bad_base</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span> <span class="o">=</span> <span class="n">base_hash</span><span class="p">;</span>
+
+	<span class="n">crypto_ahash_set_reqsize</span><span class="p">(</span><span class="n">__crypto_ahash_cast</span><span class="p">(</span><span class="n">tfm</span><span class="p">),</span>
+				 <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_req_hash_ctx</span><span class="p">)</span> <span class="o">+</span>
+				 <span class="n">crypto_shash_descsize</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">fallback</span><span class="p">));</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">err_bad_base:</span>
+	<span class="n">crypto_free_shash</span><span class="p">(</span><span class="n">fallback_tfm</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">mv_cra_hash_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_tfm_ctx</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+
+	<span class="n">crypto_free_shash</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">fallback</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">)</span>
+		<span class="n">crypto_free_shash</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">base_hash</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_cra_hash_sha1_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">mv_cra_hash_init</span><span class="p">(</span><span class="n">tfm</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">COP_SHA1</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_cra_hash_hmac_sha1_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">mv_cra_hash_init</span><span class="p">(</span><span class="n">tfm</span><span class="p">,</span> <span class="s">&quot;sha1&quot;</span><span class="p">,</span> <span class="n">COP_HMAC_SHA1</span><span class="p">,</span> <span class="n">SHA1_BLOCK_SIZE</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">irqreturn_t</span> <span class="nf">crypto_int</span><span class="p">(</span><span class="kt">int</span> <span class="n">irq</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">val</span><span class="p">;</span>
+
+	<span class="n">val</span> <span class="o">=</span> <span class="n">readl</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_INT_STATUS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">val</span> <span class="o">&amp;</span> <span class="n">SEC_INT_ACCEL0_DONE</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">IRQ_NONE</span><span class="p">;</span>
+
+	<span class="n">val</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">SEC_INT_ACCEL0_DONE</span><span class="p">;</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">FPGA_INT_STATUS</span><span class="p">);</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_INT_STATUS</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">!=</span> <span class="n">ENGINE_BUSY</span><span class="p">);</span>
+	<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">eng_st</span> <span class="o">=</span> <span class="n">ENGINE_W_DEQUEUE</span><span class="p">;</span>
+	<span class="n">wake_up_process</span><span class="p">(</span><span class="n">cpg</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">IRQ_HANDLED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">crypto_alg</span> <span class="n">mv_aes_alg_ecb</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">cra_name</span>		<span class="o">=</span> <span class="s">&quot;ecb(aes)&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_driver_name</span>	<span class="o">=</span> <span class="s">&quot;mv-ecb-aes&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_priority</span>	<span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_flags</span>	<span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_ABLKCIPHER</span> <span class="o">|</span>
+			  <span class="n">CRYPTO_ALG_KERN_DRIVER_ONLY</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_ASYNC</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_blocksize</span>	<span class="o">=</span> <span class="mi">16</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_ctxsize</span>	<span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_ctx</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">cra_alignmask</span>	<span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_type</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_ablkcipher_type</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_module</span>	<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_init</span>	<span class="o">=</span> <span class="n">mv_cra_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_u</span>		<span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">ablkcipher</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">min_keysize</span>	<span class="o">=</span>	<span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_keysize</span>	<span class="o">=</span>	<span class="n">AES_MAX_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">setkey</span>		<span class="o">=</span>	<span class="n">mv_setkey_aes</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">encrypt</span>	<span class="o">=</span>	<span class="n">mv_enc_aes_ecb</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">decrypt</span>	<span class="o">=</span>	<span class="n">mv_dec_aes_ecb</span><span class="p">,</span>
+		<span class="p">},</span>
+	<span class="p">},</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">crypto_alg</span> <span class="n">mv_aes_alg_cbc</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">cra_name</span>		<span class="o">=</span> <span class="s">&quot;cbc(aes)&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_driver_name</span>	<span class="o">=</span> <span class="s">&quot;mv-cbc-aes&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_priority</span>	<span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_flags</span>	<span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_ABLKCIPHER</span> <span class="o">|</span>
+			  <span class="n">CRYPTO_ALG_KERN_DRIVER_ONLY</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_ASYNC</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_blocksize</span>	<span class="o">=</span> <span class="n">AES_BLOCK_SIZE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_ctxsize</span>	<span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_ctx</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">cra_alignmask</span>	<span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_type</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_ablkcipher_type</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_module</span>	<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_init</span>	<span class="o">=</span> <span class="n">mv_cra_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">cra_u</span>		<span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">ablkcipher</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">ivsize</span>		<span class="o">=</span>	<span class="n">AES_BLOCK_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">min_keysize</span>	<span class="o">=</span>	<span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_keysize</span>	<span class="o">=</span>	<span class="n">AES_MAX_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">setkey</span>		<span class="o">=</span>	<span class="n">mv_setkey_aes</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">encrypt</span>	<span class="o">=</span>	<span class="n">mv_enc_aes_cbc</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">decrypt</span>	<span class="o">=</span>	<span class="n">mv_dec_aes_cbc</span><span class="p">,</span>
+		<span class="p">},</span>
+	<span class="p">},</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">ahash_alg</span> <span class="n">mv_sha1_alg</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">init</span> <span class="o">=</span> <span class="n">mv_hash_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">update</span> <span class="o">=</span> <span class="n">mv_hash_update</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">final</span> <span class="o">=</span> <span class="n">mv_hash_final</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">finup</span> <span class="o">=</span> <span class="n">mv_hash_finup</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">digest</span> <span class="o">=</span> <span class="n">mv_hash_digest</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">halg</span> <span class="o">=</span> <span class="p">{</span>
+		 <span class="p">.</span><span class="n">digestsize</span> <span class="o">=</span> <span class="n">SHA1_DIGEST_SIZE</span><span class="p">,</span>
+		 <span class="p">.</span><span class="n">base</span> <span class="o">=</span> <span class="p">{</span>
+			  <span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;sha1&quot;</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;mv-sha1&quot;</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span>
+			  <span class="n">CRYPTO_ALG_ASYNC</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_KERN_DRIVER_ONLY</span> <span class="o">|</span>
+			  <span class="n">CRYPTO_ALG_NEED_FALLBACK</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_blocksize</span> <span class="o">=</span> <span class="n">SHA1_BLOCK_SIZE</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_ctxsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span><span class="p">),</span>
+			  <span class="p">.</span><span class="n">cra_init</span> <span class="o">=</span> <span class="n">mv_cra_hash_sha1_init</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_exit</span> <span class="o">=</span> <span class="n">mv_cra_hash_exit</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_module</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+			  <span class="p">}</span>
+		 <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">ahash_alg</span> <span class="n">mv_hmac_sha1_alg</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">init</span> <span class="o">=</span> <span class="n">mv_hash_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">update</span> <span class="o">=</span> <span class="n">mv_hash_update</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">final</span> <span class="o">=</span> <span class="n">mv_hash_final</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">finup</span> <span class="o">=</span> <span class="n">mv_hash_finup</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">digest</span> <span class="o">=</span> <span class="n">mv_hash_digest</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">setkey</span> <span class="o">=</span> <span class="n">mv_hash_setkey</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">halg</span> <span class="o">=</span> <span class="p">{</span>
+		 <span class="p">.</span><span class="n">digestsize</span> <span class="o">=</span> <span class="n">SHA1_DIGEST_SIZE</span><span class="p">,</span>
+		 <span class="p">.</span><span class="n">base</span> <span class="o">=</span> <span class="p">{</span>
+			  <span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;hmac(sha1)&quot;</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;mv-hmac-sha1&quot;</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span>
+			  <span class="n">CRYPTO_ALG_ASYNC</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_KERN_DRIVER_ONLY</span> <span class="o">|</span>
+			  <span class="n">CRYPTO_ALG_NEED_FALLBACK</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_blocksize</span> <span class="o">=</span> <span class="n">SHA1_BLOCK_SIZE</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_ctxsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">mv_tfm_hash_ctx</span><span class="p">),</span>
+			  <span class="p">.</span><span class="n">cra_init</span> <span class="o">=</span> <span class="n">mv_cra_hash_hmac_sha1_init</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_exit</span> <span class="o">=</span> <span class="n">mv_cra_hash_exit</span><span class="p">,</span>
+			  <span class="p">.</span><span class="n">cra_module</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+			  <span class="p">}</span>
+		 <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_probe</span><span class="p">(</span><span class="k">struct</span> <span class="n">platform_device</span> <span class="o">*</span><span class="n">pdev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_priv</span> <span class="o">*</span><span class="n">cp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">resource</span> <span class="o">*</span><span class="n">res</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">irq</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpg</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="n">MV_CESA</span> <span class="s">&quot;Second crypto dev?</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">res</span> <span class="o">=</span> <span class="n">platform_get_resource_byname</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">IORESOURCE_MEM</span><span class="p">,</span> <span class="s">&quot;regs&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="n">cp</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">cp</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cp</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">crypto_init_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="mi">50</span><span class="p">);</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">=</span> <span class="n">ioremap</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">resource_size</span><span class="p">(</span><span class="n">res</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">reg</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">res</span> <span class="o">=</span> <span class="n">platform_get_resource_byname</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">IORESOURCE_MEM</span><span class="p">,</span> <span class="s">&quot;sram&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err_unmap_reg</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram_size</span> <span class="o">=</span> <span class="n">resource_size</span><span class="p">(</span><span class="n">res</span><span class="p">);</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">max_req_size</span> <span class="o">=</span> <span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram_size</span> <span class="o">-</span> <span class="n">SRAM_CFG_SPACE</span><span class="p">;</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram</span> <span class="o">=</span> <span class="n">ioremap</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err_unmap_reg</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">irq</span> <span class="o">=</span> <span class="n">platform_get_irq</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">irq</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">irq</span> <span class="o">==</span> <span class="n">NO_IRQ</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">irq</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">err_unmap_sram</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">irq</span> <span class="o">=</span> <span class="n">irq</span><span class="p">;</span>
+
+	<span class="n">platform_set_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">cp</span><span class="p">);</span>
+	<span class="n">cpg</span> <span class="o">=</span> <span class="n">cp</span><span class="p">;</span>
+
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue_th</span> <span class="o">=</span> <span class="n">kthread_run</span><span class="p">(</span><span class="n">queue_manag</span><span class="p">,</span> <span class="n">cp</span><span class="p">,</span> <span class="s">&quot;mv_crypto&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err_unmap_sram</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">request_irq</span><span class="p">(</span><span class="n">irq</span><span class="p">,</span> <span class="n">crypto_int</span><span class="p">,</span> <span class="n">IRQF_DISABLED</span><span class="p">,</span> <span class="n">dev_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">),</span>
+			<span class="n">cp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">err_thread</span><span class="p">;</span>
+
+	<span class="cm">/* Not all platforms can gate the clock, so it is not</span>
+<span class="cm">	   an error if the clock does not exists. */</span>
+	<span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span> <span class="o">=</span> <span class="n">clk_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">))</span>
+		<span class="n">clk_prepare_enable</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">);</span>
+
+	<span class="n">writel</span><span class="p">(</span><span class="n">SEC_INT_ACCEL0_DONE</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_INT_MASK</span><span class="p">);</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">SEC_CFG_STOP_DIG_ERR</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_CFG</span><span class="p">);</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">SRAM_CONFIG</span><span class="p">,</span> <span class="n">cpg</span><span class="o">-&gt;</span><span class="n">reg</span> <span class="o">+</span> <span class="n">SEC_ACCEL_DESC_P0</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">crypto_register_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_aes_alg_ecb</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span>
+		       <span class="s">&quot;Could not register aes-ecb driver</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err_irq</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">crypto_register_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_aes_alg_cbc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span>
+		       <span class="s">&quot;Could not register aes-cbc driver</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">err_unreg_ecb</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">crypto_register_ahash</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_sha1_alg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">has_sha1</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span> <span class="s">&quot;Could not register sha1 driver</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">crypto_register_ahash</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_hmac_sha1_alg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cpg</span><span class="o">-&gt;</span><span class="n">has_hmac_sha1</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">MV_CESA</span>
+		       <span class="s">&quot;Could not register hmac-sha1 driver</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">err_unreg_ecb:</span>
+	<span class="n">crypto_unregister_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_aes_alg_ecb</span><span class="p">);</span>
+<span class="nl">err_irq:</span>
+	<span class="n">free_irq</span><span class="p">(</span><span class="n">irq</span><span class="p">,</span> <span class="n">cp</span><span class="p">);</span>
+<span class="nl">err_thread:</span>
+	<span class="n">kthread_stop</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">);</span>
+<span class="nl">err_unmap_sram:</span>
+	<span class="n">iounmap</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram</span><span class="p">);</span>
+<span class="nl">err_unmap_reg:</span>
+	<span class="n">iounmap</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">reg</span><span class="p">);</span>
+<span class="nl">err:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">cp</span><span class="p">);</span>
+	<span class="n">cpg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">platform_set_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">mv_remove</span><span class="p">(</span><span class="k">struct</span> <span class="n">platform_device</span> <span class="o">*</span><span class="n">pdev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_priv</span> <span class="o">*</span><span class="n">cp</span> <span class="o">=</span> <span class="n">platform_get_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">);</span>
+
+	<span class="n">crypto_unregister_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_aes_alg_ecb</span><span class="p">);</span>
+	<span class="n">crypto_unregister_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_aes_alg_cbc</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">has_sha1</span><span class="p">)</span>
+		<span class="n">crypto_unregister_ahash</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_sha1_alg</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">has_hmac_sha1</span><span class="p">)</span>
+		<span class="n">crypto_unregister_ahash</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mv_hmac_sha1_alg</span><span class="p">);</span>
+	<span class="n">kthread_stop</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">queue_th</span><span class="p">);</span>
+	<span class="n">free_irq</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">irq</span><span class="p">,</span> <span class="n">cp</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram_size</span><span class="p">);</span>
+	<span class="n">iounmap</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">sram</span><span class="p">);</span>
+	<span class="n">iounmap</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">reg</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">clk_disable_unprepare</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">);</span>
+		<span class="n">clk_put</span><span class="p">(</span><span class="n">cp</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">cp</span><span class="p">);</span>
+	<span class="n">cpg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">platform_driver</span> <span class="n">marvell_crypto</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">probe</span>		<span class="o">=</span> <span class="n">mv_probe</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">remove</span>		<span class="o">=</span> <span class="n">mv_remove</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">driver</span>		<span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">owner</span>	<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">name</span>	<span class="o">=</span> <span class="s">&quot;mv_crypto&quot;</span><span class="p">,</span>
+	<span class="p">},</span>
+<span class="p">};</span>
+<span class="n">MODULE_ALIAS</span><span class="p">(</span><span class="s">&quot;platform:mv_crypto&quot;</span><span class="p">);</span>
+
+<span class="n">module_platform_driver</span><span class="p">(</span><span class="n">marvell_crypto</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Sebastian Andrzej Siewior &lt;sebastian@breakpoint.cc&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Support for Marvell&#39;s cryptographic engine&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

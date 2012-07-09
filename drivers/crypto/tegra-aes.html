@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › crypto › tegra-aes.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>tegra-aes.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * drivers/crypto/tegra-aes.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * Driver for NVIDIA Tegra AES hardware engine residing inside the</span>
+<span class="cm"> * Bit Stream Engine for Video (BSEV) hardware block.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The programming sequence for this engine is with the help</span>
+<span class="cm"> * of commands which travel via a command queue residing between the</span>
+<span class="cm"> * CPU and the BSEV block. The BSEV engine has an internal RAM (VRAM)</span>
+<span class="cm"> * where the final input plaintext, keys and the IV have to be copied</span>
+<span class="cm"> * before starting the encrypt/decrypt operation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2010, NVIDIA Corporation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License as published by</span>
+<span class="cm"> * the Free Software Foundation; either version 2 of the License, or</span>
+<span class="cm"> * (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful, but WITHOUT</span>
+<span class="cm"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</span>
+<span class="cm"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for</span>
+<span class="cm"> * more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License along</span>
+<span class="cm"> * with this program; if not, write to the Free Software Foundation, Inc.,</span>
+<span class="cm"> * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/clk.h&gt;</span>
+<span class="cp">#include &lt;linux/platform_device.h&gt;</span>
+<span class="cp">#include &lt;linux/scatterlist.h&gt;</span>
+<span class="cp">#include &lt;linux/dma-mapping.h&gt;</span>
+<span class="cp">#include &lt;linux/io.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/completion.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+
+<span class="cp">#include &lt;mach/clk.h&gt;</span>
+
+<span class="cp">#include &lt;crypto/scatterwalk.h&gt;</span>
+<span class="cp">#include &lt;crypto/aes.h&gt;</span>
+<span class="cp">#include &lt;crypto/internal/rng.h&gt;</span>
+
+<span class="cp">#include &quot;tegra-aes.h&quot;</span>
+
+<span class="cp">#define FLAGS_MODE_MASK			0x00FF</span>
+<span class="cp">#define FLAGS_ENCRYPT			BIT(0)</span>
+<span class="cp">#define FLAGS_CBC			BIT(1)</span>
+<span class="cp">#define FLAGS_GIV			BIT(2)</span>
+<span class="cp">#define FLAGS_RNG			BIT(3)</span>
+<span class="cp">#define FLAGS_OFB			BIT(4)</span>
+<span class="cp">#define FLAGS_NEW_KEY			BIT(5)</span>
+<span class="cp">#define FLAGS_NEW_IV			BIT(6)</span>
+<span class="cp">#define FLAGS_INIT			BIT(7)</span>
+<span class="cp">#define FLAGS_FAST			BIT(8)</span>
+<span class="cp">#define FLAGS_BUSY			9</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Defines AES engine Max process bytes size in one go, which takes 1 msec.</span>
+<span class="cm"> * AES engine spends about 176 cycles/16-bytes or 11 cycles/byte</span>
+<span class="cm"> * The duration CPU can use the BSE to 1 msec, then the number of available</span>
+<span class="cm"> * cycles of AVP/BSE is 216K. In this duration, AES can process 216/11 ~= 19KB</span>
+<span class="cm"> * Based on this AES_HW_DMA_BUFFER_SIZE_BYTES is configured to 16KB.</span>
+<span class="cm"> */</span>
+<span class="cp">#define AES_HW_DMA_BUFFER_SIZE_BYTES 0x4000</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The key table length is 64 bytes</span>
+<span class="cm"> * (This includes first upto 32 bytes key + 16 bytes original initial vector</span>
+<span class="cm"> * and 16 bytes updated initial vector)</span>
+<span class="cm"> */</span>
+<span class="cp">#define AES_HW_KEY_TABLE_LENGTH_BYTES 64</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The memory being used is divides as follows:</span>
+<span class="cm"> * 1. Key - 32 bytes</span>
+<span class="cm"> * 2. Original IV - 16 bytes</span>
+<span class="cm"> * 3. Updated IV - 16 bytes</span>
+<span class="cm"> * 4. Key schedule - 256 bytes</span>
+<span class="cm"> *</span>
+<span class="cm"> * 1+2+3 constitute the hw key table.</span>
+<span class="cm"> */</span>
+<span class="cp">#define AES_HW_IV_SIZE 16</span>
+<span class="cp">#define AES_HW_KEYSCHEDULE_LEN 256</span>
+<span class="cp">#define AES_IVKEY_SIZE (AES_HW_KEY_TABLE_LENGTH_BYTES + AES_HW_KEYSCHEDULE_LEN)</span>
+
+<span class="cm">/* Define commands required for AES operation */</span>
+<span class="k">enum</span> <span class="p">{</span>
+	<span class="n">CMD_BLKSTARTENGINE</span> <span class="o">=</span> <span class="mh">0x0E</span><span class="p">,</span>
+	<span class="n">CMD_DMASETUP</span> <span class="o">=</span> <span class="mh">0x10</span><span class="p">,</span>
+	<span class="n">CMD_DMACOMPLETE</span> <span class="o">=</span> <span class="mh">0x11</span><span class="p">,</span>
+	<span class="n">CMD_SETTABLE</span> <span class="o">=</span> <span class="mh">0x15</span><span class="p">,</span>
+	<span class="n">CMD_MEMDMAVD</span> <span class="o">=</span> <span class="mh">0x22</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/* Define sub-commands */</span>
+<span class="k">enum</span> <span class="p">{</span>
+	<span class="n">SUBCMD_VRAM_SEL</span> <span class="o">=</span> <span class="mh">0x1</span><span class="p">,</span>
+	<span class="n">SUBCMD_CRYPTO_TABLE_SEL</span> <span class="o">=</span> <span class="mh">0x3</span><span class="p">,</span>
+	<span class="n">SUBCMD_KEY_TABLE_SEL</span> <span class="o">=</span> <span class="mh">0x8</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/* memdma_vd command */</span>
+<span class="cp">#define MEMDMA_DIR_DTOVRAM		0 </span><span class="cm">/* sdram -&gt; vram */</span><span class="cp"></span>
+<span class="cp">#define MEMDMA_DIR_VTODRAM		1 </span><span class="cm">/* vram -&gt; sdram */</span><span class="cp"></span>
+<span class="cp">#define MEMDMA_DIR_SHIFT		25</span>
+<span class="cp">#define MEMDMA_NUM_WORDS_SHIFT		12</span>
+
+<span class="cm">/* command queue bit shifts */</span>
+<span class="k">enum</span> <span class="p">{</span>
+	<span class="n">CMDQ_KEYTABLEADDR_SHIFT</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="n">CMDQ_KEYTABLEID_SHIFT</span> <span class="o">=</span> <span class="mi">17</span><span class="p">,</span>
+	<span class="n">CMDQ_VRAMSEL_SHIFT</span> <span class="o">=</span> <span class="mi">23</span><span class="p">,</span>
+	<span class="n">CMDQ_TABLESEL_SHIFT</span> <span class="o">=</span> <span class="mi">24</span><span class="p">,</span>
+	<span class="n">CMDQ_OPCODE_SHIFT</span> <span class="o">=</span> <span class="mi">26</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The secure key slot contains a unique secure key generated</span>
+<span class="cm"> * and loaded by the bootloader. This slot is marked as non-accessible</span>
+<span class="cm"> * to the kernel.</span>
+<span class="cm"> */</span>
+<span class="cp">#define SSK_SLOT_NUM		4</span>
+
+<span class="cp">#define AES_NR_KEYSLOTS		8</span>
+<span class="cp">#define TEGRA_AES_QUEUE_LENGTH	50</span>
+<span class="cp">#define DEFAULT_RNG_BLK_SZ	16</span>
+
+<span class="cm">/* The command queue depth */</span>
+<span class="cp">#define AES_HW_MAX_ICQ_LENGTH	5</span>
+
+<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">node</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">slot_num</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="n">ssk</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">slot_num</span> <span class="o">=</span> <span class="n">SSK_SLOT_NUM</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">tegra_aes_reqctx</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">mode</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="n">__iomem</span> <span class="o">*</span><span class="n">io_base</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">ivkey_phys_base</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="n">__iomem</span> <span class="o">*</span><span class="n">ivkey_base</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">clk</span> <span class="o">*</span><span class="n">aes_clk</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">irq</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">completion</span> <span class="n">op_complete</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="o">*</span><span class="n">buf_in</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">dma_buf_in</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="o">*</span><span class="n">buf_out</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">dma_buf_out</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="o">*</span><span class="n">iv</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">dt</span><span class="p">[</span><span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">ivlen</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">ctr</span><span class="p">;</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_queue</span> <span class="n">queue</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">slots</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">total</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">in_sg</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">in_offset</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">out_sg</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">out_offset</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">aes_dev</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">key</span><span class="p">[</span><span class="n">AES_MAX_KEY_SIZE</span><span class="p">];</span>
+	<span class="kt">size_t</span> <span class="n">keylen</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="n">rng_ctx</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">FLAGS_NEW_KEY</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">keylen</span> <span class="o">=</span> <span class="n">AES_KEYSIZE_128</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/* keep registered devices data here */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="n">dev_list</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">list_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">aes_lock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">aes_workqueue_handler</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DECLARE_WORK</span><span class="p">(</span><span class="n">aes_work</span><span class="p">,</span> <span class="n">aes_workqueue_handler</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">aes_wq</span><span class="p">;</span>
+
+<span class="k">extern</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span> <span class="n">tegra_chip_uid</span><span class="p">(</span><span class="kt">void</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u32</span> <span class="nf">aes_readl</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">,</span> <span class="n">u32</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">readl</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">io_base</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">aes_writel</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">,</span> <span class="n">u32</span> <span class="n">val</span><span class="p">,</span> <span class="n">u32</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">writel</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">io_base</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">aes_start_crypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">,</span> <span class="n">u32</span> <span class="n">in_addr</span><span class="p">,</span> <span class="n">u32</span> <span class="n">out_addr</span><span class="p">,</span>
+	<span class="kt">int</span> <span class="n">nblocks</span><span class="p">,</span> <span class="kt">int</span> <span class="n">mode</span><span class="p">,</span> <span class="n">bool</span> <span class="n">upd_iv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">cmdq</span><span class="p">[</span><span class="n">AES_HW_MAX_ICQ_LENGTH</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">eng_busy</span><span class="p">,</span> <span class="n">icq_empty</span><span class="p">,</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">value</span><span class="p">;</span>
+
+	<span class="cm">/* reset all the interrupt bits */</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+
+	<span class="cm">/* enable error, dma xfer complete interrupts */</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="mh">0x33</span><span class="p">,</span> <span class="n">TEGRA_AES_INT_ENB</span><span class="p">);</span>
+
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">CMD_DMASETUP</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_OPCODE_SHIFT</span><span class="p">;</span>
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">in_addr</span><span class="p">;</span>
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">CMD_BLKSTARTENGINE</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_OPCODE_SHIFT</span> <span class="o">|</span> <span class="p">(</span><span class="n">nblocks</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">CMD_DMACOMPLETE</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_OPCODE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_CMDQUE_CONTROL</span><span class="p">);</span>
+	<span class="cm">/* access SDRAM through AHB */</span>
+	<span class="n">value</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TEGRA_AES_CMDQ_CTRL_SRC_STM_SEL_FIELD</span><span class="p">;</span>
+	<span class="n">value</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TEGRA_AES_CMDQ_CTRL_DST_STM_SEL_FIELD</span><span class="p">;</span>
+	<span class="n">value</span> <span class="o">|=</span> <span class="n">TEGRA_AES_CMDQ_CTRL_SRC_STM_SEL_FIELD</span> <span class="o">|</span>
+		 <span class="n">TEGRA_AES_CMDQ_CTRL_DST_STM_SEL_FIELD</span> <span class="o">|</span>
+		 <span class="n">TEGRA_AES_CMDQ_CTRL_ICMDQEN_FIELD</span><span class="p">;</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">TEGRA_AES_CMDQUE_CONTROL</span><span class="p">);</span>
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;cmd_q_ctrl=0x%x&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">);</span>
+
+	<span class="n">value</span> <span class="o">=</span> <span class="p">(</span><span class="mh">0x1</span> <span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_INPUT_ALG_SEL_SHIFT</span><span class="p">)</span> <span class="o">|</span>
+		<span class="p">((</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span> <span class="o">*</span> <span class="mi">8</span><span class="p">)</span> <span class="o">&lt;&lt;</span>
+			<span class="n">TEGRA_AES_SECURE_INPUT_KEY_LEN_SHIFT</span><span class="p">)</span> <span class="o">|</span>
+		<span class="p">((</span><span class="n">u32</span><span class="p">)</span><span class="n">upd_iv</span> <span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_IV_SELECT_SHIFT</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_CBC</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">|=</span> <span class="p">((((</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">)</span> <span class="o">?</span> <span class="mi">2</span> <span class="o">:</span> <span class="mi">3</span><span class="p">)</span>
+				<span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_XOR_POS_SHIFT</span><span class="p">)</span> <span class="o">|</span>
+			<span class="p">(((</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">)</span> <span class="o">?</span> <span class="mi">2</span> <span class="o">:</span> <span class="mi">3</span><span class="p">)</span>
+				<span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_VCTRAM_SEL_SHIFT</span><span class="p">)</span> <span class="o">|</span>
+			<span class="p">((</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">)</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_CORE_SEL_SHIFT</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_OFB</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">|=</span> <span class="p">((</span><span class="n">TEGRA_AES_SECURE_XOR_POS_FIELD</span><span class="p">)</span> <span class="o">|</span>
+			<span class="p">(</span><span class="mi">2</span> <span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_INPUT_SEL_SHIFT</span><span class="p">)</span> <span class="o">|</span>
+			<span class="p">(</span><span class="n">TEGRA_AES_SECURE_CORE_SEL_FIELD</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_RNG</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">|=</span> <span class="p">(((</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">)</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_CORE_SEL_SHIFT</span> <span class="o">|</span>
+			  <span class="n">TEGRA_AES_SECURE_RNG_ENB_FIELD</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">|=</span> <span class="p">(((</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">)</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_CORE_SEL_SHIFT</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;secure_in_sel=0x%x&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">);</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_INPUT_SELECT</span><span class="p">);</span>
+
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">out_addr</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_DEST_ADDR</span><span class="p">);</span>
+	<span class="n">INIT_COMPLETION</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">op_complete</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">AES_HW_MAX_ICQ_LENGTH</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+			<span class="n">eng_busy</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ENGINE_BUSY_FIELD</span><span class="p">;</span>
+			<span class="n">icq_empty</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ICQ_EMPTY_FIELD</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">eng_busy</span> <span class="o">&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">icq_empty</span><span class="p">));</span>
+		<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">cmdq</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">TEGRA_AES_ICMDQUE_WR</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">wait_for_completion_timeout</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">op_complete</span><span class="p">,</span>
+					  <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="mi">150</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;timed out (0x%x)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">));</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ETIMEDOUT</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">cmdq</span><span class="p">[</span><span class="n">AES_HW_MAX_ICQ_LENGTH</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">TEGRA_AES_ICMDQUE_WR</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">aes_release_key_slot</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">slot</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">slot_num</span> <span class="o">==</span> <span class="n">SSK_SLOT_NUM</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="nf">aes_find_key_slot</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">slot</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">new_head</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">empty</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="n">empty</span> <span class="o">=</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">empty</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tegra_aes_slot</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>
+		<span class="n">new_head</span> <span class="o">=</span> <span class="n">dev_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+		<span class="n">dev_list</span><span class="p">.</span><span class="n">next</span> <span class="o">=</span> <span class="n">new_head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">dev_list</span><span class="p">.</span><span class="n">prev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">slot</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">aes_set_key</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">value</span><span class="p">,</span> <span class="n">cmdq</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">eng_busy</span><span class="p">,</span> <span class="n">icq_empty</span><span class="p">,</span> <span class="n">dma_busy</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">use_ssk</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/* use ssk? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;using ssk&quot;</span><span class="p">);</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">ssk</span><span class="p">;</span>
+		<span class="n">use_ssk</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* enable key schedule generation in hardware */</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_CONFIG_EXT</span><span class="p">);</span>
+	<span class="n">value</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TEGRA_AES_SECURE_KEY_SCH_DIS_FIELD</span><span class="p">;</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_CONFIG_EXT</span><span class="p">);</span>
+
+	<span class="cm">/* select the key slot */</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_CONFIG</span><span class="p">);</span>
+	<span class="n">value</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">TEGRA_AES_SECURE_KEY_INDEX_FIELD</span><span class="p">;</span>
+	<span class="n">value</span> <span class="o">|=</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">slot_num</span> <span class="o">&lt;&lt;</span> <span class="n">TEGRA_AES_SECURE_KEY_INDEX_SHIFT</span><span class="p">);</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">TEGRA_AES_SECURE_CONFIG</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">use_ssk</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* copy the key table from sdram to vram */</span>
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">CMD_MEMDMAVD</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_OPCODE_SHIFT</span> <span class="o">|</span>
+		<span class="n">MEMDMA_DIR_DTOVRAM</span> <span class="o">&lt;&lt;</span> <span class="n">MEMDMA_DIR_SHIFT</span> <span class="o">|</span>
+		<span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span> <span class="o">/</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">)</span> <span class="o">&lt;&lt;</span>
+			<span class="n">MEMDMA_NUM_WORDS_SHIFT</span><span class="p">;</span>
+	<span class="n">cmdq</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_phys_base</span><span class="p">;</span>
+
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">cmdq</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">TEGRA_AES_ICMDQUE_WR</span><span class="p">);</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">cmdq</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">TEGRA_AES_ICMDQUE_WR</span><span class="p">);</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+		<span class="n">eng_busy</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ENGINE_BUSY_FIELD</span><span class="p">;</span>
+		<span class="n">icq_empty</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ICQ_EMPTY_FIELD</span><span class="p">;</span>
+		<span class="n">dma_busy</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_DMA_BUSY_FIELD</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">eng_busy</span> <span class="o">&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">icq_empty</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">dma_busy</span><span class="p">);</span>
+
+	<span class="cm">/* settable command to get key into internal registers */</span>
+	<span class="n">value</span> <span class="o">=</span> <span class="n">CMD_SETTABLE</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_OPCODE_SHIFT</span> <span class="o">|</span>
+		<span class="n">SUBCMD_CRYPTO_TABLE_SEL</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_TABLESEL_SHIFT</span> <span class="o">|</span>
+		<span class="n">SUBCMD_VRAM_SEL</span> <span class="o">&lt;&lt;</span> <span class="n">CMDQ_VRAMSEL_SHIFT</span> <span class="o">|</span>
+		<span class="p">(</span><span class="n">SUBCMD_KEY_TABLE_SEL</span> <span class="o">|</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="o">-&gt;</span><span class="n">slot_num</span><span class="p">)</span> <span class="o">&lt;&lt;</span>
+			<span class="n">CMDQ_KEYTABLEID_SHIFT</span><span class="p">;</span>
+	<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">TEGRA_AES_ICMDQUE_WR</span><span class="p">);</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+		<span class="n">eng_busy</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ENGINE_BUSY_FIELD</span><span class="p">;</span>
+		<span class="n">icq_empty</span> <span class="o">=</span> <span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ICQ_EMPTY_FIELD</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">eng_busy</span> <span class="o">&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">icq_empty</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_handle_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">crypto_async_request</span> <span class="o">*</span><span class="n">async_req</span><span class="p">,</span> <span class="o">*</span><span class="n">backlog</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">crypto_ablkcipher</span> <span class="o">*</span><span class="n">tfm</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_reqctx</span> <span class="o">*</span><span class="n">rctx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">dma_max</span> <span class="o">=</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">nblocks</span><span class="p">,</span> <span class="n">total</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">addr_in</span><span class="p">,</span> <span class="n">addr_out</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">in_sg</span><span class="p">,</span> <span class="o">*</span><span class="n">out_sg</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">backlog</span> <span class="o">=</span> <span class="n">crypto_get_backlog</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+	<span class="n">async_req</span> <span class="o">=</span> <span class="n">crypto_dequeue_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">async_req</span><span class="p">)</span>
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">FLAGS_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">async_req</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODATA</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">backlog</span><span class="p">)</span>
+		<span class="n">backlog</span><span class="o">-&gt;</span><span class="n">complete</span><span class="p">(</span><span class="n">backlog</span><span class="p">,</span> <span class="o">-</span><span class="n">EINPROGRESS</span><span class="p">);</span>
+
+	<span class="n">req</span> <span class="o">=</span> <span class="n">ablkcipher_request_cast</span><span class="p">(</span><span class="n">async_req</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: get new req</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span> <span class="o">||</span> <span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">dst</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="cm">/* take mutex to access the aes hw */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="cm">/* assign new request to device */</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">req</span> <span class="o">=</span> <span class="n">req</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">total</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">in_offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">in_sg</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">src</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">out_offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">out_sg</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">dst</span><span class="p">;</span>
+
+	<span class="n">in_sg</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">in_sg</span><span class="p">;</span>
+	<span class="n">out_sg</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">out_sg</span><span class="p">;</span>
+
+	<span class="n">total</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">total</span><span class="p">;</span>
+
+	<span class="n">tfm</span> <span class="o">=</span> <span class="n">crypto_ablkcipher_reqtfm</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">rctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_ablkcipher_ctx</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="n">rctx</span><span class="o">-&gt;</span><span class="n">mode</span> <span class="o">&amp;=</span> <span class="n">FLAGS_MODE_MASK</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">FLAGS_MODE_MASK</span><span class="p">)</span> <span class="o">|</span> <span class="n">rctx</span><span class="o">-&gt;</span><span class="n">mode</span><span class="p">;</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span> <span class="o">=</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">info</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivlen</span> <span class="o">=</span> <span class="n">crypto_ablkcipher_ivsize</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+
+	<span class="cm">/* assign new context to device */</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">dd</span> <span class="o">=</span> <span class="n">dd</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">FLAGS_NEW_KEY</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* copy the key */</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">,</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span><span class="p">);</span>
+		<span class="n">memset</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span> <span class="o">+</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span> <span class="o">-</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span><span class="p">);</span>
+		<span class="n">aes_set_key</span><span class="p">(</span><span class="n">dd</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FLAGS_NEW_KEY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(((</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">FLAGS_CBC</span><span class="p">)</span> <span class="o">||</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">FLAGS_OFB</span><span class="p">))</span> <span class="o">&amp;&amp;</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* set iv to the aes hw slot</span>
+<span class="cm">		 * Hw generates updated iv only after iv is set in slot.</span>
+<span class="cm">		 * So key and iv is passed asynchronously.</span>
+<span class="cm">		 */</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivlen</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">aes_start_crypt</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">,</span>
+				      <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">FLAGS_CBC</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;aes_start_crypt fail(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">total</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;remain: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">total</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">dma_map_sg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">in_sg</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;dma_map_sg() error</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">dma_map_sg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">out_sg</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;dma_map_sg() error</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">dma_unmap_sg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">in_sg</span><span class="p">,</span>
+				<span class="mi">1</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">addr_in</span> <span class="o">=</span> <span class="n">sg_dma_address</span><span class="p">(</span><span class="n">in_sg</span><span class="p">);</span>
+		<span class="n">addr_out</span> <span class="o">=</span> <span class="n">sg_dma_address</span><span class="p">(</span><span class="n">out_sg</span><span class="p">);</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">FLAGS_FAST</span><span class="p">;</span>
+		<span class="n">count</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span> <span class="n">sg_dma_len</span><span class="p">(</span><span class="n">in_sg</span><span class="p">),</span> <span class="n">dma_max</span><span class="p">);</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">sg_dma_len</span><span class="p">(</span><span class="n">in_sg</span><span class="p">)</span> <span class="o">!=</span> <span class="n">sg_dma_len</span><span class="p">(</span><span class="n">out_sg</span><span class="p">));</span>
+		<span class="n">nblocks</span> <span class="o">=</span> <span class="n">DIV_ROUND_UP</span><span class="p">(</span><span class="n">count</span><span class="p">,</span> <span class="n">AES_BLOCK_SIZE</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">aes_start_crypt</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">addr_in</span><span class="p">,</span> <span class="n">addr_out</span><span class="p">,</span> <span class="n">nblocks</span><span class="p">,</span>
+			<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+
+		<span class="n">dma_unmap_sg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">out_sg</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+		<span class="n">dma_unmap_sg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">in_sg</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;aes_start_crypt fail(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FLAGS_FAST</span><span class="p">;</span>
+
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;out: copied %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+		<span class="n">total</span> <span class="o">-=</span> <span class="n">count</span><span class="p">;</span>
+		<span class="n">in_sg</span> <span class="o">=</span> <span class="n">sg_next</span><span class="p">(</span><span class="n">in_sg</span><span class="p">);</span>
+		<span class="n">out_sg</span> <span class="o">=</span> <span class="n">sg_next</span><span class="p">(</span><span class="n">out_sg</span><span class="p">);</span>
+		<span class="n">WARN_ON</span><span class="p">(((</span><span class="n">total</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="o">!</span><span class="n">in_sg</span> <span class="o">||</span> <span class="o">!</span><span class="n">out_sg</span><span class="p">)));</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">total</span> <span class="o">=</span> <span class="n">total</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">complete</span><span class="p">)</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">.</span><span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">base</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: exit</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_setkey</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_ablkcipher</span> <span class="o">*</span><span class="n">tfm</span><span class="p">,</span> <span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">key</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">keylen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">crypto_ablkcipher_ctx</span><span class="p">(</span><span class="n">tfm</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">aes_dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">key_slot</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">keylen</span> <span class="o">!=</span> <span class="n">AES_KEYSIZE_128</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">keylen</span> <span class="o">!=</span> <span class="n">AES_KEYSIZE_192</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		<span class="p">(</span><span class="n">keylen</span> <span class="o">!=</span> <span class="n">AES_KEYSIZE_256</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;unsupported key size</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">crypto_ablkcipher_set_flags</span><span class="p">(</span><span class="n">tfm</span><span class="p">,</span> <span class="n">CRYPTO_TFM_RES_BAD_KEY_LEN</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;keylen: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">keylen</span><span class="p">);</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">dd</span> <span class="o">=</span> <span class="n">dd</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">key</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">key_slot</span> <span class="o">=</span> <span class="n">aes_find_key_slot</span><span class="p">();</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">key_slot</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;no empty slot</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span> <span class="o">=</span> <span class="n">key_slot</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">key</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">keylen</span><span class="p">);</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span> <span class="o">=</span> <span class="n">keylen</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">FLAGS_NEW_KEY</span><span class="p">;</span>
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;done</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">aes_workqueue_handler</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">aes_dev</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">clk_enable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="s">&quot;clock enable failed&quot;</span><span class="p">);</span>
+
+	<span class="cm">/* empty the crypto queue and then return */</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">tegra_aes_handle_req</span><span class="p">(</span><span class="n">dd</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">);</span>
+
+	<span class="n">clk_disable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">irqreturn_t</span> <span class="nf">aes_irq</span><span class="p">(</span><span class="kt">int</span> <span class="n">irq</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">dev_id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="p">)</span><span class="n">dev_id</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">value</span> <span class="o">=</span> <span class="n">aes_readl</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">busy</span> <span class="o">=</span> <span class="n">test_bit</span><span class="p">(</span><span class="n">FLAGS_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">busy</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;spurious interrupt</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">IRQ_NONE</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;irq_stat: 0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_INT_ERROR_MASK</span><span class="p">)</span>
+		<span class="n">aes_writel</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="n">TEGRA_AES_INT_ERROR_MASK</span><span class="p">,</span> <span class="n">TEGRA_AES_INTR_STATUS</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">value</span> <span class="o">&amp;</span> <span class="n">TEGRA_AES_ENGINE_BUSY_FIELD</span><span class="p">))</span>
+		<span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">op_complete</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="n">IRQ_NONE</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">IRQ_HANDLED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_crypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_reqctx</span> <span class="o">*</span><span class="n">rctx</span> <span class="o">=</span> <span class="n">ablkcipher_request_ctx</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">aes_dev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">busy</span><span class="p">;</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;nbytes: %d, enc: %d, cbc: %d, ofb: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">nbytes</span><span class="p">,</span> <span class="o">!!</span><span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">),</span>
+		<span class="o">!!</span><span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_CBC</span><span class="p">),</span> <span class="o">!!</span><span class="p">(</span><span class="n">mode</span> <span class="o">&amp;</span> <span class="n">FLAGS_OFB</span><span class="p">));</span>
+
+	<span class="n">rctx</span><span class="o">-&gt;</span><span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ablkcipher_enqueue_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+	<span class="n">busy</span> <span class="o">=</span> <span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">FLAGS_BUSY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">busy</span><span class="p">)</span>
+		<span class="n">queue_work</span><span class="p">(</span><span class="n">aes_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">aes_work</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_ecb_encrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">FLAGS_ENCRYPT</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_ecb_decrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_cbc_encrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">FLAGS_ENCRYPT</span> <span class="o">|</span> <span class="n">FLAGS_CBC</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_cbc_decrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">FLAGS_CBC</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_ofb_encrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">FLAGS_ENCRYPT</span> <span class="o">|</span> <span class="n">FLAGS_OFB</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_ofb_decrypt</span><span class="p">(</span><span class="k">struct</span> <span class="n">ablkcipher_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">tegra_aes_crypt</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">FLAGS_OFB</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_get_random</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_rng</span> <span class="o">*</span><span class="n">tfm</span><span class="p">,</span> <span class="n">u8</span> <span class="o">*</span><span class="n">rdata</span><span class="p">,</span>
+				<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">dlen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">aes_dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">rng_ctx</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="o">*</span><span class="n">dest</span> <span class="o">=</span> <span class="n">rdata</span><span class="p">,</span> <span class="o">*</span><span class="n">dt</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dt</span><span class="p">;</span>
+
+	<span class="cm">/* take mutex to access the aes hw */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">clk_enable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">dd</span> <span class="o">=</span> <span class="n">dd</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">FLAGS_ENCRYPT</span> <span class="o">|</span> <span class="n">FLAGS_RNG</span><span class="p">;</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">,</span> <span class="n">dt</span><span class="p">,</span> <span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">aes_start_crypt</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">,</span>
+			      <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;aes_start_crypt fail(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+		<span class="n">dlen</span> <span class="o">=</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">dest</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span><span class="p">,</span> <span class="n">dlen</span><span class="p">);</span>
+
+	<span class="cm">/* update the DT */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">DEFAULT_RNG_BLK_SZ</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span><span class="o">--</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dt</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dt</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">clk_disable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: done</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">dlen</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_rng_reset</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_rng</span> <span class="o">*</span><span class="n">tfm</span><span class="p">,</span> <span class="n">u8</span> <span class="o">*</span><span class="n">seed</span><span class="p">,</span>
+			       <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">slen</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">aes_dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">rng_ctx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_slot</span> <span class="o">*</span><span class="n">key_slot</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timespec</span> <span class="n">ts</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">nsec</span><span class="p">,</span> <span class="n">tmp</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+	<span class="n">u8</span> <span class="o">*</span><span class="n">dt</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span> <span class="o">||</span> <span class="o">!</span><span class="n">dd</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;ctx=0x%x, dd=0x%x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span><span class="n">ctx</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span><span class="n">dd</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">slen</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">DEFAULT_RNG_BLK_SZ</span> <span class="o">+</span> <span class="n">AES_KEYSIZE_128</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;seed size invalid&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* take mutex to access the aes hw */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">key_slot</span> <span class="o">=</span> <span class="n">aes_find_key_slot</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">key_slot</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;no empty slot</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span> <span class="o">=</span> <span class="n">key_slot</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">dd</span> <span class="o">=</span> <span class="n">dd</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctr</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">keylen</span> <span class="o">=</span> <span class="n">AES_KEYSIZE_128</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">FLAGS_NEW_KEY</span><span class="p">;</span>
+
+	<span class="cm">/* copy the key to the key slot */</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">,</span> <span class="n">seed</span> <span class="o">+</span> <span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">,</span> <span class="n">AES_KEYSIZE_128</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span> <span class="o">+</span> <span class="n">AES_KEYSIZE_128</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span> <span class="o">-</span> <span class="n">AES_KEYSIZE_128</span><span class="p">);</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span> <span class="o">=</span> <span class="n">seed</span><span class="p">;</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivlen</span> <span class="o">=</span> <span class="n">slen</span><span class="p">;</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">FLAGS_ENCRYPT</span> <span class="o">|</span> <span class="n">FLAGS_RNG</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">clk_enable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">aes_set_key</span><span class="p">(</span><span class="n">dd</span><span class="p">);</span>
+
+	<span class="cm">/* set seed to the aes hw slot */</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span><span class="p">,</span> <span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">aes_start_crypt</span><span class="p">(</span><span class="n">dd</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">,</span>
+			      <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">FLAGS_CBC</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;aes_start_crypt fail(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivlen</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">DEFAULT_RNG_BLK_SZ</span> <span class="o">+</span> <span class="n">AES_KEYSIZE_128</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dt</span> <span class="o">=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">iv</span> <span class="o">+</span> <span class="n">DEFAULT_RNG_BLK_SZ</span> <span class="o">+</span> <span class="n">AES_KEYSIZE_128</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">getnstimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ts</span><span class="p">);</span>
+		<span class="n">nsec</span> <span class="o">=</span> <span class="n">timespec_to_ns</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ts</span><span class="p">);</span>
+		<span class="n">do_div</span><span class="p">(</span><span class="n">nsec</span><span class="p">,</span> <span class="mi">1000</span><span class="p">);</span>
+		<span class="n">nsec</span> <span class="o">^=</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctr</span> <span class="o">&lt;&lt;</span> <span class="mi">56</span><span class="p">;</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ctr</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">tmp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">nsec</span><span class="p">;</span>
+		<span class="n">tmp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">tegra_chip_uid</span><span class="p">();</span>
+		<span class="n">dt</span> <span class="o">=</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dt</span><span class="p">,</span> <span class="n">dt</span><span class="p">,</span> <span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">clk_disable</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+
+	<span class="n">dev_dbg</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: done</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_cra_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tfm</span><span class="o">-&gt;</span><span class="n">crt_ablkcipher</span><span class="p">.</span><span class="n">reqsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_reqctx</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">tegra_aes_cra_exit</span><span class="p">(</span><span class="k">struct</span> <span class="n">crypto_tfm</span> <span class="o">*</span><span class="n">tfm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="o">=</span>
+		<span class="n">crypto_ablkcipher_ctx</span><span class="p">((</span><span class="k">struct</span> <span class="n">crypto_ablkcipher</span> <span class="o">*</span><span class="p">)</span><span class="n">tfm</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span> <span class="o">&amp;&amp;</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="p">)</span>
+		<span class="n">aes_release_key_slot</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">slot</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">crypto_alg</span> <span class="n">algs</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span>
+		<span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;ecb(aes)&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;ecb-aes-tegra&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_ABLKCIPHER</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_ASYNC</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_blocksize</span> <span class="o">=</span> <span class="n">AES_BLOCK_SIZE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_alignmask</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_type</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_ablkcipher_type</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_u</span><span class="p">.</span><span class="n">ablkcipher</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">min_keysize</span> <span class="o">=</span> <span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_keysize</span> <span class="o">=</span> <span class="n">AES_MAX_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">setkey</span> <span class="o">=</span> <span class="n">tegra_aes_setkey</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">encrypt</span> <span class="o">=</span> <span class="n">tegra_aes_ecb_encrypt</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">decrypt</span> <span class="o">=</span> <span class="n">tegra_aes_ecb_decrypt</span><span class="p">,</span>
+		<span class="p">},</span>
+	<span class="p">},</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;cbc(aes)&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;cbc-aes-tegra&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_ABLKCIPHER</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_ASYNC</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_blocksize</span> <span class="o">=</span> <span class="n">AES_BLOCK_SIZE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_alignmask</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_type</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_ablkcipher_type</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_u</span><span class="p">.</span><span class="n">ablkcipher</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">min_keysize</span> <span class="o">=</span> <span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_keysize</span> <span class="o">=</span> <span class="n">AES_MAX_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">ivsize</span> <span class="o">=</span> <span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">setkey</span> <span class="o">=</span> <span class="n">tegra_aes_setkey</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">encrypt</span> <span class="o">=</span> <span class="n">tegra_aes_cbc_encrypt</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">decrypt</span> <span class="o">=</span> <span class="n">tegra_aes_cbc_decrypt</span><span class="p">,</span>
+		<span class="p">}</span>
+	<span class="p">},</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;ofb(aes)&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;ofb-aes-tegra&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_ABLKCIPHER</span> <span class="o">|</span> <span class="n">CRYPTO_ALG_ASYNC</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_blocksize</span> <span class="o">=</span> <span class="n">AES_BLOCK_SIZE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_alignmask</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_type</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_ablkcipher_type</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_u</span><span class="p">.</span><span class="n">ablkcipher</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">min_keysize</span> <span class="o">=</span> <span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_keysize</span> <span class="o">=</span> <span class="n">AES_MAX_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">ivsize</span> <span class="o">=</span> <span class="n">AES_MIN_KEY_SIZE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">setkey</span> <span class="o">=</span> <span class="n">tegra_aes_setkey</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">encrypt</span> <span class="o">=</span> <span class="n">tegra_aes_ofb_encrypt</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">decrypt</span> <span class="o">=</span> <span class="n">tegra_aes_ofb_decrypt</span><span class="p">,</span>
+		<span class="p">}</span>
+	<span class="p">},</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">cra_name</span> <span class="o">=</span> <span class="s">&quot;ansi_cprng&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_driver_name</span> <span class="o">=</span> <span class="s">&quot;rng-aes-tegra&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_flags</span> <span class="o">=</span> <span class="n">CRYPTO_ALG_TYPE_RNG</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_ctxsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_ctx</span><span class="p">),</span>
+		<span class="p">.</span><span class="n">cra_type</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">crypto_rng_type</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">cra_u</span><span class="p">.</span><span class="n">rng</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">rng_make_random</span> <span class="o">=</span> <span class="n">tegra_aes_get_random</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">rng_reset</span> <span class="o">=</span> <span class="n">tegra_aes_rng_reset</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">seedsize</span> <span class="o">=</span> <span class="n">AES_KEYSIZE_128</span> <span class="o">+</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">DEFAULT_RNG_BLK_SZ</span><span class="p">),</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tegra_aes_probe</span><span class="p">(</span><span class="k">struct</span> <span class="n">platform_device</span> <span class="o">*</span><span class="n">pdev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">resource</span> <span class="o">*</span><span class="n">res</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">,</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">j</span><span class="p">;</span>
+
+	<span class="n">dd</span> <span class="o">=</span> <span class="n">devm_kzalloc</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_dev</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;unable to alloc data struct.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+	<span class="n">platform_set_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">dd</span><span class="p">);</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">slots</span> <span class="o">=</span> <span class="n">devm_kzalloc</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_slot</span><span class="p">)</span> <span class="o">*</span>
+				 <span class="n">AES_NR_KEYSLOTS</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">slots</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;unable to alloc slot struct.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">crypto_init_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">,</span> <span class="n">TEGRA_AES_QUEUE_LENGTH</span><span class="p">);</span>
+
+	<span class="cm">/* Get the module base address */</span>
+	<span class="n">res</span> <span class="o">=</span> <span class="n">platform_get_resource</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">IORESOURCE_MEM</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;invalid resource type: base</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">devm_request_mem_region</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span>
+				     <span class="n">resource_size</span><span class="p">(</span><span class="n">res</span><span class="p">),</span>
+				     <span class="n">dev_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;Couldn&#39;t request MEM resource</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">io_base</span> <span class="o">=</span> <span class="n">devm_ioremap</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">resource_size</span><span class="p">(</span><span class="n">res</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">io_base</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;can&#39;t ioremap register space</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Initialize the vde clock */</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span> <span class="o">=</span> <span class="n">clk_get</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;vde&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;iclock intialization failed.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">clk_set_rate</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">,</span> <span class="n">ULONG_MAX</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;iclk set_rate fail(%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * the foll contiguous memory is allocated as follows -</span>
+<span class="cm">	 * - hardware key table</span>
+<span class="cm">	 * - key schedule</span>
+<span class="cm">	 */</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span> <span class="o">=</span> <span class="n">dma_alloc_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span><span class="p">,</span>
+					    <span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_phys_base</span><span class="p">,</span>
+		<span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;can not allocate iv/key buffer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span> <span class="o">=</span> <span class="n">dma_alloc_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+					<span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;can not allocate dma-in buffer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span> <span class="o">=</span> <span class="n">dma_alloc_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+					 <span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;can not allocate dma-out buffer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">init_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">op_complete</span><span class="p">);</span>
+	<span class="n">aes_wq</span> <span class="o">=</span> <span class="n">alloc_workqueue</span><span class="p">(</span><span class="s">&quot;tegra_aes_wq&quot;</span><span class="p">,</span> <span class="n">WQ_HIGHPRI</span> <span class="o">|</span> <span class="n">WQ_UNBOUND</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">aes_wq</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;alloc_workqueue failed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* get the irq */</span>
+	<span class="n">res</span> <span class="o">=</span> <span class="n">platform_get_resource</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span> <span class="n">IORESOURCE_IRQ</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;invalid resource type: base</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dd</span><span class="o">-&gt;</span><span class="n">irq</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">devm_request_irq</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">irq</span><span class="p">,</span> <span class="n">aes_irq</span><span class="p">,</span> <span class="n">IRQF_TRIGGER_HIGH</span> <span class="o">|</span>
+				<span class="n">IRQF_SHARED</span><span class="p">,</span> <span class="s">&quot;tegra-aes&quot;</span><span class="p">,</span> <span class="n">dd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;request_irq failed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_lock</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">AES_NR_KEYSLOTS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">==</span> <span class="n">SSK_SLOT_NUM</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">dd</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">slot_num</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">node</span><span class="p">);</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+
+	<span class="n">aes_dev</span> <span class="o">=</span> <span class="n">dd</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">algs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_list</span><span class="p">);</span>
+
+		<span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_priority</span> <span class="o">=</span> <span class="mi">300</span><span class="p">;</span>
+		<span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_ctxsize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tegra_aes_ctx</span><span class="p">);</span>
+		<span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_module</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">;</span>
+		<span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_init</span> <span class="o">=</span> <span class="n">tegra_aes_cra_init</span><span class="p">;</span>
+		<span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">cra_exit</span> <span class="o">=</span> <span class="n">tegra_aes_cra_exit</span><span class="p">;</span>
+
+		<span class="n">err</span> <span class="o">=</span> <span class="n">crypto_register_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_info</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;registered&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">i</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">crypto_unregister_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">algs</span><span class="p">[</span><span class="n">j</span><span class="p">]);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">)</span>
+		<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span><span class="p">,</span>
+			<span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_phys_base</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">)</span>
+		<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+			<span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span><span class="p">)</span>
+		<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+			<span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">))</span>
+		<span class="n">clk_put</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">aes_wq</span><span class="p">)</span>
+		<span class="n">destroy_workqueue</span><span class="p">(</span><span class="n">aes_wq</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+
+	<span class="n">aes_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;%s: initialization failed.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__devexit</span> <span class="nf">tegra_aes_remove</span><span class="p">(</span><span class="k">struct</span> <span class="n">platform_device</span> <span class="o">*</span><span class="n">pdev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tegra_aes_dev</span> <span class="o">*</span><span class="n">dd</span> <span class="o">=</span> <span class="n">platform_get_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">algs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">crypto_unregister_alg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">algs</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="n">cancel_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aes_work</span><span class="p">);</span>
+	<span class="n">destroy_workqueue</span><span class="p">(</span><span class="n">aes_wq</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list_lock</span><span class="p">);</span>
+
+	<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_KEY_TABLE_LENGTH_BYTES</span><span class="p">,</span>
+			  <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_base</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">ivkey_phys_base</span><span class="p">);</span>
+	<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+			  <span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_in</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_in</span><span class="p">);</span>
+	<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AES_HW_DMA_BUFFER_SIZE_BYTES</span><span class="p">,</span>
+			  <span class="n">dd</span><span class="o">-&gt;</span><span class="n">buf_out</span><span class="p">,</span> <span class="n">dd</span><span class="o">-&gt;</span><span class="n">dma_buf_out</span><span class="p">);</span>
+	<span class="n">clk_put</span><span class="p">(</span><span class="n">dd</span><span class="o">-&gt;</span><span class="n">aes_clk</span><span class="p">);</span>
+	<span class="n">aes_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">of_device_id</span> <span class="n">tegra_aes_of_match</span><span class="p">[]</span> <span class="n">__devinitdata</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span> <span class="p">.</span><span class="n">compatible</span> <span class="o">=</span> <span class="s">&quot;nvidia,tegra20-aes&quot;</span><span class="p">,</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="p">.</span><span class="n">compatible</span> <span class="o">=</span> <span class="s">&quot;nvidia,tegra30-aes&quot;</span><span class="p">,</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="p">},</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">platform_driver</span> <span class="n">tegra_aes_driver</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">probe</span>  <span class="o">=</span> <span class="n">tegra_aes_probe</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">remove</span> <span class="o">=</span> <span class="n">__devexit_p</span><span class="p">(</span><span class="n">tegra_aes_remove</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">driver</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">name</span>   <span class="o">=</span> <span class="s">&quot;tegra-aes&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">owner</span>  <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">of_match_table</span> <span class="o">=</span> <span class="n">tegra_aes_of_match</span><span class="p">,</span>
+	<span class="p">},</span>
+<span class="p">};</span>
+
+<span class="n">module_platform_driver</span><span class="p">(</span><span class="n">tegra_aes_driver</span><span class="p">);</span>
+
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Tegra AES/OFB/CPRNG hw acceleration support.&quot;</span><span class="p">);</span>
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;NVIDIA Corporation&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL v2&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

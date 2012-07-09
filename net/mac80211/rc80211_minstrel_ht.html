@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › mac80211 › rc80211_minstrel_ht.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>rc80211_minstrel_ht.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2010 Felix Fietkau &lt;nbd@openwrt.org&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License version 2 as</span>
+<span class="cm"> * published by the Free Software Foundation.</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;linux/debugfs.h&gt;</span>
+<span class="cp">#include &lt;linux/random.h&gt;</span>
+<span class="cp">#include &lt;linux/ieee80211.h&gt;</span>
+<span class="cp">#include &lt;net/mac80211.h&gt;</span>
+<span class="cp">#include &quot;rate.h&quot;</span>
+<span class="cp">#include &quot;rc80211_minstrel.h&quot;</span>
+<span class="cp">#include &quot;rc80211_minstrel_ht.h&quot;</span>
+
+<span class="cp">#define AVG_PKT_SIZE	1200</span>
+<span class="cp">#define SAMPLE_COLUMNS	10</span>
+<span class="cp">#define EWMA_LEVEL		75</span>
+
+<span class="cm">/* Number of bits for an average sized packet */</span>
+<span class="cp">#define MCS_NBITS (AVG_PKT_SIZE &lt;&lt; 3)</span>
+
+<span class="cm">/* Number of symbols for a packet with (bps) bits per symbol */</span>
+<span class="cp">#define MCS_NSYMS(bps) ((MCS_NBITS + (bps) - 1) / (bps))</span>
+
+<span class="cm">/* Transmission time for a packet containing (syms) symbols */</span>
+<span class="cp">#define MCS_SYMBOL_TIME(sgi, syms)					\</span>
+<span class="cp">	(sgi ?								\</span>
+<span class="cp">	  ((syms) * 18 + 4) / 5 :	</span><span class="cm">/* syms * 3.6 us */</span><span class="cp">		\</span>
+<span class="cp">	  (syms) &lt;&lt; 2			</span><span class="cm">/* syms * 4 us */</span><span class="cp">		\</span>
+<span class="cp">	)</span>
+
+<span class="cm">/* Transmit duration for the raw data part of an average sized packet */</span>
+<span class="cp">#define MCS_DURATION(streams, sgi, bps) MCS_SYMBOL_TIME(sgi, MCS_NSYMS((streams) * (bps)))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Define group sort order: HT40 -&gt; SGI -&gt; #streams</span>
+<span class="cm"> */</span>
+<span class="cp">#define GROUP_IDX(_streams, _sgi, _ht40)	\</span>
+<span class="cp">	MINSTREL_MAX_STREAMS * 2 * _ht40 +	\</span>
+<span class="cp">	MINSTREL_MAX_STREAMS * _sgi +		\</span>
+<span class="cp">	_streams - 1</span>
+
+<span class="cm">/* MCS rate information for an MCS group */</span>
+<span class="cp">#define MCS_GROUP(_streams, _sgi, _ht40)				\</span>
+<span class="cp">	[GROUP_IDX(_streams, _sgi, _ht40)] = {				\</span>
+<span class="cp">	.streams = _streams,						\</span>
+<span class="cp">	.flags =							\</span>
+<span class="cp">		(_sgi ? IEEE80211_TX_RC_SHORT_GI : 0) |			\</span>
+<span class="cp">		(_ht40 ? IEEE80211_TX_RC_40_MHZ_WIDTH : 0),		\</span>
+<span class="cp">	.duration = {							\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 54 : 26),		\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 108 : 52),		\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 162 : 78),		\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 216 : 104),	\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 324 : 156),	\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 432 : 208),	\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 486 : 234),	\</span>
+<span class="cp">		MCS_DURATION(_streams, _sgi, _ht40 ? 540 : 260)		\</span>
+<span class="cp">	}								\</span>
+<span class="cp">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * To enable sufficiently targeted rate sampling, MCS rates are divided into</span>
+<span class="cm"> * groups, based on the number of streams and flags (HT40, SGI) that they</span>
+<span class="cm"> * use.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Sortorder has to be fixed for GROUP_IDX macro to be applicable:</span>
+<span class="cm"> * HT40 -&gt; SGI -&gt; #streams</span>
+<span class="cm"> */</span>
+<span class="k">const</span> <span class="k">struct</span> <span class="n">mcs_group</span> <span class="n">minstrel_mcs_groups</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+<span class="cp">#if MINSTREL_MAX_STREAMS &gt;= 3</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+<span class="cp">#endif</span>
+
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+<span class="cp">#if MINSTREL_MAX_STREAMS &gt;= 3</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+<span class="cp">#endif</span>
+
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="cp">#if MINSTREL_MAX_STREAMS &gt;= 3</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="cp">#endif</span>
+
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="cp">#if MINSTREL_MAX_STREAMS &gt;= 3</span>
+	<span class="n">MCS_GROUP</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="cp">#endif</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">u8</span> <span class="n">sample_table</span><span class="p">[</span><span class="n">SAMPLE_COLUMNS</span><span class="p">][</span><span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Perform EWMA (Exponentially Weighted Moving Average) calculation</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">minstrel_ewma</span><span class="p">(</span><span class="kt">int</span> <span class="n">old</span><span class="p">,</span> <span class="kt">int</span> <span class="n">new</span><span class="p">,</span> <span class="kt">int</span> <span class="n">weight</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">new</span> <span class="o">*</span> <span class="p">(</span><span class="mi">100</span> <span class="o">-</span> <span class="n">weight</span><span class="p">)</span> <span class="o">+</span> <span class="n">old</span> <span class="o">*</span> <span class="n">weight</span><span class="p">)</span> <span class="o">/</span> <span class="mi">100</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Look up an MCS group index based on mac80211 rate information</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">minstrel_ht_get_group_idx</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_tx_rate</span> <span class="o">*</span><span class="n">rate</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">GROUP_IDX</span><span class="p">((</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+			 <span class="o">!!</span><span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_SHORT_GI</span><span class="p">),</span>
+			 <span class="o">!!</span><span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_40_MHZ_WIDTH</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span>
+<span class="nf">minstrel_get_ratestats</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">,</span> <span class="kt">int</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">index</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">].</span><span class="n">rates</span><span class="p">[</span><span class="n">index</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Recalculate success probabilities and counters for a rate using EWMA</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_calc_rate_ewma</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">attempts</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">sample_skipped</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_prob</span> <span class="o">=</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">success</span><span class="p">,</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">attempts</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">att_hist</span><span class="p">)</span>
+			<span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_prob</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">=</span> <span class="n">minstrel_ewma</span><span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span><span class="p">,</span>
+				<span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_prob</span><span class="p">,</span> <span class="n">EWMA_LEVEL</span><span class="p">);</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">att_hist</span> <span class="o">+=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">attempts</span><span class="p">;</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">succ_hist</span> <span class="o">+=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">success</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">sample_skipped</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">last_success</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">success</span><span class="p">;</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">last_attempts</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">attempts</span><span class="p">;</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">success</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">attempts</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Calculate throughput based on the average A-MPDU length, taking into account</span>
+<span class="cm"> * the expected number of retransmissions and their expected length</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_calc_tp</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">,</span> <span class="kt">int</span> <span class="n">group</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rate</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">usecs</span><span class="p">;</span>
+
+	<span class="n">mr</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">rates</span><span class="p">[</span><span class="n">rate</span><span class="p">];</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&lt;</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">10</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">usecs</span> <span class="o">=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead</span> <span class="o">/</span> <span class="n">MINSTREL_TRUNC</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span><span class="p">);</span>
+	<span class="n">usecs</span> <span class="o">+=</span> <span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">duration</span><span class="p">[</span><span class="n">rate</span><span class="p">];</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">=</span> <span class="n">MINSTREL_TRUNC</span><span class="p">((</span><span class="mi">1000000</span> <span class="o">/</span> <span class="n">usecs</span><span class="p">)</span> <span class="o">*</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Update rate statistics and select new primary rates</span>
+<span class="cm"> *</span>
+<span class="cm"> * Rules for rate selection:</span>
+<span class="cm"> *  - max_prob_rate must use only one stream, as a tradeoff between delivery</span>
+<span class="cm"> *    probability and throughput during strong fluctuations</span>
+<span class="cm"> *  - as long as the max prob rate has a probability of more than 3/4, pick</span>
+<span class="cm"> *    higher throughput rates, even if the probablity is a bit lower</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_update_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_mcs_group_data</span> <span class="o">*</span><span class="n">mg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cur_prob</span><span class="p">,</span> <span class="n">cur_prob_tp</span><span class="p">,</span> <span class="n">cur_tp</span><span class="p">,</span> <span class="n">cur_tp2</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">group</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">index</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_packets</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span> <span class="o">=</span> <span class="n">minstrel_ewma</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span><span class="p">,</span>
+			<span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_len</span><span class="p">,</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_packets</span><span class="p">),</span> <span class="n">EWMA_LEVEL</span><span class="p">);</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_packets</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_slow</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">group</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">group</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">);</span> <span class="n">group</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cur_prob</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">cur_prob_tp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">cur_tp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">cur_tp2</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">mg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">supported</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">supported</span> <span class="o">&amp;</span> <span class="n">BIT</span><span class="p">(</span><span class="n">i</span><span class="p">)))</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="n">mr</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">rates</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+			<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_updated</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+			<span class="n">index</span> <span class="o">=</span> <span class="n">MCS_GROUP_RATES</span> <span class="o">*</span> <span class="n">group</span> <span class="o">+</span> <span class="n">i</span><span class="p">;</span>
+			<span class="n">minstrel_calc_rate_ewma</span><span class="p">(</span><span class="n">mr</span><span class="p">);</span>
+			<span class="n">minstrel_ht_calc_tp</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">group</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">)</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="cm">/* ignore the lowest rate of each single-stream group */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">i</span> <span class="o">&amp;&amp;</span> <span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">streams</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">((</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">&gt;</span> <span class="n">cur_prob_tp</span> <span class="o">&amp;&amp;</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&gt;</span>
+			     <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">))</span> <span class="o">||</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&gt;</span> <span class="n">cur_prob</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span>
+				<span class="n">cur_prob</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span><span class="p">;</span>
+				<span class="n">cur_prob_tp</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">&gt;</span> <span class="n">cur_tp</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">swap</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">);</span>
+				<span class="n">cur_tp</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+				<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">)</span>
+				<span class="k">continue</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">&gt;</span> <span class="n">cur_tp2</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span>
+				<span class="n">cur_tp2</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* try to sample up to half of the available rates during each interval */</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span> <span class="o">*=</span> <span class="mi">4</span><span class="p">;</span>
+
+	<span class="n">cur_prob</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">cur_prob_tp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">cur_tp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">cur_tp2</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">group</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">group</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">);</span> <span class="n">group</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">supported</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cur_prob_tp</span> <span class="o">&lt;</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">streams</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span> <span class="o">=</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span><span class="p">;</span>
+			<span class="n">cur_prob</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_prob</span><span class="p">;</span>
+			<span class="n">cur_prob_tp</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cur_tp</span> <span class="o">&lt;</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span> <span class="o">=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">;</span>
+			<span class="n">cur_tp2</span> <span class="o">=</span> <span class="n">cur_tp</span><span class="p">;</span>
+			<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span> <span class="o">=</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">;</span>
+			<span class="n">cur_tp</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cur_tp2</span> <span class="o">&lt;</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span> <span class="o">=</span> <span class="n">mg</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span><span class="p">;</span>
+			<span class="n">cur_tp2</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">cur_tp</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">stats_update</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">bool</span>
+<span class="nf">minstrel_ht_txstat_valid</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_tx_rate</span> <span class="o">*</span><span class="n">rate</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="o">!!</span><span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_MCS</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_next_sample_idx</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_mcs_group_data</span> <span class="o">*</span><span class="n">mg</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_group</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_group</span> <span class="o">%=</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">);</span>
+		<span class="n">mg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_group</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">supported</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">MCS_GROUP_RATES</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">mg</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">column</span> <span class="o">&gt;=</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">sample_table</span><span class="p">))</span>
+				<span class="n">mg</span><span class="o">-&gt;</span><span class="n">column</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_downgrade_rate</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">idx</span><span class="p">,</span>
+			<span class="n">bool</span> <span class="n">primary</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">group</span><span class="p">,</span> <span class="n">orig_group</span><span class="p">;</span>
+
+	<span class="n">orig_group</span> <span class="o">=</span> <span class="n">group</span> <span class="o">=</span> <span class="o">*</span><span class="n">idx</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">group</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">group</span><span class="o">--</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">supported</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">streams</span> <span class="o">&gt;</span>
+		    <span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">orig_group</span><span class="p">].</span><span class="n">streams</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">primary</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">idx</span> <span class="o">=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">max_tp_rate</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="o">*</span><span class="n">idx</span> <span class="o">=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">max_tp_rate2</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_aggr_check</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">pubsta</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ieee80211_hdr</span> <span class="o">*</span><span class="n">hdr</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_hdr</span> <span class="o">*</span><span class="p">)</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sta_info</span> <span class="o">*</span><span class="n">sta</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">pubsta</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sta_info</span><span class="p">,</span> <span class="n">sta</span><span class="p">);</span>
+	<span class="n">u16</span> <span class="n">tid</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">ieee80211_is_data_qos</span><span class="p">(</span><span class="n">hdr</span><span class="o">-&gt;</span><span class="n">frame_control</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">cpu_to_be16</span><span class="p">(</span><span class="n">ETH_P_PAE</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">tid</span> <span class="o">=</span> <span class="o">*</span><span class="n">ieee80211_get_qos_ctl</span><span class="p">(</span><span class="n">hdr</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">IEEE80211_QOS_CTL_TID_MASK</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">sta</span><span class="o">-&gt;</span><span class="n">ampdu_mlme</span><span class="p">.</span><span class="n">tid_tx</span><span class="p">[</span><span class="n">tid</span><span class="p">]))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb_get_queue_mapping</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span> <span class="o">==</span> <span class="n">IEEE80211_AC_VO</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">ieee80211_start_tx_ba_session</span><span class="p">(</span><span class="n">pubsta</span><span class="p">,</span> <span class="n">tid</span><span class="p">,</span> <span class="mi">5000</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_tx_status</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+                      <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">,</span>
+                      <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta_priv</span> <span class="o">*</span><span class="n">msp</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">IEEE80211_SKB_CB</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_rate</span> <span class="o">*</span><span class="n">ar</span> <span class="o">=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">rates</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">rate</span><span class="p">,</span> <span class="o">*</span><span class="n">rate2</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">last</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">group</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">is_ht</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">mac80211_minstrel</span><span class="p">.</span><span class="n">tx_status</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+
+	<span class="cm">/* This packet was aggregated but doesn&#39;t carry status info */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_CTL_AMPDU</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_STAT_AMPDU</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_STAT_AMPDU</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_ack_len</span> <span class="o">=</span>
+			<span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_STAT_ACK</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_len</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_packets</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">ampdu_len</span> <span class="o">+=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_tries</span> <span class="o">&amp;&amp;</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span> <span class="o">=</span> <span class="mi">16</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">MINSTREL_TRUNC</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span><span class="p">);</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_tries</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_CTL_RATE_CTRL_PROBE</span><span class="p">)</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_packets</span> <span class="o">+=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_len</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="o">!</span><span class="n">last</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">last</span> <span class="o">=</span> <span class="p">(</span><span class="n">i</span> <span class="o">==</span> <span class="n">IEEE80211_TX_MAX_RATES</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">||</span>
+		       <span class="o">!</span><span class="n">minstrel_ht_txstat_valid</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">minstrel_ht_txstat_valid</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="n">i</span><span class="p">]))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">group</span> <span class="o">=</span> <span class="n">minstrel_ht_get_group_idx</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">rate</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">group</span><span class="p">].</span><span class="n">rates</span><span class="p">[</span><span class="n">ar</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">idx</span> <span class="o">%</span> <span class="mi">8</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">last</span><span class="p">)</span>
+			<span class="n">rate</span><span class="o">-&gt;</span><span class="n">success</span> <span class="o">+=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_ack_len</span><span class="p">;</span>
+
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">attempts</span> <span class="o">+=</span> <span class="n">ar</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">count</span> <span class="o">*</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">ampdu_len</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * check for sudden death of spatial multiplexing,</span>
+<span class="cm">	 * downgrade to a lower number of streams if necessary.</span>
+<span class="cm">	 */</span>
+	<span class="n">rate</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">attempts</span> <span class="o">&gt;</span> <span class="mi">30</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="n">rate</span><span class="o">-&gt;</span><span class="n">success</span><span class="p">,</span> <span class="n">rate</span><span class="o">-&gt;</span><span class="n">attempts</span><span class="p">)</span> <span class="o">&lt;</span>
+	    <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span> <span class="mi">100</span><span class="p">))</span>
+		<span class="n">minstrel_downgrade_rate</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+
+	<span class="n">rate2</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rate2</span><span class="o">-&gt;</span><span class="n">attempts</span> <span class="o">&gt;</span> <span class="mi">30</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="n">rate2</span><span class="o">-&gt;</span><span class="n">success</span><span class="p">,</span> <span class="n">rate2</span><span class="o">-&gt;</span><span class="n">attempts</span><span class="p">)</span> <span class="o">&lt;</span>
+	    <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span> <span class="mi">100</span><span class="p">))</span>
+		<span class="n">minstrel_downgrade_rate</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">stats_update</span> <span class="o">+</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">update_interval</span> <span class="o">/</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">)</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">minstrel_ht_update_stats</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_CTL_AMPDU</span><span class="p">))</span>
+			<span class="n">minstrel_aggr_check</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_calc_retransmit</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">,</span>
+                         <span class="kt">int</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mcs_group</span> <span class="o">*</span><span class="n">group</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">tx_time</span><span class="p">,</span> <span class="n">tx_time_rtscts</span><span class="p">,</span> <span class="n">tx_time_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cw</span> <span class="o">=</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">cw_min</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ctime</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">t_slot</span> <span class="o">=</span> <span class="mi">9</span><span class="p">;</span> <span class="cm">/* FIXME */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ampdu_len</span> <span class="o">=</span> <span class="n">MINSTREL_TRUNC</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span><span class="p">);</span>
+
+	<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&lt;</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">10</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count_rtscts</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count_rtscts</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_updated</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="n">group</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">index</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+	<span class="n">tx_time_data</span> <span class="o">=</span> <span class="n">group</span><span class="o">-&gt;</span><span class="n">duration</span><span class="p">[</span><span class="n">index</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span><span class="p">]</span> <span class="o">*</span> <span class="n">ampdu_len</span><span class="p">;</span>
+
+	<span class="cm">/* Contention time for first 2 tries */</span>
+	<span class="n">ctime</span> <span class="o">=</span> <span class="p">(</span><span class="n">t_slot</span> <span class="o">*</span> <span class="n">cw</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">cw</span> <span class="o">=</span> <span class="n">min</span><span class="p">((</span><span class="n">cw</span> <span class="o">&lt;&lt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">|</span> <span class="mi">1</span><span class="p">,</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">cw_max</span><span class="p">);</span>
+	<span class="n">ctime</span> <span class="o">+=</span> <span class="p">(</span><span class="n">t_slot</span> <span class="o">*</span> <span class="n">cw</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">cw</span> <span class="o">=</span> <span class="n">min</span><span class="p">((</span><span class="n">cw</span> <span class="o">&lt;&lt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">|</span> <span class="mi">1</span><span class="p">,</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">cw_max</span><span class="p">);</span>
+
+	<span class="cm">/* Total TX time for data and Contention after first 2 tries */</span>
+	<span class="n">tx_time</span> <span class="o">=</span> <span class="n">ctime</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead</span> <span class="o">+</span> <span class="n">tx_time_data</span><span class="p">);</span>
+	<span class="n">tx_time_rtscts</span> <span class="o">=</span> <span class="n">ctime</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead_rtscts</span> <span class="o">+</span> <span class="n">tx_time_data</span><span class="p">);</span>
+
+	<span class="cm">/* See how many more tries we can fit inside segment size */</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="cm">/* Contention time for this try */</span>
+		<span class="n">ctime</span> <span class="o">=</span> <span class="p">(</span><span class="n">t_slot</span> <span class="o">*</span> <span class="n">cw</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">cw</span> <span class="o">=</span> <span class="n">min</span><span class="p">((</span><span class="n">cw</span> <span class="o">&lt;&lt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">|</span> <span class="mi">1</span><span class="p">,</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">cw_max</span><span class="p">);</span>
+
+		<span class="cm">/* Total TX time after this try */</span>
+		<span class="n">tx_time</span> <span class="o">+=</span> <span class="n">ctime</span> <span class="o">+</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead</span> <span class="o">+</span> <span class="n">tx_time_data</span><span class="p">;</span>
+		<span class="n">tx_time_rtscts</span> <span class="o">+=</span> <span class="n">ctime</span> <span class="o">+</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead_rtscts</span> <span class="o">+</span> <span class="n">tx_time_data</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">tx_time_rtscts</span> <span class="o">&lt;</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">segment_size</span><span class="p">)</span>
+			<span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count_rtscts</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">((</span><span class="n">tx_time</span> <span class="o">&lt;</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">segment_size</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	         <span class="p">(</span><span class="o">++</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count</span> <span class="o">&lt;</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">max_retry</span><span class="p">));</span>
+<span class="p">}</span>
+
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_set_rate</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">,</span>
+                     <span class="k">struct</span> <span class="n">ieee80211_tx_rate</span> <span class="o">*</span><span class="n">rate</span><span class="p">,</span> <span class="kt">int</span> <span class="n">index</span><span class="p">,</span>
+                     <span class="n">bool</span> <span class="n">sample</span><span class="p">,</span> <span class="n">bool</span> <span class="n">rtscts</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mcs_group</span> <span class="o">*</span><span class="n">group</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">index</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>
+
+	<span class="n">mr</span> <span class="o">=</span> <span class="n">minstrel_get_ratestats</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_updated</span><span class="p">)</span>
+		<span class="n">minstrel_calc_retransmit</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sample</span><span class="p">)</span>
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&lt;</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span> <span class="mi">100</span><span class="p">))</span>
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">rtscts</span><span class="p">)</span>
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count_rtscts</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">mr</span><span class="o">-&gt;</span><span class="n">retry_count</span><span class="p">;</span>
+
+	<span class="n">rate</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">IEEE80211_TX_RC_MCS</span> <span class="o">|</span> <span class="n">group</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rtscts</span><span class="p">)</span>
+		<span class="n">rate</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">IEEE80211_TX_RC_USE_RTS_CTS</span><span class="p">;</span>
+	<span class="n">rate</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">=</span> <span class="n">index</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span> <span class="o">+</span> <span class="p">(</span><span class="n">group</span><span class="o">-&gt;</span><span class="n">streams</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span>
+<span class="nf">minstrel_get_duration</span><span class="p">(</span><span class="kt">int</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">mcs_group</span> <span class="o">*</span><span class="n">group</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">index</span> <span class="o">/</span> <span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+	<span class="k">return</span> <span class="n">group</span><span class="o">-&gt;</span><span class="n">duration</span><span class="p">[</span><span class="n">index</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">minstrel_get_sample_rate</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_rate_stats</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_mcs_group_data</span> <span class="o">*</span><span class="n">mg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">sample_idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span><span class="o">--</span><span class="p">;</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_tries</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_tries</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">mg</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_group</span><span class="p">];</span>
+	<span class="n">sample_idx</span> <span class="o">=</span> <span class="n">sample_table</span><span class="p">[</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">column</span><span class="p">][</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">];</span>
+	<span class="n">mr</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">mg</span><span class="o">-&gt;</span><span class="n">rates</span><span class="p">[</span><span class="n">sample_idx</span><span class="p">];</span>
+	<span class="n">sample_idx</span> <span class="o">+=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_group</span> <span class="o">*</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span>
+	<span class="n">minstrel_next_sample_idx</span><span class="p">(</span><span class="n">mi</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Sampling might add some overhead (RTS, no aggregation)</span>
+<span class="cm">	 * to the frame. Hence, don&#39;t use sampling for the currently</span>
+<span class="cm">	 * used max TP rate.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sample_idx</span> <span class="o">==</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * When not using MRR, do not sample if the probability is already</span>
+<span class="cm">	 * higher than 95% to avoid wasting airtime</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">has_mrr</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">probability</span> <span class="o">&gt;</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">95</span><span class="p">,</span> <span class="mi">100</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Make sure that lower rates get sampled only occasionally,</span>
+<span class="cm">	 * if the link is working perfectly.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">minstrel_get_duration</span><span class="p">(</span><span class="n">sample_idx</span><span class="p">)</span> <span class="o">&gt;</span>
+	    <span class="n">minstrel_get_duration</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">sample_skipped</span> <span class="o">&lt;</span> <span class="mi">20</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_slow</span><span class="o">++</span> <span class="o">&gt;</span> <span class="mi">2</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">sample_idx</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_get_rate</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">,</span>
+                     <span class="k">struct</span> <span class="n">ieee80211_tx_rate_control</span> <span class="o">*</span><span class="n">txrc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">IEEE80211_SKB_CB</span><span class="p">(</span><span class="n">txrc</span><span class="o">-&gt;</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_rate</span> <span class="o">*</span><span class="n">ar</span> <span class="o">=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">rates</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta_priv</span> <span class="o">*</span><span class="n">msp</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">sample_idx</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">sample</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rate_control_send_low</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">priv_sta</span><span class="p">,</span> <span class="n">txrc</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">is_ht</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">mac80211_minstrel</span><span class="p">.</span><span class="n">get_rate</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">,</span> <span class="n">txrc</span><span class="p">);</span>
+
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">tx_flags</span><span class="p">;</span>
+
+	<span class="cm">/* Don&#39;t use EAPOL frames for sampling on non-mrr hw */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">hw</span><span class="o">-&gt;</span><span class="n">max_rates</span> <span class="o">==</span> <span class="mi">1</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">txrc</span><span class="o">-&gt;</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">cpu_to_be16</span><span class="p">(</span><span class="n">ETH_P_PAE</span><span class="p">))</span>
+		<span class="n">sample_idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">sample_idx</span> <span class="o">=</span> <span class="n">minstrel_get_sample_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="cm">/* use fixed index if set */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">fixed_rate_idx</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="n">sample_idx</span> <span class="o">=</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">fixed_rate_idx</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sample_idx</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sample</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">sample_idx</span><span class="p">,</span>
+			<span class="nb">true</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+		<span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">IEEE80211_TX_CTL_RATE_CTRL_PROBE</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">,</span>
+			<span class="nb">false</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">hw</span><span class="o">-&gt;</span><span class="n">max_rates</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * At least 3 tx rates supported, use</span>
+<span class="cm">		 * sample_rate -&gt; max_tp_rate -&gt; max_prob_rate for sampling and</span>
+<span class="cm">		 * max_tp_rate -&gt; max_tp_rate2 -&gt; max_prob_rate by default.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sample_idx</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate</span><span class="p">,</span>
+				<span class="nb">false</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_tp_rate2</span><span class="p">,</span>
+				<span class="nb">false</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+
+		<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span><span class="p">,</span>
+				     <span class="nb">false</span><span class="p">,</span> <span class="o">!</span><span class="n">sample</span><span class="p">);</span>
+
+		<span class="n">ar</span><span class="p">[</span><span class="mi">3</span><span class="p">].</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ar</span><span class="p">[</span><span class="mi">3</span><span class="p">].</span><span class="n">idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">hw</span><span class="o">-&gt;</span><span class="n">max_rates</span> <span class="o">==</span> <span class="mi">2</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Only 2 tx rates supported, use</span>
+<span class="cm">		 * sample_rate -&gt; max_prob_rate for sampling and</span>
+<span class="cm">		 * max_tp_rate -&gt; max_prob_rate by default.</span>
+<span class="cm">		 */</span>
+		<span class="n">minstrel_ht_set_rate</span><span class="p">(</span><span class="n">mp</span><span class="p">,</span> <span class="n">mi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ar</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">max_prob_rate</span><span class="p">,</span>
+				     <span class="nb">false</span><span class="p">,</span> <span class="o">!</span><span class="n">sample</span><span class="p">);</span>
+
+		<span class="n">ar</span><span class="p">[</span><span class="mi">2</span><span class="p">].</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ar</span><span class="p">[</span><span class="mi">2</span><span class="p">].</span><span class="n">idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Not using MRR, only use the first rate */</span>
+		<span class="n">ar</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ar</span><span class="p">[</span><span class="mi">1</span><span class="p">].</span><span class="n">idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">total_packets</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="cm">/* wraparound */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">total_packets</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">total_packets</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_packets</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_update_caps</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+                        <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta_priv</span> <span class="o">*</span><span class="n">msp</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta</span> <span class="o">*</span><span class="n">mi</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ht</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_mcs_info</span> <span class="o">*</span><span class="n">mcs</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sta</span><span class="o">-&gt;</span><span class="n">ht_cap</span><span class="p">.</span><span class="n">mcs</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">sta_cap</span> <span class="o">=</span> <span class="n">sta</span><span class="o">-&gt;</span><span class="n">ht_cap</span><span class="p">.</span><span class="n">cap</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">n_supported</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ack_dur</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">stbc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">smps</span><span class="p">;</span>
+
+	<span class="cm">/* fall back to the old minstrel for legacy stations */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sta</span><span class="o">-&gt;</span><span class="n">ht_cap</span><span class="p">.</span><span class="n">ht_supported</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">use_legacy</span><span class="p">;</span>
+
+	<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">)</span> <span class="o">!=</span>
+		<span class="n">MINSTREL_MAX_STREAMS</span> <span class="o">*</span> <span class="n">MINSTREL_STREAM_GROUPS</span><span class="p">);</span>
+
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">is_ht</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">mi</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">mi</span><span class="p">));</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">stats_update</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+
+	<span class="n">ack_dur</span> <span class="o">=</span> <span class="n">ieee80211_frame_duration</span><span class="p">(</span><span class="n">sband</span><span class="o">-&gt;</span><span class="n">band</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="mi">60</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead</span> <span class="o">=</span> <span class="n">ieee80211_frame_duration</span><span class="p">(</span><span class="n">sband</span><span class="o">-&gt;</span><span class="n">band</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">60</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">ack_dur</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead_rtscts</span> <span class="o">=</span> <span class="n">mi</span><span class="o">-&gt;</span><span class="n">overhead</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">ack_dur</span><span class="p">;</span>
+
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">avg_ampdu_len</span> <span class="o">=</span> <span class="n">MINSTREL_FRAC</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="cm">/* When using MRR, sample more on the first attempt, without delay */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mp</span><span class="o">-&gt;</span><span class="n">has_mrr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span> <span class="o">=</span> <span class="mi">16</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_count</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_wait</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">sample_tries</span> <span class="o">=</span> <span class="mi">4</span><span class="p">;</span>
+
+	<span class="n">stbc</span> <span class="o">=</span> <span class="p">(</span><span class="n">sta_cap</span> <span class="o">&amp;</span> <span class="n">IEEE80211_HT_CAP_RX_STBC</span><span class="p">)</span> <span class="o">&gt;&gt;</span>
+		<span class="n">IEEE80211_HT_CAP_RX_STBC_SHIFT</span><span class="p">;</span>
+	<span class="n">mi</span><span class="o">-&gt;</span><span class="n">tx_flags</span> <span class="o">|=</span> <span class="n">stbc</span> <span class="o">&lt;&lt;</span> <span class="n">IEEE80211_TX_CTL_STBC_SHIFT</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sta_cap</span> <span class="o">&amp;</span> <span class="n">IEEE80211_HT_CAP_LDPC_CODING</span><span class="p">)</span>
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">tx_flags</span> <span class="o">|=</span> <span class="n">IEEE80211_TX_CTL_LDPC</span><span class="p">;</span>
+
+	<span class="n">smps</span> <span class="o">=</span> <span class="p">(</span><span class="n">sta_cap</span> <span class="o">&amp;</span> <span class="n">IEEE80211_HT_CAP_SM_PS</span><span class="p">)</span> <span class="o">&gt;&gt;</span>
+		<span class="n">IEEE80211_HT_CAP_SM_PS_SHIFT</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">u16</span> <span class="n">req</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">supported</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_SHORT_GI</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_40_MHZ_WIDTH</span><span class="p">)</span>
+				<span class="n">req</span> <span class="o">|=</span> <span class="n">IEEE80211_HT_CAP_SGI_40</span><span class="p">;</span>
+			<span class="k">else</span>
+				<span class="n">req</span> <span class="o">|=</span> <span class="n">IEEE80211_HT_CAP_SGI_20</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_RC_40_MHZ_WIDTH</span><span class="p">)</span>
+			<span class="n">req</span> <span class="o">|=</span> <span class="n">IEEE80211_HT_CAP_SUP_WIDTH_20_40</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="n">sta_cap</span> <span class="o">&amp;</span> <span class="n">req</span><span class="p">)</span> <span class="o">!=</span> <span class="n">req</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="cm">/* Mark MCS &gt; 7 as unsupported if STA is in static SMPS mode */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">smps</span> <span class="o">==</span> <span class="n">WLAN_HT_CAP_SM_PS_STATIC</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">streams</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">supported</span> <span class="o">=</span>
+			<span class="n">mcs</span><span class="o">-&gt;</span><span class="n">rx_mask</span><span class="p">[</span><span class="n">minstrel_mcs_groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">streams</span> <span class="o">-</span> <span class="mi">1</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">mi</span><span class="o">-&gt;</span><span class="n">groups</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">supported</span><span class="p">)</span>
+			<span class="n">n_supported</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">n_supported</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">use_legacy</span><span class="p">;</span>
+
+	<span class="k">return</span><span class="p">;</span>
+
+<span class="nl">use_legacy:</span>
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">is_ht</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">));</span>
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">.</span><span class="n">r</span> <span class="o">=</span> <span class="n">msp</span><span class="o">-&gt;</span><span class="n">ratelist</span><span class="p">;</span>
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">.</span><span class="n">sample_table</span> <span class="o">=</span> <span class="n">msp</span><span class="o">-&gt;</span><span class="n">sample_table</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">mac80211_minstrel</span><span class="p">.</span><span class="n">rate_init</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">legacy</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_rate_init</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+                      <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">minstrel_ht_update_caps</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="n">priv_sta</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_rate_update</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+                        <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">,</span>
+                        <span class="n">u32</span> <span class="n">changed</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">minstrel_ht_update_caps</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="n">priv_sta</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span>
+<span class="nf">minstrel_ht_alloc_sta</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta_priv</span> <span class="o">*</span><span class="n">msp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">minstrel_priv</span> <span class="o">*</span><span class="n">mp</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_hw</span> <span class="o">*</span><span class="n">hw</span> <span class="o">=</span> <span class="n">mp</span><span class="o">-&gt;</span><span class="n">hw</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">max_rates</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">IEEE80211_NUM_BANDS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sband</span> <span class="o">=</span> <span class="n">hw</span><span class="o">-&gt;</span><span class="n">wiphy</span><span class="o">-&gt;</span><span class="n">bands</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sband</span> <span class="o">&amp;&amp;</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span> <span class="o">&gt;</span> <span class="n">max_rates</span><span class="p">)</span>
+			<span class="n">max_rates</span> <span class="o">=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">msp</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_ht_sta</span><span class="p">),</span> <span class="n">gfp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">msp</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">ratelist</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">minstrel_rate</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_rates</span><span class="p">,</span> <span class="n">gfp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ratelist</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+
+	<span class="n">msp</span><span class="o">-&gt;</span><span class="n">sample_table</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">SAMPLE_COLUMNS</span> <span class="o">*</span> <span class="n">max_rates</span><span class="p">,</span> <span class="n">gfp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">sample_table</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">error1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">msp</span><span class="p">;</span>
+
+<span class="nl">error1:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ratelist</span><span class="p">);</span>
+<span class="nl">error:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">msp</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_free_sta</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">minstrel_ht_sta_priv</span> <span class="o">*</span><span class="n">msp</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">sample_table</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">msp</span><span class="o">-&gt;</span><span class="n">ratelist</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">msp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span>
+<span class="nf">minstrel_ht_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_hw</span> <span class="o">*</span><span class="n">hw</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">debugfsdir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">mac80211_minstrel</span><span class="p">.</span><span class="n">alloc</span><span class="p">(</span><span class="n">hw</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">minstrel_ht_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mac80211_minstrel</span><span class="p">.</span><span class="n">free</span><span class="p">(</span><span class="n">priv</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">rate_control_ops</span> <span class="n">mac80211_minstrel_ht</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;minstrel_ht&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">tx_status</span> <span class="o">=</span> <span class="n">minstrel_ht_tx_status</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">get_rate</span> <span class="o">=</span> <span class="n">minstrel_ht_get_rate</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rate_init</span> <span class="o">=</span> <span class="n">minstrel_ht_rate_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rate_update</span> <span class="o">=</span> <span class="n">minstrel_ht_rate_update</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">alloc_sta</span> <span class="o">=</span> <span class="n">minstrel_ht_alloc_sta</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_sta</span> <span class="o">=</span> <span class="n">minstrel_ht_free_sta</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">alloc</span> <span class="o">=</span> <span class="n">minstrel_ht_alloc</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free</span> <span class="o">=</span> <span class="n">minstrel_ht_free</span><span class="p">,</span>
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="p">.</span><span class="n">add_sta_debugfs</span> <span class="o">=</span> <span class="n">minstrel_ht_add_sta_debugfs</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">remove_sta_debugfs</span> <span class="o">=</span> <span class="n">minstrel_ht_remove_sta_debugfs</span><span class="p">,</span>
+<span class="cp">#endif</span>
+<span class="p">};</span>
+
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">init_sample_table</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">col</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">new_idx</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">rnd</span><span class="p">[</span><span class="n">MCS_GROUP_RATES</span><span class="p">];</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">sample_table</span><span class="p">,</span> <span class="mh">0xff</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sample_table</span><span class="p">));</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">col</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">col</span> <span class="o">&lt;</span> <span class="n">SAMPLE_COLUMNS</span><span class="p">;</span> <span class="n">col</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">get_random_bytes</span><span class="p">(</span><span class="n">rnd</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">rnd</span><span class="p">));</span>
+			<span class="n">new_idx</span> <span class="o">=</span> <span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="n">rnd</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span>
+
+			<span class="k">while</span> <span class="p">(</span><span class="n">sample_table</span><span class="p">[</span><span class="n">col</span><span class="p">][</span><span class="n">new_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="mh">0xff</span><span class="p">)</span>
+				<span class="n">new_idx</span> <span class="o">=</span> <span class="p">(</span><span class="n">new_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">MCS_GROUP_RATES</span><span class="p">;</span>
+
+			<span class="n">sample_table</span><span class="p">[</span><span class="n">col</span><span class="p">][</span><span class="n">new_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="n">__init</span>
+<span class="nf">rc80211_minstrel_ht_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">init_sample_table</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">ieee80211_rate_control_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mac80211_minstrel_ht</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span>
+<span class="nf">rc80211_minstrel_ht_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ieee80211_rate_control_unregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mac80211_minstrel_ht</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

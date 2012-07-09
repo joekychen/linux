@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › btrfs › async-thread.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>async-thread.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2007 Oracle.  All rights reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public</span>
+<span class="cm"> * License v2 as published by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</span>
+<span class="cm"> * General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public</span>
+<span class="cm"> * License along with this program; if not, write to the</span>
+<span class="cm"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330,</span>
+<span class="cm"> * Boston, MA 021110-1307, USA.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/freezer.h&gt;</span>
+<span class="cp">#include &quot;async-thread.h&quot;</span>
+
+<span class="cp">#define WORK_QUEUED_BIT 0</span>
+<span class="cp">#define WORK_DONE_BIT 1</span>
+<span class="cp">#define WORK_ORDER_DONE_BIT 2</span>
+<span class="cp">#define WORK_HIGH_PRIO_BIT 3</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * container for the kthread task pointer and the list of pending work</span>
+<span class="cm"> * One of these is allocated per thread.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="p">{</span>
+	<span class="cm">/* pool we belong to */</span>
+	<span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">;</span>
+
+	<span class="cm">/* list of struct btrfs_work that are waiting for service */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">pending</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">prio_pending</span><span class="p">;</span>
+
+	<span class="cm">/* list of worker threads from struct btrfs_workers */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">worker_list</span><span class="p">;</span>
+
+	<span class="cm">/* kthread */</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">;</span>
+
+	<span class="cm">/* number of things on the pending list */</span>
+	<span class="n">atomic_t</span> <span class="n">num_pending</span><span class="p">;</span>
+
+	<span class="cm">/* reference counter for this struct */</span>
+	<span class="n">atomic_t</span> <span class="n">refs</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">sequence</span><span class="p">;</span>
+
+	<span class="cm">/* protects the pending list. */</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+
+	<span class="cm">/* set to non-zero when this thread is already awake and kicking */</span>
+	<span class="kt">int</span> <span class="n">working</span><span class="p">;</span>
+
+	<span class="cm">/* are we currently idle */</span>
+	<span class="kt">int</span> <span class="n">idle</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__btrfs_start_workers</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * btrfs_start_workers uses kthread_run, which can block waiting for memory</span>
+<span class="cm"> * for a very long time.  It will actually throttle on page writeback,</span>
+<span class="cm"> * and so it may not make progress until after our btrfs worker threads</span>
+<span class="cm"> * process all of the pending work structs in their queue</span>
+<span class="cm"> *</span>
+<span class="cm"> * This means we can&#39;t use btrfs_start_workers from inside a btrfs worker</span>
+<span class="cm"> * thread that is used as part of cleaning dirty memory, which pretty much</span>
+<span class="cm"> * involves all of the worker threads.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Instead we have a helper queue who never has more than one thread</span>
+<span class="cm"> * where we scheduler thread start operations.  This worker_start struct</span>
+<span class="cm"> * is used to contain the work and hold a pointer to the queue that needs</span>
+<span class="cm"> * another worker.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">worker_start</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_work</span> <span class="n">work</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">queue</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">start_new_worker_func</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">worker_start</span> <span class="o">*</span><span class="n">start</span><span class="p">;</span>
+	<span class="n">start</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">worker_start</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+	<span class="n">__btrfs_start_workers</span><span class="p">(</span><span class="n">start</span><span class="o">-&gt;</span><span class="n">queue</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">start</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * helper function to move a thread onto the idle list after it</span>
+<span class="cm"> * has finished some requests.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_idle_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">&amp;&amp;</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">)</span> <span class="o">&lt;</span>
+	    <span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_thresh</span> <span class="o">/</span> <span class="mi">2</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="cm">/* the list may be empty if the worker is just starting */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">,</span>
+				 <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * helper function to move a thread off the idle list after new</span>
+<span class="cm"> * pending work is added.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_busy_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">&amp;&amp;</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">)</span> <span class="o">&gt;=</span>
+	    <span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_thresh</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_move_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">,</span>
+				      <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_pending_worker_creates</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span> <span class="o">=</span> <span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">worker_start</span> <span class="o">*</span><span class="n">start</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">rmb</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_start_pending</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">start</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">start</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">start</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">start</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">.</span><span class="n">func</span> <span class="o">=</span> <span class="n">start_new_worker_func</span><span class="p">;</span>
+	<span class="n">start</span><span class="o">-&gt;</span><span class="n">queue</span> <span class="o">=</span> <span class="n">workers</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_start_pending</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_start_pending</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">+</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span> <span class="o">&gt;=</span>
+	    <span class="n">workers</span><span class="o">-&gt;</span><span class="n">max_workers</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span> <span class="o">+=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">btrfs_queue_worker</span><span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_worker_start</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">start</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">start</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">noinline</span> <span class="kt">void</span> <span class="nf">run_ordered_completions</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">,</span>
+					    <span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">ordered</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">WORK_DONE_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">prio_order_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">work</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">prio_order_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">btrfs_work</span><span class="p">,</span> <span class="n">order_list</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">work</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">btrfs_work</span><span class="p">,</span> <span class="n">order_list</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">WORK_DONE_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="cm">/* we are going to call the ordered done function, but</span>
+<span class="cm">		 * we leave the work item on the list as a barrier so</span>
+<span class="cm">		 * that later work items that are done don&#39;t have their</span>
+<span class="cm">		 * functions called before this one returns</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">WORK_ORDER_DONE_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+
+		<span class="n">work</span><span class="o">-&gt;</span><span class="n">ordered_func</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+
+		<span class="cm">/* now take the lock again and call the freeing code */</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">);</span>
+		<span class="n">work</span><span class="o">-&gt;</span><span class="n">ordered_free</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">put_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">))</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">try_worker_shutdown</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">freeit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">freeit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+		<span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">freeit</span><span class="p">)</span>
+		<span class="n">put_worker</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">freeit</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="nf">get_next_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">prio_head</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">cur</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">prio_head</span><span class="p">))</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">prio_head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="n">smp_mb</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">refill</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">head</span><span class="p">))</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cur</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+<span class="nl">refill:</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">list_splice_tail_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">,</span> <span class="n">prio_head</span><span class="p">);</span>
+	<span class="n">list_splice_tail_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">prio_head</span><span class="p">))</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">prio_head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">head</span><span class="p">))</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cur</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_fail</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">work</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_work</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+
+<span class="nl">out_fail:</span>
+	<span class="k">return</span> <span class="n">work</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * main loop for servicing work items</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">worker_loop</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">head</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">prio_head</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">head</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">prio_head</span><span class="p">);</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+<span class="nl">again:</span>
+		<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+
+
+			<span class="n">work</span> <span class="o">=</span> <span class="n">get_next_work</span><span class="p">(</span><span class="n">worker</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">prio_head</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">head</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">work</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">clear_bit</span><span class="p">(</span><span class="n">WORK_QUEUED_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+
+			<span class="n">work</span><span class="o">-&gt;</span><span class="n">worker</span> <span class="o">=</span> <span class="n">worker</span><span class="p">;</span>
+
+			<span class="n">work</span><span class="o">-&gt;</span><span class="n">func</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+
+			<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">);</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * unless this is an ordered work queue,</span>
+<span class="cm">			 * &#39;work&#39; was probably freed by func above.</span>
+<span class="cm">			 */</span>
+			<span class="n">run_ordered_completions</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+
+			<span class="n">check_pending_worker_creates</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+			<span class="n">cond_resched</span><span class="p">();</span>
+		<span class="p">}</span>
+
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">check_idle_worker</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">freezing</span><span class="p">(</span><span class="n">current</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+			<span class="n">try_to_freeze</span><span class="p">();</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+				<span class="n">cpu_relax</span><span class="p">();</span>
+				<span class="cm">/*</span>
+<span class="cm">				 * we&#39;ve dropped the lock, did someone else</span>
+<span class="cm">				 * jump_in?</span>
+<span class="cm">				 */</span>
+				<span class="n">smp_mb</span><span class="p">();</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">)</span> <span class="o">||</span>
+				    <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">))</span>
+					<span class="k">continue</span><span class="p">;</span>
+
+				<span class="cm">/*</span>
+<span class="cm">				 * this short schedule allows more work to</span>
+<span class="cm">				 * come in without the queue functions</span>
+<span class="cm">				 * needing to go through wake_up_process()</span>
+<span class="cm">				 *</span>
+<span class="cm">				 * worker-&gt;working is still 1, so nobody</span>
+<span class="cm">				 * is going to try and wake us up</span>
+<span class="cm">				 */</span>
+				<span class="n">schedule_timeout</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+				<span class="n">smp_mb</span><span class="p">();</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">)</span> <span class="o">||</span>
+				    <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">))</span>
+					<span class="k">continue</span><span class="p">;</span>
+
+				<span class="k">if</span> <span class="p">(</span><span class="n">kthread_should_stop</span><span class="p">())</span>
+					<span class="k">break</span><span class="p">;</span>
+
+				<span class="cm">/* still no more work?, sleep for real */</span>
+				<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+				<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">)</span> <span class="o">||</span>
+				    <span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+					<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+					<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+				<span class="p">}</span>
+
+				<span class="cm">/*</span>
+<span class="cm">				 * this makes sure we get a wakeup when someone</span>
+<span class="cm">				 * adds something new to the queue</span>
+<span class="cm">				 */</span>
+				<span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+					<span class="n">schedule_timeout</span><span class="p">(</span><span class="n">HZ</span> <span class="o">*</span> <span class="mi">120</span><span class="p">);</span>
+					<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">&amp;&amp;</span>
+					    <span class="n">try_worker_shutdown</span><span class="p">(</span><span class="n">worker</span><span class="p">))</span> <span class="p">{</span>
+						<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+					<span class="p">}</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">());</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * this will wait for all the worker threads to shutdown</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">btrfs_stop_workers</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">cur</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">can_stop</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">list_splice_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">worker</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_worker_thread</span><span class="p">,</span>
+				    <span class="n">worker_list</span><span class="p">);</span>
+
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">);</span>
+		<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">-=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+			<span class="n">put_worker</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+			<span class="n">can_stop</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">can_stop</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">can_stop</span><span class="p">)</span>
+			<span class="n">kthread_stop</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">put_worker</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * simple init on struct btrfs_workers</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">btrfs_init_workers</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">,</span> <span class="kt">int</span> <span class="n">max</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">async_helper</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">prio_order_list</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">max_workers</span> <span class="o">=</span> <span class="n">max</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_thresh</span> <span class="o">=</span> <span class="mi">32</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">=</span> <span class="n">name</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">ordered</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_start_pending</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_worker_start</span> <span class="o">=</span> <span class="n">async_helper</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * starts new worker threads.  This does not enforce the max worker</span>
+<span class="cm"> * count in case you need to temporarily go past it.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__btrfs_start_workers</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">worker</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">worker</span><span class="p">),</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">refs</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span> <span class="o">=</span> <span class="n">workers</span><span class="p">;</span>
+	<span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span> <span class="o">=</span> <span class="n">kthread_run</span><span class="p">(</span><span class="n">worker_loop</span><span class="p">,</span> <span class="n">worker</span><span class="p">,</span>
+				   <span class="s">&quot;btrfs-%s-%d&quot;</span><span class="p">,</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span>
+				   <span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">);</span>
+	<span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">fail:</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">btrfs_start_workers</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">__btrfs_start_workers</span><span class="p">(</span><span class="n">workers</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * run through the list and find a worker thread that doesn&#39;t have a lot</span>
+<span class="cm"> * to do right now.  This can return null if we aren&#39;t yet at the thread</span>
+<span class="cm"> * count limit and all of the threads are busy.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="nf">next_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">enforce_min</span><span class="p">;</span>
+
+	<span class="n">enforce_min</span> <span class="o">=</span> <span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">+</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span><span class="p">)</span> <span class="o">&lt;</span>
+		<span class="n">workers</span><span class="o">-&gt;</span><span class="n">max_workers</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * if we find an idle thread, don&#39;t move it to the end of the</span>
+<span class="cm">	 * idle list.  This improves the chance that the next submission</span>
+<span class="cm">	 * will reuse the same thread, and maybe catch it while it is still</span>
+<span class="cm">	 * working</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">next</span> <span class="o">=</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+		<span class="n">worker</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_worker_thread</span><span class="p">,</span>
+				    <span class="n">worker_list</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">worker</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">enforce_min</span> <span class="o">||</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * if we pick a busy task, move the task to the end of the list.</span>
+<span class="cm">	 * hopefully this will keep things somewhat evenly balanced.</span>
+<span class="cm">	 * Do the move in batches based on the sequence number.  This groups</span>
+<span class="cm">	 * requests submitted at roughly the same time onto the same worker.</span>
+<span class="cm">	 */</span>
+	<span class="n">next</span> <span class="o">=</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">worker</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_worker_thread</span><span class="p">,</span> <span class="n">worker_list</span><span class="p">);</span>
+	<span class="n">worker</span><span class="o">-&gt;</span><span class="n">sequence</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">sequence</span> <span class="o">%</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_thresh</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">list_move_tail</span><span class="p">(</span><span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">worker</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * selects a worker thread to take the next job.  This will either find</span>
+<span class="cm"> * an idle worker, start a new worker up to the max count, or just return</span>
+<span class="cm"> * one of the existing busy workers.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="nf">find_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">fallback</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="nl">again:</span>
+	<span class="n">worker</span> <span class="o">=</span> <span class="n">next_worker</span><span class="p">(</span><span class="n">workers</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers</span> <span class="o">+</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span> <span class="o">&gt;=</span>
+		    <span class="n">workers</span><span class="o">-&gt;</span><span class="n">max_workers</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">goto</span> <span class="n">fallback</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_worker_start</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">workers</span><span class="o">-&gt;</span><span class="n">atomic_start_pending</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">fallback</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">workers</span><span class="o">-&gt;</span><span class="n">num_workers_starting</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+			<span class="cm">/* we&#39;re below the limit, start another worker */</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">__btrfs_start_workers</span><span class="p">(</span><span class="n">workers</span><span class="p">);</span>
+			<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+				<span class="k">goto</span> <span class="n">fallback</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">goto</span> <span class="n">found</span><span class="p">;</span>
+
+<span class="nl">fallback:</span>
+	<span class="n">fallback</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * we have failed to find any workers, just</span>
+<span class="cm">	 * return the first one we can find.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">))</span>
+		<span class="n">fallback</span> <span class="o">=</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">))</span>
+		<span class="n">fallback</span> <span class="o">=</span> <span class="n">workers</span><span class="o">-&gt;</span><span class="n">idle_list</span><span class="p">.</span><span class="n">next</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">fallback</span><span class="p">);</span>
+	<span class="n">worker</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">fallback</span><span class="p">,</span>
+		  <span class="k">struct</span> <span class="n">btrfs_worker_thread</span><span class="p">,</span> <span class="n">worker_list</span><span class="p">);</span>
+<span class="nl">found:</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * this makes sure the worker doesn&#39;t exit before it is placed</span>
+<span class="cm">	 * onto a busy/idle list</span>
+<span class="cm">	 */</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">worker</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * btrfs_requeue_work just puts the work item back on the tail of the list</span>
+<span class="cm"> * it was taken from.  It is intended for use with long running work functions</span>
+<span class="cm"> * that make some progress and want to give the cpu up for others.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">btrfs_requeue_work</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span> <span class="o">=</span> <span class="n">work</span><span class="o">-&gt;</span><span class="n">worker</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">wake</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">WORK_QUEUED_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">WORK_HIGH_PRIO_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">num_pending</span><span class="p">);</span>
+
+	<span class="cm">/* by definition we&#39;re busy, take ourselves off the idle</span>
+<span class="cm">	 * list</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">worker</span><span class="o">-&gt;</span><span class="n">idle</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">list_move_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">,</span>
+			      <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">worker_list</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">wake</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wake</span><span class="p">)</span>
+		<span class="n">wake_up_process</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">btrfs_set_work_high_prio</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">WORK_HIGH_PRIO_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * places a struct btrfs_work into the pending queue of one of the kthreads</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">btrfs_queue_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">btrfs_workers</span> <span class="o">*</span><span class="n">workers</span><span class="p">,</span> <span class="k">struct</span> <span class="n">btrfs_work</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">btrfs_worker_thread</span> <span class="o">*</span><span class="n">worker</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">wake</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* don&#39;t requeue something already on a list */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">WORK_QUEUED_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">worker</span> <span class="o">=</span> <span class="n">find_worker</span><span class="p">(</span><span class="n">workers</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">ordered</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * you&#39;re not allowed to do ordered queues from an</span>
+<span class="cm">		 * interrupt handler</span>
+<span class="cm">		 */</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">WORK_HIGH_PRIO_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">,</span>
+				      <span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">prio_order_list</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">workers</span><span class="o">-&gt;</span><span class="n">order_lock</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">order_list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">WORK_HIGH_PRIO_BIT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">prio_pending</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">work</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">pending</span><span class="p">);</span>
+	<span class="n">check_busy_worker</span><span class="p">(</span><span class="n">worker</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * avoid calling into wake_up_process if this thread has already</span>
+<span class="cm">	 * been kicked</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span><span class="p">)</span>
+		<span class="n">wake</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">worker</span><span class="o">-&gt;</span><span class="n">working</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wake</span><span class="p">)</span>
+		<span class="n">wake_up_process</span><span class="p">(</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">worker</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

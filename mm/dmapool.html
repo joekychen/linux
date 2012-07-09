@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » mm › dmapool.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>dmapool.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * DMA Pool allocator</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright 2001 David Brownell</span>
+<span class="cm"> * Copyright 2007 Intel Corporation</span>
+<span class="cm"> *   Author: Matthew Wilcox &lt;willy@linux.intel.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This software may be redistributed and/or modified under the terms of</span>
+<span class="cm"> * the GNU General Public License (&quot;GPL&quot;) version 2 as published by the</span>
+<span class="cm"> * Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This allocator returns small blocks of a given size which are DMA-able by</span>
+<span class="cm"> * the given device.  It uses the dma_alloc_coherent page allocator to get</span>
+<span class="cm"> * new pages, then splits them up into blocks of the required size.</span>
+<span class="cm"> * Many older drivers still have their own code to do this.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The current design of this allocator is fairly simple.  The pool is</span>
+<span class="cm"> * represented by the &#39;struct dma_pool&#39; which keeps a doubly-linked list of</span>
+<span class="cm"> * allocated pages.  Each page in the page_list is split into blocks of at</span>
+<span class="cm"> * least &#39;size&#39; bytes.  Free blocks are tracked in an unsorted singly-linked</span>
+<span class="cm"> * list of free blocks within the page.  Used blocks aren&#39;t tracked, but we</span>
+<span class="cm"> * keep a count of how many are currently allocated from each page.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/dma-mapping.h&gt;</span>
+<span class="cp">#include &lt;linux/dmapool.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/poison.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/stat.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/wait.h&gt;</span>
+
+<span class="cp">#if defined(CONFIG_DEBUG_SLAB) || defined(CONFIG_SLUB_DEBUG_ON)</span>
+<span class="cp">#define DMAPOOL_DEBUG 1</span>
+<span class="cp">#endif</span>
+
+<span class="k">struct</span> <span class="n">dma_pool</span> <span class="p">{</span>		<span class="cm">/* the pool */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">page_list</span><span class="p">;</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">size</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">allocation</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">boundary</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">name</span><span class="p">[</span><span class="mi">32</span><span class="p">];</span>
+	<span class="n">wait_queue_head_t</span> <span class="n">waitq</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">pools</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">dma_page</span> <span class="p">{</span>		<span class="cm">/* cacheable header for &#39;allocation&#39; bytes */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">page_list</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">dma</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">in_use</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cp">#define	POOL_TIMEOUT_JIFFIES	((100 </span><span class="cm">/* msec */</span><span class="cp"> * HZ) / 1000)</span>
+
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">pools_lock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span>
+<span class="nf">show_pools</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">temp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">size</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+
+	<span class="n">next</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+	<span class="n">size</span> <span class="o">=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+
+	<span class="n">temp</span> <span class="o">=</span> <span class="n">scnprintf</span><span class="p">(</span><span class="n">next</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="s">&quot;poolinfo - 0.1</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="n">size</span> <span class="o">-=</span> <span class="n">temp</span><span class="p">;</span>
+	<span class="n">next</span> <span class="o">+=</span> <span class="n">temp</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dma_pools</span><span class="p">,</span> <span class="n">pools</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="n">pages</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="n">blocks</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span> <span class="n">page_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pages</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">blocks</span> <span class="o">+=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">in_use</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="cm">/* per-pool info, no real statistics yet */</span>
+		<span class="n">temp</span> <span class="o">=</span> <span class="n">scnprintf</span><span class="p">(</span><span class="n">next</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="s">&quot;%-16s %4u %4Zu %4Zu %2u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				 <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">blocks</span><span class="p">,</span>
+				 <span class="n">pages</span> <span class="o">*</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span> <span class="o">/</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">),</span>
+				 <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+		<span class="n">size</span> <span class="o">-=</span> <span class="n">temp</span><span class="p">;</span>
+		<span class="n">next</span> <span class="o">+=</span> <span class="n">temp</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">DEVICE_ATTR</span><span class="p">(</span><span class="n">pools</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="p">,</span> <span class="n">show_pools</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dma_pool_create - Creates a pool of consistent memory blocks, for dma.</span>
+<span class="cm"> * @name: name of pool, for diagnostics</span>
+<span class="cm"> * @dev: device that will be doing the DMA</span>
+<span class="cm"> * @size: size of the blocks in this pool.</span>
+<span class="cm"> * @align: alignment requirement for blocks; must be a power of two</span>
+<span class="cm"> * @boundary: returned blocks won&#39;t cross this power of two boundary</span>
+<span class="cm"> * Context: !in_interrupt()</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns a dma allocation pool with the requested characteristics, or</span>
+<span class="cm"> * null if one can&#39;t be created.  Given one of these pools, dma_pool_alloc()</span>
+<span class="cm"> * may be used to allocate memory.  Such memory will all have &quot;consistent&quot;</span>
+<span class="cm"> * DMA mappings, accessible by the device and its driver without using</span>
+<span class="cm"> * cache flushing primitives.  The actual size of blocks allocated may be</span>
+<span class="cm"> * larger than requested because of alignment.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If @boundary is nonzero, objects returned from dma_pool_alloc() won&#39;t</span>
+<span class="cm"> * cross that size boundary.  This is useful for devices which have</span>
+<span class="cm"> * addressing restrictions on individual DMA transfers, such as not crossing</span>
+<span class="cm"> * boundaries of 4KBytes.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="nf">dma_pool_create</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+				 <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">align</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">boundary</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">retval</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">allocation</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">align</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">align</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">align</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">align</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;</span> <span class="mi">4</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="mi">4</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">size</span> <span class="o">%</span> <span class="n">align</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">align</span><span class="p">);</span>
+
+	<span class="n">allocation</span> <span class="o">=</span> <span class="n">max_t</span><span class="p">(</span><span class="kt">size_t</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">boundary</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">boundary</span> <span class="o">=</span> <span class="n">allocation</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">((</span><span class="n">boundary</span> <span class="o">&lt;</span> <span class="n">size</span><span class="p">)</span> <span class="o">||</span> <span class="p">(</span><span class="n">boundary</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">boundary</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">retval</span> <span class="o">=</span> <span class="n">kmalloc_node</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">retval</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="n">dev_to_node</span><span class="p">(</span><span class="n">dev</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">retval</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">retval</span><span class="p">;</span>
+
+	<span class="n">strlcpy</span><span class="p">(</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">));</span>
+
+	<span class="n">retval</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">dev</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">retval</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="n">retval</span><span class="o">-&gt;</span><span class="n">boundary</span> <span class="o">=</span> <span class="n">boundary</span><span class="p">;</span>
+	<span class="n">retval</span><span class="o">-&gt;</span><span class="n">allocation</span> <span class="o">=</span> <span class="n">allocation</span><span class="p">;</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">waitq</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dma_pools</span><span class="p">))</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">device_create_file</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev_attr_pools</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="cm">/* note:  not currently insisting &quot;name&quot; be unique */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">pools</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dma_pools</span><span class="p">);</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">retval</span><span class="p">);</span>
+			<span class="n">retval</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">retval</span><span class="o">-&gt;</span><span class="n">pools</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">retval</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dma_pool_create</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">pool_initialise_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">next_boundary</span> <span class="o">=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">boundary</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">next</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">+</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">((</span><span class="n">next</span> <span class="o">+</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">next_boundary</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">next</span> <span class="o">=</span> <span class="n">next_boundary</span><span class="p">;</span>
+			<span class="n">next_boundary</span> <span class="o">+=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">boundary</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="o">*</span><span class="p">(</span><span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">)</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&lt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="nf">pool_alloc_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">mem_flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="n">page</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">page</span><span class="p">),</span> <span class="n">mem_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">=</span> <span class="n">dma_alloc_coherent</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">,</span>
+					 <span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span><span class="p">,</span> <span class="n">mem_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef	DMAPOOL_DEBUG</span>
+		<span class="n">memset</span><span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">POOL_POISON_FREED</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">);</span>
+<span class="cp">#endif</span>
+		<span class="n">pool_initialise_page</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">);</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">in_use</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">page</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">is_page_busy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">in_use</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">pool_free_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dma_addr_t</span> <span class="n">dma</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span><span class="p">;</span>
+
+<span class="cp">#ifdef	DMAPOOL_DEBUG</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">POOL_POISON_FREED</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">);</span>
+<span class="cp">#endif</span>
+	<span class="n">dma_free_coherent</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">dma</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dma_pool_destroy - destroys a pool of dma memory blocks.</span>
+<span class="cm"> * @pool: dma pool that will be destroyed</span>
+<span class="cm"> * Context: !in_interrupt()</span>
+<span class="cm"> *</span>
+<span class="cm"> * Caller guarantees that no more memory from the pool is in use,</span>
+<span class="cm"> * and that nothing will try to use the pool after this call.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dma_pool_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pools</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">&amp;&amp;</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dma_pools</span><span class="p">))</span>
+		<span class="n">device_remove_file</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev_attr_pools</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pools_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				  <span class="k">struct</span> <span class="n">dma_page</span><span class="p">,</span> <span class="n">page_list</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_page_busy</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+				<span class="n">dev_err</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+					<span class="s">&quot;dma_pool_destroy %s, %p busy</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">);</span>
+			<span class="k">else</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+				       <span class="s">&quot;dma_pool_destroy %s, %p busy</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				       <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">);</span>
+			<span class="cm">/* leak the still-in-use consistent memory */</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">pool_free_page</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dma_pool_destroy</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dma_pool_alloc - get a block of consistent memory</span>
+<span class="cm"> * @pool: dma pool that will produce the block</span>
+<span class="cm"> * @mem_flags: GFP_* bitmask</span>
+<span class="cm"> * @handle: pointer to dma address of block</span>
+<span class="cm"> *</span>
+<span class="cm"> * This returns the kernel virtual address of a currently unused block,</span>
+<span class="cm"> * and reports its dma address through the handle.</span>
+<span class="cm"> * If such a memory block can&#39;t be allocated, %NULL is returned.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dma_pool_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">mem_flags</span><span class="p">,</span>
+		     <span class="n">dma_addr_t</span> <span class="o">*</span><span class="n">handle</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">retval</span><span class="p">;</span>
+
+	<span class="n">might_sleep_if</span><span class="p">(</span><span class="n">mem_flags</span> <span class="o">&amp;</span> <span class="n">__GFP_WAIT</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+ <span class="nl">restart:</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span> <span class="n">page_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">&lt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">ready</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">pool_alloc_page</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">mem_flags</span> <span class="o">&amp;</span> <span class="n">__GFP_WAIT</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">DECLARE_WAITQUEUE</span><span class="p">(</span><span class="n">wait</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+
+			<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+			<span class="n">__add_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+			<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+			<span class="n">schedule_timeout</span><span class="p">(</span><span class="n">POOL_TIMEOUT_JIFFIES</span><span class="p">);</span>
+
+			<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+			<span class="n">__remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">waitq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">restart</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">retval</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+	<span class="p">}</span>
+
+ <span class="nl">ready:</span>
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">in_use</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="n">retval</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">+</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">handle</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">+</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span><span class="p">;</span>
+<span class="cp">#ifdef	DMAPOOL_DEBUG</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">retval</span><span class="p">,</span> <span class="n">POOL_POISON_ALLOCATED</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+<span class="cp">#endif</span>
+ <span class="nl">done:</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">retval</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dma_pool_alloc</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="nf">pool_find_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span> <span class="n">page_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dma</span> <span class="o">&lt;</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dma</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span> <span class="o">+</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">page</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dma_pool_free - put block back into dma pool</span>
+<span class="cm"> * @pool: the dma pool holding the block</span>
+<span class="cm"> * @vaddr: virtual address of block</span>
+<span class="cm"> * @dma: dma address of block</span>
+<span class="cm"> *</span>
+<span class="cm"> * Caller promises neither device nor driver will again touch this block</span>
+<span class="cm"> * unless it is first re-allocated.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dma_pool_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">pool_find_page</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">dma</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+				<span class="s">&quot;dma_pool_free %s, %p/%lx (bad dma)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;dma_pool_free %s, %p/%lx (bad dma)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">vaddr</span> <span class="o">-</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">;</span>
+<span class="cp">#ifdef	DMAPOOL_DEBUG</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">dma</span> <span class="o">-</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">dma</span><span class="p">)</span> <span class="o">!=</span> <span class="n">offset</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+			<span class="n">dev_err</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span>
+				<span class="s">&quot;dma_pool_free %s, %p (bad vaddr)/%Lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+			       <span class="s">&quot;dma_pool_free %s, %p (bad vaddr)/%Lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">chain</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">chain</span> <span class="o">&lt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">allocation</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">chain</span> <span class="o">!=</span> <span class="n">offset</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">chain</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">chain</span><span class="p">);</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+				<span class="n">dev_err</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;dma_pool_free %s, dma %Lx &quot;</span>
+					<span class="s">&quot;already free</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span>
+					<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+			<span class="k">else</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;dma_pool_free %s, dma %Lx &quot;</span>
+					<span class="s">&quot;already free</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span>
+					<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">POOL_POISON_FREED</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">in_use</span><span class="o">--</span><span class="p">;</span>
+	<span class="o">*</span><span class="p">(</span><span class="kt">int</span> <span class="o">*</span><span class="p">)</span><span class="n">vaddr</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">waitqueue_active</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">waitq</span><span class="p">))</span>
+		<span class="n">wake_up_locked</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">waitq</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Resist a temptation to do</span>
+<span class="cm">	 *    if (!is_page_busy(page)) pool_free_page(pool, page);</span>
+<span class="cm">	 * Better have a few empty pages hang around.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dma_pool_free</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Managed DMA pool</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dmam_pool_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">res</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">**</span><span class="p">)</span><span class="n">res</span><span class="p">;</span>
+
+	<span class="n">dma_pool_destroy</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dmam_pool_match</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">res</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">match_data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">*</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">**</span><span class="p">)</span><span class="n">res</span> <span class="o">==</span> <span class="n">match_data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dmam_pool_create - Managed dma_pool_create()</span>
+<span class="cm"> * @name: name of pool, for diagnostics</span>
+<span class="cm"> * @dev: device that will be doing the DMA</span>
+<span class="cm"> * @size: size of the blocks in this pool.</span>
+<span class="cm"> * @align: alignment requirement for blocks; must be a power of two</span>
+<span class="cm"> * @allocation: returned blocks won&#39;t cross this boundary (or zero)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Managed dma_pool_create().  DMA pool created with this function is</span>
+<span class="cm"> * automatically destroyed on driver detach.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="nf">dmam_pool_create</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">,</span> <span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span>
+				  <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">align</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">allocation</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">**</span><span class="n">ptr</span><span class="p">,</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+
+	<span class="n">ptr</span> <span class="o">=</span> <span class="n">devres_alloc</span><span class="p">(</span><span class="n">dmam_pool_release</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">ptr</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ptr</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">pool</span> <span class="o">=</span> <span class="o">*</span><span class="n">ptr</span> <span class="o">=</span> <span class="n">dma_pool_create</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">dev</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">align</span><span class="p">,</span> <span class="n">allocation</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="p">)</span>
+		<span class="n">devres_add</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">ptr</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">devres_free</span><span class="p">(</span><span class="n">ptr</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">pool</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dmam_pool_create</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * dmam_pool_destroy - Managed dma_pool_destroy()</span>
+<span class="cm"> * @pool: dma pool that will be destroyed</span>
+<span class="cm"> *</span>
+<span class="cm"> * Managed dma_pool_destroy().</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dmam_pool_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dma_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">devres_destroy</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">dmam_pool_release</span><span class="p">,</span> <span class="n">dmam_pool_match</span><span class="p">,</span> <span class="n">pool</span><span class="p">));</span>
+	<span class="n">dma_pool_destroy</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">dmam_pool_destroy</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

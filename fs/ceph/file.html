@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › ceph › file.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>file.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cp">#include &lt;linux/ceph/ceph_debug.h&gt;</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/file.h&gt;</span>
+<span class="cp">#include &lt;linux/namei.h&gt;</span>
+<span class="cp">#include &lt;linux/writeback.h&gt;</span>
+
+<span class="cp">#include &quot;super.h&quot;</span>
+<span class="cp">#include &quot;mds_client.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Ceph file operations</span>
+<span class="cm"> *</span>
+<span class="cm"> * Implement basic open/close functionality, and implement</span>
+<span class="cm"> * read/write.</span>
+<span class="cm"> *</span>
+<span class="cm"> * We implement three modes of file I/O:</span>
+<span class="cm"> *  - buffered uses the generic_file_aio_{read,write} helpers</span>
+<span class="cm"> *</span>
+<span class="cm"> *  - synchronous is used when there is multi-client read/write</span>
+<span class="cm"> *    sharing, avoids the page cache, and synchronously waits for an</span>
+<span class="cm"> *    ack from the OSD.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  - direct io takes the variant of the sync path that references</span>
+<span class="cm"> *    user pages directly.</span>
+<span class="cm"> *</span>
+<span class="cm"> * fsync() flushes and waits on dirty pages, but just queues metadata</span>
+<span class="cm"> * for writeback: since the MDS can recover size and mtime there is no</span>
+<span class="cm"> * need to wait for MDS acknowledgement.</span>
+<span class="cm"> */</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Prepare an open request.  Preallocate ceph_cap to avoid an</span>
+<span class="cm"> * inopportune ENOMEM later.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">ceph_mds_request</span> <span class="o">*</span>
+<span class="nf">prepare_open_request</span><span class="p">(</span><span class="k">struct</span> <span class="n">super_block</span> <span class="o">*</span><span class="n">sb</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">,</span> <span class="kt">int</span> <span class="n">create_mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_sb_to_client</span><span class="p">(</span><span class="n">sb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">want_auth</span> <span class="o">=</span> <span class="n">USE_ANY_MDS</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">op</span> <span class="o">=</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">O_CREAT</span><span class="p">)</span> <span class="o">?</span> <span class="n">CEPH_MDS_OP_CREATE</span> <span class="o">:</span> <span class="n">CEPH_MDS_OP_OPEN</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">O_WRONLY</span><span class="o">|</span><span class="n">O_RDWR</span><span class="o">|</span><span class="n">O_CREAT</span><span class="o">|</span><span class="n">O_TRUNC</span><span class="p">))</span>
+		<span class="n">want_auth</span> <span class="o">=</span> <span class="n">USE_AUTH_MDS</span><span class="p">;</span>
+
+	<span class="n">req</span> <span class="o">=</span> <span class="n">ceph_mdsc_create_request</span><span class="p">(</span><span class="n">mdsc</span><span class="p">,</span> <span class="n">op</span><span class="p">,</span> <span class="n">want_auth</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_fmode</span> <span class="o">=</span> <span class="n">ceph_flags_to_mode</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_args</span><span class="p">.</span><span class="n">open</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_args</span><span class="p">.</span><span class="n">open</span><span class="p">.</span><span class="n">mode</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">create_mode</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">req</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * initialize private struct file data.</span>
+<span class="cm"> * if we fail, clean up by dropping fmode reference on the ceph_inode</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_init_file</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">int</span> <span class="n">fmode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_file_info</span> <span class="o">*</span><span class="n">cf</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mode</span> <span class="o">&amp;</span> <span class="n">S_IFMT</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">S_IFREG</span>:
+	<span class="k">case</span> <span class="n">S_IFDIR</span>:
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;init_file %p %p 0%o (regular)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mode</span><span class="p">);</span>
+		<span class="n">cf</span> <span class="o">=</span> <span class="n">kmem_cache_alloc</span><span class="p">(</span><span class="n">ceph_file_cachep</span><span class="p">,</span> <span class="n">GFP_NOFS</span> <span class="o">|</span> <span class="n">__GFP_ZERO</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cf</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ceph_put_fmode</span><span class="p">(</span><span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">fmode</span><span class="p">);</span> <span class="cm">/* clean up */</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">cf</span><span class="o">-&gt;</span><span class="n">fmode</span> <span class="o">=</span> <span class="n">fmode</span><span class="p">;</span>
+		<span class="n">cf</span><span class="o">-&gt;</span><span class="n">next_offset</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">cf</span><span class="p">;</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_fop</span><span class="o">-&gt;</span><span class="n">release</span> <span class="o">!=</span> <span class="n">ceph_release</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">S_IFLNK</span>:
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;init_file %p %p 0%o (symlink)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mode</span><span class="p">);</span>
+		<span class="n">ceph_put_fmode</span><span class="p">(</span><span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">fmode</span><span class="p">);</span> <span class="cm">/* clean up */</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;init_file %p %p 0%o (special)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mode</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * we need to drop the open ref now, since we don&#39;t</span>
+<span class="cm">		 * have .release set to ceph_release.</span>
+<span class="cm">		 */</span>
+		<span class="n">ceph_put_fmode</span><span class="p">(</span><span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">fmode</span><span class="p">);</span> <span class="cm">/* clean up */</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_fop</span><span class="o">-&gt;</span><span class="n">release</span> <span class="o">==</span> <span class="n">ceph_release</span><span class="p">);</span>
+
+		<span class="cm">/* call the proper open fop */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_fop</span><span class="o">-&gt;</span><span class="n">open</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If the filp already has private_data, that means the file was</span>
+<span class="cm"> * already opened by intent during lookup, and we do nothing.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we already have the requisite capabilities, we can satisfy</span>
+<span class="cm"> * the open request locally (no need to request new caps from the</span>
+<span class="cm"> * MDS).  We do, however, need to inform the MDS (asynchronously)</span>
+<span class="cm"> * if our wanted caps set expands.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">ceph_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_sb_to_client</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_file_info</span> <span class="o">*</span><span class="n">cf</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">parent_inode</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span><span class="p">,</span> <span class="n">fmode</span><span class="p">,</span> <span class="n">wanted</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cf</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;open file %p is already opened</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* filter out O_CREAT|O_EXCL; vfs did that already.  yuck. */</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">O_CREAT</span><span class="o">|</span><span class="n">O_EXCL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">S_ISDIR</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mode</span><span class="p">))</span>
+		<span class="n">flags</span> <span class="o">=</span> <span class="n">O_DIRECTORY</span><span class="p">;</span>  <span class="cm">/* mds likes to know */</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;open inode %p ino %llx.%llx file %p flags %d (%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span>
+	     <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">file</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span><span class="p">);</span>
+	<span class="n">fmode</span> <span class="o">=</span> <span class="n">ceph_flags_to_mode</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="n">wanted</span> <span class="o">=</span> <span class="n">ceph_caps_for_mode</span><span class="p">(</span><span class="n">fmode</span><span class="p">);</span>
+
+	<span class="cm">/* snapped files are read-only */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_snap</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CEPH_NOSNAP</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_WRITE</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EROFS</span><span class="p">;</span>
+
+	<span class="cm">/* trivially open snapdir */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_snap</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span> <span class="o">==</span> <span class="n">CEPH_SNAPDIR</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="n">__ceph_get_fmode</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ceph_init_file</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * No need to block if we have caps on the auth MDS (for</span>
+<span class="cm">	 * write) or any MDS (for read).  Update wanted set</span>
+<span class="cm">	 * asynchronously.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">__ceph_is_any_real_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="p">(((</span><span class="n">fmode</span> <span class="o">&amp;</span> <span class="n">CEPH_FILE_MODE_WR</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="o">||</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_auth_cap</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">mds_wanted</span> <span class="o">=</span> <span class="n">__ceph_caps_mds_wanted</span><span class="p">(</span><span class="n">ci</span><span class="p">);</span>
+		<span class="kt">int</span> <span class="n">issued</span> <span class="o">=</span> <span class="n">__ceph_caps_issued</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;open %p fmode %d want %s issued %s using existing</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">fmode</span><span class="p">,</span> <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">wanted</span><span class="p">),</span>
+		     <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">issued</span><span class="p">));</span>
+		<span class="n">__ceph_get_fmode</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+
+		<span class="cm">/* adjust wanted? */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">issued</span> <span class="o">&amp;</span> <span class="n">wanted</span><span class="p">)</span> <span class="o">!=</span> <span class="n">wanted</span> <span class="o">&amp;&amp;</span>
+		    <span class="p">(</span><span class="n">mds_wanted</span> <span class="o">&amp;</span> <span class="n">wanted</span><span class="p">)</span> <span class="o">!=</span> <span class="n">wanted</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">ceph_snap</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CEPH_SNAPDIR</span><span class="p">)</span>
+			<span class="n">ceph_check_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="n">ceph_init_file</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">ceph_snap</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CEPH_NOSNAP</span> <span class="o">&amp;&amp;</span>
+		   <span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_snap_caps</span> <span class="o">&amp;</span> <span class="n">wanted</span><span class="p">)</span> <span class="o">==</span> <span class="n">wanted</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__ceph_get_fmode</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ceph_init_file</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">fmode</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;open fmode %d wants %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">fmode</span><span class="p">,</span> <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">wanted</span><span class="p">));</span>
+	<span class="n">req</span> <span class="o">=</span> <span class="n">prepare_open_request</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">;</span>
+	<span class="n">ihold</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_caps</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">O_CREAT</span><span class="o">|</span><span class="n">O_TRUNC</span><span class="p">))</span>
+		<span class="n">parent_inode</span> <span class="o">=</span> <span class="n">ceph_get_dentry_parent_inode</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_mdsc_do_request</span><span class="p">(</span><span class="n">mdsc</span><span class="p">,</span> <span class="n">parent_inode</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+	<span class="n">iput</span><span class="p">(</span><span class="n">parent_inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">err</span><span class="p">)</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_init_file</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_fmode</span><span class="p">);</span>
+	<span class="n">ceph_mdsc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;open result=%d on %llx.%llx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">err</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Do a lookup + open with a single request.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If this succeeds, but some subsequent check in the vfs</span>
+<span class="cm"> * may_open() fails, the struct *file gets cleaned up (i.e.</span>
+<span class="cm"> * ceph_release gets called).  So fear not!</span>
+<span class="cm"> */</span>
+<span class="cm">/*</span>
+<span class="cm"> * flags</span>
+<span class="cm"> *  path_lookup_open   -&gt; LOOKUP_OPEN</span>
+<span class="cm"> *  path_lookup_create -&gt; LOOKUP_OPEN|LOOKUP_CREATE</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="nf">ceph_lookup_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">dir</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">dentry</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">nameidata</span> <span class="o">*</span><span class="n">nd</span><span class="p">,</span> <span class="kt">int</span> <span class="n">mode</span><span class="p">,</span>
+				<span class="kt">int</span> <span class="n">locked_dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_sb_to_client</span><span class="p">(</span><span class="n">dir</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span> <span class="o">=</span> <span class="n">nd</span><span class="o">-&gt;</span><span class="n">intent</span><span class="p">.</span><span class="n">open</span><span class="p">.</span><span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;ceph_lookup_open dentry %p &#39;%.*s&#39; flags %d mode 0%o</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">dentry</span><span class="p">,</span> <span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_name</span><span class="p">.</span><span class="n">len</span><span class="p">,</span> <span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_name</span><span class="p">.</span><span class="n">name</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">mode</span><span class="p">);</span>
+
+	<span class="cm">/* do the open */</span>
+	<span class="n">req</span> <span class="o">=</span> <span class="n">prepare_open_request</span><span class="p">(</span><span class="n">dir</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">mode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">req</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">ERR_CAST</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_dentry</span> <span class="o">=</span> <span class="n">dget</span><span class="p">(</span><span class="n">dentry</span><span class="p">);</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_caps</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">O_CREAT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_dentry_drop</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_SHARED</span><span class="p">;</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_dentry_unless</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_EXCL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_locked_dir</span> <span class="o">=</span> <span class="n">dir</span><span class="p">;</span>           <span class="cm">/* caller holds dir-&gt;i_mutex */</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_mdsc_do_request</span><span class="p">(</span><span class="n">mdsc</span><span class="p">,</span>
+				   <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">O_CREAT</span><span class="o">|</span><span class="n">O_TRUNC</span><span class="p">))</span> <span class="o">?</span> <span class="n">dir</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">,</span>
+				   <span class="n">req</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_handle_snapdir</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">dentry</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">O_CREAT</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_reply_info</span><span class="p">.</span><span class="n">head</span><span class="o">-&gt;</span><span class="n">is_dentry</span><span class="p">)</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_handle_notrace_create</span><span class="p">(</span><span class="n">dir</span><span class="p">,</span> <span class="n">dentry</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">file</span> <span class="o">=</span> <span class="n">lookup_instantiate_filp</span><span class="p">(</span><span class="n">nd</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_dentry</span><span class="p">,</span> <span class="n">ceph_open</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">file</span><span class="p">))</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">file</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_finish_lookup</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">dentry</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+	<span class="n">ceph_mdsc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;ceph_lookup_open result=%p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">ceph_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_file_info</span> <span class="o">*</span><span class="n">cf</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;release inode %p file %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+	<span class="n">ceph_put_fmode</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">cf</span><span class="o">-&gt;</span><span class="n">fmode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cf</span><span class="o">-&gt;</span><span class="n">last_readdir</span><span class="p">)</span>
+		<span class="n">ceph_mdsc_put_request</span><span class="p">(</span><span class="n">cf</span><span class="o">-&gt;</span><span class="n">last_readdir</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">cf</span><span class="o">-&gt;</span><span class="n">last_name</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">cf</span><span class="o">-&gt;</span><span class="n">dir_info</span><span class="p">);</span>
+	<span class="n">dput</span><span class="p">(</span><span class="n">cf</span><span class="o">-&gt;</span><span class="n">dentry</span><span class="p">);</span>
+	<span class="n">kmem_cache_free</span><span class="p">(</span><span class="n">ceph_file_cachep</span><span class="p">,</span> <span class="n">cf</span><span class="p">);</span>
+
+	<span class="cm">/* wake up anyone waiting for caps on this inode */</span>
+	<span class="n">wake_up_all</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_cap_wq</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Read a range of bytes striped over one or more objects.  Iterate over</span>
+<span class="cm"> * objects we stripe over.  (That&#39;s not atomic, but good enough for now.)</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we get a short result from the OSD, check against i_size; we need to</span>
+<span class="cm"> * only return a short read to the caller if we hit EOF.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">striped_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span>
+			<span class="n">u64</span> <span class="n">off</span><span class="p">,</span> <span class="n">u64</span> <span class="n">len</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">,</span> <span class="kt">int</span> <span class="n">num_pages</span><span class="p">,</span>
+			<span class="kt">int</span> <span class="o">*</span><span class="n">checkeof</span><span class="p">,</span> <span class="n">bool</span> <span class="n">o_direct</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buf_align</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">u64</span> <span class="n">pos</span><span class="p">,</span> <span class="n">this_len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">io_align</span><span class="p">,</span> <span class="n">page_align</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">left</span><span class="p">,</span> <span class="n">pages_left</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">read</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">page_pos</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">hit_stripe</span><span class="p">,</span> <span class="n">was_short</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * we may need to do multiple reads.  not atomic, unfortunately.</span>
+<span class="cm">	 */</span>
+	<span class="n">pos</span> <span class="o">=</span> <span class="n">off</span><span class="p">;</span>
+	<span class="n">left</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+	<span class="n">page_pos</span> <span class="o">=</span> <span class="n">pages</span><span class="p">;</span>
+	<span class="n">pages_left</span> <span class="o">=</span> <span class="n">num_pages</span><span class="p">;</span>
+	<span class="n">read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">io_align</span> <span class="o">=</span> <span class="n">off</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+
+<span class="nl">more:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">o_direct</span><span class="p">)</span>
+		<span class="n">page_align</span> <span class="o">=</span> <span class="p">(</span><span class="n">pos</span> <span class="o">-</span> <span class="n">io_align</span> <span class="o">+</span> <span class="n">buf_align</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">page_align</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">this_len</span> <span class="o">=</span> <span class="n">left</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_osdc_readpages</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span> <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span>
+				  <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">this_len</span><span class="p">,</span>
+				  <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span>
+				  <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+				  <span class="n">page_pos</span><span class="p">,</span> <span class="n">pages_left</span><span class="p">,</span> <span class="n">page_align</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">hit_stripe</span> <span class="o">=</span> <span class="n">this_len</span> <span class="o">&lt;</span> <span class="n">left</span><span class="p">;</span>
+	<span class="n">was_short</span> <span class="o">=</span> <span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">ret</span> <span class="o">&lt;</span> <span class="n">this_len</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;striped_read %llu~%u (read %u) got %d%s%s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">read</span><span class="p">,</span>
+	     <span class="n">ret</span><span class="p">,</span> <span class="n">hit_stripe</span> <span class="o">?</span> <span class="s">&quot; HITSTRIPE&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">,</span> <span class="n">was_short</span> <span class="o">?</span> <span class="s">&quot; SHORT&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">didpages</span> <span class="o">=</span> <span class="p">(</span><span class="n">page_align</span> <span class="o">+</span> <span class="n">ret</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">read</span> <span class="o">&lt;</span> <span class="n">pos</span> <span class="o">-</span> <span class="n">off</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot; zero gap %llu to %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">off</span> <span class="o">+</span> <span class="n">read</span><span class="p">,</span> <span class="n">pos</span><span class="p">);</span>
+			<span class="n">ceph_zero_page_vector_range</span><span class="p">(</span><span class="n">page_align</span> <span class="o">+</span> <span class="n">read</span><span class="p">,</span>
+						    <span class="n">pos</span> <span class="o">-</span> <span class="n">off</span> <span class="o">-</span> <span class="n">read</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">pos</span> <span class="o">+=</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="n">read</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">-</span> <span class="n">off</span><span class="p">;</span>
+		<span class="n">left</span> <span class="o">-=</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="n">page_pos</span> <span class="o">+=</span> <span class="n">didpages</span><span class="p">;</span>
+		<span class="n">pages_left</span> <span class="o">-=</span> <span class="n">didpages</span><span class="p">;</span>
+
+		<span class="cm">/* hit stripe? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">left</span> <span class="o">&amp;&amp;</span> <span class="n">hit_stripe</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">more</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">was_short</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* did we bounce off eof? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pos</span> <span class="o">+</span> <span class="n">left</span> <span class="o">&gt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span>
+			<span class="o">*</span><span class="n">checkeof</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+		<span class="cm">/* zero trailing bytes (inside i_size) */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">left</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">pos</span> <span class="o">&lt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pos</span> <span class="o">+</span> <span class="n">left</span> <span class="o">&gt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span>
+				<span class="n">left</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span> <span class="o">-</span> <span class="n">pos</span><span class="p">;</span>
+
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot;zero tail %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">left</span><span class="p">);</span>
+			<span class="n">ceph_zero_page_vector_range</span><span class="p">(</span><span class="n">page_align</span> <span class="o">+</span> <span class="n">read</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span>
+						    <span class="n">pages</span><span class="p">);</span>
+			<span class="n">read</span> <span class="o">+=</span> <span class="n">left</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">read</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;striped_read returns %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Completely synchronous read and write methods.  Direct from __user</span>
+<span class="cm"> * buffer to osd, or directly to user pages (if O_DIRECT).</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the read spans object boundary, just do multiple reads.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">ceph_sync_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span>
+			      <span class="kt">unsigned</span> <span class="n">len</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">poff</span><span class="p">,</span> <span class="kt">int</span> <span class="o">*</span><span class="n">checkeof</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">off</span> <span class="o">=</span> <span class="o">*</span><span class="n">poff</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">num_pages</span><span class="p">,</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;sync_read on file %p %llu~%u %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span>
+	     <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot;O_DIRECT&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">num_pages</span> <span class="o">=</span> <span class="n">calc_pages_for</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">data</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">pages</span> <span class="o">=</span> <span class="n">ceph_get_direct_page_vector</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">num_pages</span> <span class="o">=</span> <span class="n">calc_pages_for</span><span class="p">(</span><span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">pages</span> <span class="o">=</span> <span class="n">ceph_alloc_page_vector</span><span class="p">(</span><span class="n">num_pages</span><span class="p">,</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * flush any page cache pages in this range.  this</span>
+<span class="cm">	 * will make concurrent normal and sync io slow,</span>
+<span class="cm">	 * but it will at least behave sensibly when they are</span>
+<span class="cm">	 * in sequence.</span>
+<span class="cm">	 */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">filemap_write_and_wait</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">striped_read</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">,</span> <span class="n">checkeof</span><span class="p">,</span>
+			   <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">,</span>
+			   <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">data</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_copy_page_vector_to_user</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">poff</span> <span class="o">=</span> <span class="n">off</span> <span class="o">+</span> <span class="n">ret</span><span class="p">;</span>
+
+<span class="nl">done:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span>
+		<span class="n">ceph_put_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">ceph_release_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">);</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;sync_read result %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Write commit callback, called if we requested both an ACK and</span>
+<span class="cm"> * ONDISK commit reply from the OSD.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">sync_write_commit</span><span class="p">(</span><span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">ceph_msg</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span><span class="p">);</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;sync_write_commit %p tid %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_tid</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_unsafe_item</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+	<span class="n">ceph_put_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Synchronous write, straight from __user pointer or user pages (if</span>
+<span class="cm"> * O_DIRECT).</span>
+<span class="cm"> *</span>
+<span class="cm"> * If write spans object boundary, just do multiple writes.  (For a</span>
+<span class="cm"> * correct atomic write, we should e.g. take write locks on all</span>
+<span class="cm"> * objects, rollback on failure, etc.)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">ceph_sync_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="n">__user</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span>
+			       <span class="kt">size_t</span> <span class="n">left</span><span class="p">,</span> <span class="n">loff_t</span> <span class="o">*</span><span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">num_pages</span><span class="p">;</span>
+	<span class="kt">long</span> <span class="kt">long</span> <span class="kt">unsigned</span> <span class="n">pos</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">written</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">do_sync</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">check_caps</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">page_align</span><span class="p">,</span> <span class="n">io_align</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buf_align</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">timespec</span> <span class="n">mtime</span> <span class="o">=</span> <span class="n">CURRENT_TIME</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_snap</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CEPH_NOSNAP</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EROFS</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;sync_write on file %p %lld~%u %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="o">*</span><span class="n">offset</span><span class="p">,</span>
+	     <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">left</span><span class="p">,</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot;O_DIRECT&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_APPEND</span><span class="p">)</span>
+		<span class="n">pos</span> <span class="o">=</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">pos</span> <span class="o">=</span> <span class="o">*</span><span class="n">offset</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">filemap_write_and_wait_range</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">pos</span> <span class="o">+</span> <span class="n">left</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">invalidate_inode_pages2_range</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">,</span>
+					    <span class="n">pos</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span>
+					    <span class="p">(</span><span class="n">pos</span> <span class="o">+</span> <span class="n">left</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;invalidate_inode_pages2_range returned %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">CEPH_OSD_FLAG_ORDERSNAP</span> <span class="o">|</span>
+		<span class="n">CEPH_OSD_FLAG_ONDISK</span> <span class="o">|</span>
+		<span class="n">CEPH_OSD_FLAG_WRITE</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">O_SYNC</span><span class="o">|</span><span class="n">O_DIRECT</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">flags</span> <span class="o">|=</span> <span class="n">CEPH_OSD_FLAG_ACK</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">do_sync</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * we may need to do multiple writes here if we span an object</span>
+<span class="cm">	 * boundary.  this isn&#39;t atomic, unfortunately.  :(</span>
+<span class="cm">	 */</span>
+<span class="nl">more:</span>
+	<span class="n">io_align</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">buf_align</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">data</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">len</span> <span class="o">=</span> <span class="n">left</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* write from beginning of first page, regardless of</span>
+<span class="cm">		   io alignment */</span>
+		<span class="n">page_align</span> <span class="o">=</span> <span class="p">(</span><span class="n">pos</span> <span class="o">-</span> <span class="n">io_align</span> <span class="o">+</span> <span class="n">buf_align</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+		<span class="n">num_pages</span> <span class="o">=</span> <span class="n">calc_pages_for</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">data</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">page_align</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+		<span class="n">num_pages</span> <span class="o">=</span> <span class="n">calc_pages_for</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">req</span> <span class="o">=</span> <span class="n">ceph_osdc_new_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span>
+				    <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">len</span><span class="p">,</span>
+				    <span class="n">CEPH_OSD_OP_WRITE</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span>
+				    <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_snap_realm</span><span class="o">-&gt;</span><span class="n">cached_context</span><span class="p">,</span>
+				    <span class="n">do_sync</span><span class="p">,</span>
+				    <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+				    <span class="o">&amp;</span><span class="n">mtime</span><span class="p">,</span> <span class="nb">false</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">page_align</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pages</span> <span class="o">=</span> <span class="n">ceph_get_direct_page_vector</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * throw out any page cache pages in this range. this</span>
+<span class="cm">		 * may block.</span>
+<span class="cm">		 */</span>
+		<span class="n">truncate_inode_pages_range</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span>
+					   <span class="p">(</span><span class="n">pos</span><span class="o">+</span><span class="n">len</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">PAGE_CACHE_SIZE</span><span class="o">-</span><span class="mi">1</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">pages</span> <span class="o">=</span> <span class="n">ceph_alloc_page_vector</span><span class="p">(</span><span class="n">num_pages</span><span class="p">,</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_copy_user_to_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ceph_release_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_SYNC</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* get a second commit callback */</span>
+			<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_safe_callback</span> <span class="o">=</span> <span class="n">sync_write_commit</span><span class="p">;</span>
+			<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_own_pages</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span> <span class="o">=</span> <span class="n">pages</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span> <span class="o">=</span> <span class="n">num_pages</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_osdc_start_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_safe_callback</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Add to inode unsafe list only after we</span>
+<span class="cm">			 * start_request so that a tid has been assigned.</span>
+<span class="cm">			 */</span>
+			<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_unsafe_item</span><span class="p">,</span>
+				      <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_writes</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+			<span class="n">ceph_get_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">);</span>
+		<span class="p">}</span>
+		
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_osdc_wait_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_safe_callback</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+			<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_unsafe_item</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_unsafe_lock</span><span class="p">);</span>
+			<span class="n">ceph_put_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span>
+		<span class="n">ceph_put_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_SYNC</span><span class="p">)</span>
+		<span class="n">ceph_release_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">ceph_osdc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pos</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">written</span> <span class="o">+=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">left</span> <span class="o">-=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">data</span> <span class="o">+=</span> <span class="n">written</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">left</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">more</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">written</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">offset</span> <span class="o">=</span> <span class="n">pos</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pos</span> <span class="o">&gt;</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">))</span>
+			<span class="n">check_caps</span> <span class="o">=</span> <span class="n">ceph_inode_set_size</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">pos</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">check_caps</span><span class="p">)</span>
+			<span class="n">ceph_check_caps</span><span class="p">(</span><span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">CHECK_CAPS_AUTHONLY</span><span class="p">,</span>
+					<span class="nb">NULL</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wrap generic_file_aio_read with checks for cap bits on the inode.</span>
+<span class="cm"> * Atomically grab references, so that those bits are not released</span>
+<span class="cm"> * back to the MDS mid-read.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Hmm, the sync read case isn&#39;t actually async... should it be?</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">ceph_aio_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">kiocb</span> <span class="o">*</span><span class="n">iocb</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">iovec</span> <span class="o">*</span><span class="n">iov</span><span class="p">,</span>
+			     <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_segs</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">pos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span> <span class="o">=</span> <span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_filp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_file_info</span> <span class="o">*</span><span class="n">fi</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="o">*</span><span class="n">ppos</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_pos</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">len</span> <span class="o">=</span> <span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">base</span> <span class="o">=</span> <span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_base</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">want</span><span class="p">,</span> <span class="n">got</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">checkeof</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_read %p %llx.%llx %llu~%u trying to get caps on %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">len</span><span class="p">,</span> <span class="n">inode</span><span class="p">);</span>
+<span class="nl">again:</span>
+	<span class="n">__ceph_do_pending_vmtruncate</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fi</span><span class="o">-&gt;</span><span class="n">fmode</span> <span class="o">&amp;</span> <span class="n">CEPH_FILE_MODE_LAZY</span><span class="p">)</span>
+		<span class="n">want</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_CACHE</span> <span class="o">|</span> <span class="n">CEPH_CAP_FILE_LAZYIO</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">want</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_CACHE</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_get_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_RD</span><span class="p">,</span> <span class="n">want</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">got</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_read %p %llx.%llx %llu~%u got cap refs on %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">len</span><span class="p">,</span>
+	     <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">got</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">got</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">CEPH_CAP_FILE_CACHE</span><span class="o">|</span><span class="n">CEPH_CAP_FILE_LAZYIO</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_filp</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_flags</span> <span class="o">&amp;</span> <span class="n">MS_SYNCHRONOUS</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">fi</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">CEPH_F_SYNC</span><span class="p">))</span>
+		<span class="cm">/* hmm, this isn&#39;t really async... */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_sync_read</span><span class="p">(</span><span class="n">filp</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">ppos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">checkeof</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">generic_file_aio_read</span><span class="p">(</span><span class="n">iocb</span><span class="p">,</span> <span class="n">iov</span><span class="p">,</span> <span class="n">nr_segs</span><span class="p">,</span> <span class="n">pos</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_read %p %llx.%llx dropping cap refs on %s = %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">got</span><span class="p">),</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">ret</span><span class="p">);</span>
+	<span class="n">ceph_put_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">got</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">checkeof</span> <span class="o">&amp;&amp;</span> <span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">statret</span> <span class="o">=</span> <span class="n">ceph_do_getattr</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">CEPH_STAT_CAP_SIZE</span><span class="p">);</span>
+
+		<span class="cm">/* hit EOF or hole? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">statret</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="o">*</span><span class="n">ppos</span> <span class="o">&lt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_read sync_read hit hole, ppos %lld &lt; size %lld, reading more</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">*</span><span class="n">ppos</span><span class="p">,</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">);</span>
+			<span class="n">read</span> <span class="o">+=</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="n">base</span> <span class="o">+=</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="n">len</span> <span class="o">-=</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="n">checkeof</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">+=</span> <span class="n">read</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Take cap references to avoid releasing caps to MDS mid-write.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we are synchronous, and write with an old snap context, the OSD</span>
+<span class="cm"> * may return EOLDSNAPC.  In that case, retry the write.. _after_</span>
+<span class="cm"> * dropping our cap refs and allowing the pending snap to logically</span>
+<span class="cm"> * complete _before_ this write occurs.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we are near ENOSPC, write synchronously.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">ceph_aio_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">kiocb</span> <span class="o">*</span><span class="n">iocb</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">iovec</span> <span class="o">*</span><span class="n">iov</span><span class="p">,</span>
+		       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_segs</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">pos</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span> <span class="o">=</span> <span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_filp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_file_info</span> <span class="o">*</span><span class="n">fi</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_client</span> <span class="o">*</span><span class="n">osdc</span> <span class="o">=</span>
+		<span class="o">&amp;</span><span class="n">ceph_sb_to_client</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">endoff</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">+</span> <span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">want</span><span class="p">,</span> <span class="n">got</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">,</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_snap</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CEPH_NOSNAP</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EROFS</span><span class="p">;</span>
+
+<span class="nl">retry_snap:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_osdmap_flag</span><span class="p">(</span><span class="n">osdc</span><span class="o">-&gt;</span><span class="n">osdmap</span><span class="p">,</span> <span class="n">CEPH_OSDMAP_FULL</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOSPC</span><span class="p">;</span>
+	<span class="n">__ceph_do_pending_vmtruncate</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_write %p %llx.%llx %llu~%u getting caps. i_size %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fi</span><span class="o">-&gt;</span><span class="n">fmode</span> <span class="o">&amp;</span> <span class="n">CEPH_FILE_MODE_LAZY</span><span class="p">)</span>
+		<span class="n">want</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_BUFFER</span> <span class="o">|</span> <span class="n">CEPH_CAP_FILE_LAZYIO</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">want</span> <span class="o">=</span> <span class="n">CEPH_CAP_FILE_BUFFER</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_get_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">,</span> <span class="n">want</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">got</span><span class="p">,</span> <span class="n">endoff</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_put</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_write %p %llx.%llx %llu~%u  got cap refs on %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">,</span>
+	     <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">got</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">got</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">CEPH_CAP_FILE_BUFFER</span><span class="o">|</span><span class="n">CEPH_CAP_FILE_LAZYIO</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_filp</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_DIRECT</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_flags</span> <span class="o">&amp;</span> <span class="n">MS_SYNCHRONOUS</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">fi</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">CEPH_F_SYNC</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_sync_write</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_base</span><span class="p">,</span> <span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">,</span>
+			<span class="o">&amp;</span><span class="n">iocb</span><span class="o">-&gt;</span><span class="n">ki_pos</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * buffered write; drop Fw early to avoid slow</span>
+<span class="cm">		 * revocation if we get stuck on balance_dirty_pages</span>
+<span class="cm">		 */</span>
+		<span class="kt">int</span> <span class="n">dirty</span><span class="p">;</span>
+
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="n">dirty</span> <span class="o">=</span> <span class="n">__ceph_mark_dirty_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="n">ceph_put_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">got</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">generic_file_aio_write</span><span class="p">(</span><span class="n">iocb</span><span class="p">,</span> <span class="n">iov</span><span class="p">,</span> <span class="n">nr_segs</span><span class="p">,</span> <span class="n">pos</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EIOCBQUEUED</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="p">((</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_flags</span> <span class="o">&amp;</span> <span class="n">O_SYNC</span><span class="p">)</span> <span class="o">||</span> <span class="n">IS_SYNC</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">)</span>
+		     <span class="o">||</span> <span class="n">ceph_osdmap_flag</span><span class="p">(</span><span class="n">osdc</span><span class="o">-&gt;</span><span class="n">osdmap</span><span class="p">,</span> <span class="n">CEPH_OSDMAP_NEARFULL</span><span class="p">)))</span> <span class="p">{</span>
+			<span class="n">err</span> <span class="o">=</span> <span class="n">vfs_fsync_range</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">pos</span> <span class="o">+</span> <span class="n">ret</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="n">err</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">dirty</span><span class="p">)</span>
+			<span class="n">__mark_inode_dirty</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">dirty</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">dirty</span><span class="p">;</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="n">dirty</span> <span class="o">=</span> <span class="n">__ceph_mark_dirty_caps</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_WR</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dirty</span><span class="p">)</span>
+			<span class="n">__mark_inode_dirty</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">dirty</span><span class="p">);</span>
+	<span class="p">}</span>
+
+<span class="nl">out_put:</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_write %p %llx.%llx %llu~%u  dropping cap refs on %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">,</span>
+	     <span class="n">ceph_cap_string</span><span class="p">(</span><span class="n">got</span><span class="p">));</span>
+	<span class="n">ceph_put_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">got</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EOLDSNAPC</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;aio_write %p %llx.%llx %llu~%u got EOLDSNAPC, retrying</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">ceph_vinop</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">iov</span><span class="o">-&gt;</span><span class="n">iov_len</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">retry_snap</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * llseek.  be sure to verify file size on SEEK_END.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">loff_t</span> <span class="nf">ceph_llseek</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">int</span> <span class="n">origin</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mutex</span><span class="p">);</span>
+	<span class="n">__ceph_do_pending_vmtruncate</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">origin</span> <span class="o">==</span> <span class="n">SEEK_END</span> <span class="o">||</span> <span class="n">origin</span> <span class="o">==</span> <span class="n">SEEK_DATA</span> <span class="o">||</span> <span class="n">origin</span> <span class="o">==</span> <span class="n">SEEK_HOLE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_do_getattr</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">CEPH_STAT_CAP_SIZE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">offset</span> <span class="o">=</span> <span class="n">ret</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">origin</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">SEEK_END</span>:
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">SEEK_CUR</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * Here we special-case the lseek(fd, 0, SEEK_CUR)</span>
+<span class="cm">		 * position-querying operation.  Avoid rewriting the &quot;same&quot;</span>
+<span class="cm">		 * f_pos value back to the file because a concurrent read(),</span>
+<span class="cm">		 * write() or lseek() might have altered it</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">offset</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_pos</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_pos</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">SEEK_DATA</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">SEEK_HOLE</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">;</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">offset</span> <span class="o">&gt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_maxbytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Special lock needed here? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">!=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_pos</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_pos</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+		<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_version</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">ceph_file_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span> <span class="n">ceph_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span> <span class="o">=</span> <span class="n">ceph_release</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">llseek</span> <span class="o">=</span> <span class="n">ceph_llseek</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span> <span class="o">=</span> <span class="n">do_sync_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write</span> <span class="o">=</span> <span class="n">do_sync_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">aio_read</span> <span class="o">=</span> <span class="n">ceph_aio_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">aio_write</span> <span class="o">=</span> <span class="n">ceph_aio_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mmap</span> <span class="o">=</span> <span class="n">ceph_mmap</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">fsync</span> <span class="o">=</span> <span class="n">ceph_fsync</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">lock</span> <span class="o">=</span> <span class="n">ceph_lock</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">flock</span> <span class="o">=</span> <span class="n">ceph_flock</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">splice_read</span> <span class="o">=</span> <span class="n">generic_file_splice_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">splice_write</span> <span class="o">=</span> <span class="n">generic_file_splice_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span> <span class="o">=</span> <span class="n">ceph_ioctl</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">compat_ioctl</span>	<span class="o">=</span> <span class="n">ceph_ioctl</span><span class="p">,</span>
+<span class="p">};</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

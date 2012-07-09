@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › mac80211 › rc80211_pid_algo.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>rc80211_pid_algo.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright 2002-2005, Instant802 Networks, Inc.</span>
+<span class="cm"> * Copyright 2005, Devicescape Software, Inc.</span>
+<span class="cm"> * Copyright 2007, Mattias Nissler &lt;mattias.nissler@gmx.de&gt;</span>
+<span class="cm"> * Copyright 2007-2008, Stefano Brivio &lt;stefano.brivio@polimi.it&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License version 2 as</span>
+<span class="cm"> * published by the Free Software Foundation.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;linux/debugfs.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;net/mac80211.h&gt;</span>
+<span class="cp">#include &quot;rate.h&quot;</span>
+<span class="cp">#include &quot;mesh.h&quot;</span>
+<span class="cp">#include &quot;rc80211_pid.h&quot;</span>
+
+
+<span class="cm">/* This is an implementation of a TX rate control algorithm that uses a PID</span>
+<span class="cm"> * controller. Given a target failed frames rate, the controller decides about</span>
+<span class="cm"> * TX rate changes to meet the target failed frames rate.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The controller basically computes the following:</span>
+<span class="cm"> *</span>
+<span class="cm"> * adj = CP * err + CI * err_avg + CD * (err - last_err) * (1 + sharpening)</span>
+<span class="cm"> *</span>
+<span class="cm"> * where</span>
+<span class="cm"> * 	adj	adjustment value that is used to switch TX rate (see below)</span>
+<span class="cm"> * 	err	current error: target vs. current failed frames percentage</span>
+<span class="cm"> * 	last_err	last error</span>
+<span class="cm"> * 	err_avg	average (i.e. poor man&#39;s integral) of recent errors</span>
+<span class="cm"> *	sharpening	non-zero when fast response is needed (i.e. right after</span>
+<span class="cm"> *			association or no frames sent for a long time), heading</span>
+<span class="cm"> * 			to zero over time</span>
+<span class="cm"> * 	CP	Proportional coefficient</span>
+<span class="cm"> * 	CI	Integral coefficient</span>
+<span class="cm"> * 	CD	Derivative coefficient</span>
+<span class="cm"> *</span>
+<span class="cm"> * CP, CI, CD are subject to careful tuning.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The integral component uses a exponential moving average approach instead of</span>
+<span class="cm"> * an actual sliding window. The advantage is that we don&#39;t need to keep an</span>
+<span class="cm"> * array of the last N error values and computation is easier.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Once we have the adj value, we map it to a rate by means of a learning</span>
+<span class="cm"> * algorithm. This algorithm keeps the state of the percentual failed frames</span>
+<span class="cm"> * difference between rates. The behaviour of the lowest available rate is kept</span>
+<span class="cm"> * as a reference value, and every time we switch between two rates, we compute</span>
+<span class="cm"> * the difference between the failed frames each rate exhibited. By doing so,</span>
+<span class="cm"> * we compare behaviours which different rates exhibited in adjacent timeslices,</span>
+<span class="cm"> * thus the comparison is minimally affected by external conditions. This</span>
+<span class="cm"> * difference gets propagated to the whole set of measurements, so that the</span>
+<span class="cm"> * reference is always the same. Periodically, we normalize this set so that</span>
+<span class="cm"> * recent events weigh the most. By comparing the adj value with this set, we</span>
+<span class="cm"> * avoid pejorative switches to lower rates and allow for switches to higher</span>
+<span class="cm"> * rates if they behaved well.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that for the computations we use a fixed-point representation to avoid</span>
+<span class="cm"> * floating point arithmetic. Hence, all values are shifted left by</span>
+<span class="cm"> * RC_PID_ARITH_SHIFT.</span>
+<span class="cm"> */</span>
+
+
+<span class="cm">/* Adjust the rate while ensuring that we won&#39;t switch to a lower rate if it</span>
+<span class="cm"> * exhibited a worse failed frames behaviour and we&#39;ll choose the highest rate</span>
+<span class="cm"> * whose failed frames behaviour is not worse than the one of the original rate</span>
+<span class="cm"> * target. While at it, check that the new rate is valid. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_adjust_rate</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span><span class="p">,</span> <span class="kt">int</span> <span class="n">adj</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">rc_pid_rateinfo</span> <span class="o">*</span><span class="n">rinfo</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cur_sorted</span><span class="p">,</span> <span class="n">new_sorted</span><span class="p">,</span> <span class="n">probe</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="n">n_bitrates</span><span class="p">,</span> <span class="n">band</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cur</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">;</span>
+
+	<span class="n">band</span> <span class="o">=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">band</span><span class="p">;</span>
+	<span class="n">n_bitrates</span> <span class="o">=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">;</span>
+
+	<span class="cm">/* Map passed arguments to sorted values. */</span>
+	<span class="n">cur_sorted</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">cur</span><span class="p">].</span><span class="n">rev_index</span><span class="p">;</span>
+	<span class="n">new_sorted</span> <span class="o">=</span> <span class="n">cur_sorted</span> <span class="o">+</span> <span class="n">adj</span><span class="p">;</span>
+
+	<span class="cm">/* Check limits. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">new_sorted</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">new_sorted</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">rev_index</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">new_sorted</span> <span class="o">&gt;=</span> <span class="n">n_bitrates</span><span class="p">)</span>
+		<span class="n">new_sorted</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">n_bitrates</span> <span class="o">-</span> <span class="mi">1</span><span class="p">].</span><span class="n">rev_index</span><span class="p">;</span>
+
+	<span class="n">tmp</span> <span class="o">=</span> <span class="n">new_sorted</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">adj</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Ensure that the rate decrease isn&#39;t disadvantageous. */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">probe</span> <span class="o">=</span> <span class="n">cur_sorted</span><span class="p">;</span> <span class="n">probe</span> <span class="o">&gt;=</span> <span class="n">new_sorted</span><span class="p">;</span> <span class="n">probe</span><span class="o">--</span><span class="p">)</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rinfo</span><span class="p">[</span><span class="n">probe</span><span class="p">].</span><span class="n">diff</span> <span class="o">&lt;=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">cur_sorted</span><span class="p">].</span><span class="n">diff</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">rate_supported</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">band</span><span class="p">,</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">probe</span><span class="p">].</span><span class="n">index</span><span class="p">))</span>
+				<span class="n">tmp</span> <span class="o">=</span> <span class="n">probe</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Look for rate increase with zero (or below) cost. */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">probe</span> <span class="o">=</span> <span class="n">new_sorted</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="n">probe</span> <span class="o">&lt;</span> <span class="n">n_bitrates</span><span class="p">;</span> <span class="n">probe</span><span class="o">++</span><span class="p">)</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rinfo</span><span class="p">[</span><span class="n">probe</span><span class="p">].</span><span class="n">diff</span> <span class="o">&lt;=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">new_sorted</span><span class="p">].</span><span class="n">diff</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">rate_supported</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">band</span><span class="p">,</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">probe</span><span class="p">].</span><span class="n">index</span><span class="p">))</span>
+				<span class="n">tmp</span> <span class="o">=</span> <span class="n">probe</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Fit the rate found to the nearest supported rate. */</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rate_supported</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">band</span><span class="p">,</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">tmp</span><span class="p">].</span><span class="n">index</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">tmp</span><span class="p">].</span><span class="n">index</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">adj</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">tmp</span><span class="o">--</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">tmp</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">tmp</span> <span class="o">&lt;</span> <span class="n">n_bitrates</span> <span class="o">&amp;&amp;</span> <span class="n">tmp</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">rate_control_pid_event_rate_change</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">,</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">,</span>
+		<span class="n">sband</span><span class="o">-&gt;</span><span class="n">bitrates</span><span class="p">[</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">].</span><span class="n">bitrate</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="cm">/* Normalize the failed frames per-rate differences. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_normalize</span><span class="p">(</span><span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span><span class="p">,</span> <span class="kt">int</span> <span class="n">l</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">norm_offset</span> <span class="o">=</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">norm_offset</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rc_pid_rateinfo</span> <span class="o">*</span><span class="n">r</span> <span class="o">=</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">rinfo</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">diff</span> <span class="o">&gt;</span> <span class="n">norm_offset</span><span class="p">)</span>
+		<span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">diff</span> <span class="o">-=</span> <span class="n">norm_offset</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">diff</span> <span class="o">&lt;</span> <span class="o">-</span><span class="n">norm_offset</span><span class="p">)</span>
+		<span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">diff</span> <span class="o">+=</span> <span class="n">norm_offset</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">l</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">diff</span> <span class="o">&gt;</span> <span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">diff</span> <span class="o">+</span> <span class="n">norm_offset</span><span class="p">)</span>
+			<span class="n">r</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">diff</span> <span class="o">-=</span> <span class="n">norm_offset</span><span class="p">;</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">diff</span> <span class="o">&lt;=</span> <span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">diff</span><span class="p">)</span>
+			<span class="n">r</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">diff</span> <span class="o">+=</span> <span class="n">norm_offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_sample</span><span class="p">(</span><span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_rateinfo</span> <span class="o">*</span><span class="n">rinfo</span> <span class="o">=</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">rinfo</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">pf</span><span class="p">;</span>
+	<span class="n">s32</span> <span class="n">err_avg</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">err_prop</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">err_int</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">err_der</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">adj</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">period</span><span class="p">;</span>
+
+	<span class="cm">/* In case nothing happened during the previous control interval, turn</span>
+<span class="cm">	 * the sharpening factor on. */</span>
+	<span class="n">period</span> <span class="o">=</span> <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sampling_period</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">jiffies</span> <span class="o">-</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_sample</span> <span class="o">&gt;</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">period</span><span class="p">)</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">sharp_cnt</span> <span class="o">=</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_duration</span><span class="p">;</span>
+
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_sample</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+
+	<span class="cm">/* This should never happen, but in case, we assume the old sample is</span>
+<span class="cm">	 * still a good measurement and copy it. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span> <span class="o">==</span> <span class="mi">0</span><span class="p">))</span>
+		<span class="n">pf</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_pf</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">pf</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_failed</span> <span class="o">*</span> <span class="mi">100</span> <span class="o">/</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span><span class="p">;</span>
+
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_failed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* If we just switched rate, update the rate behaviour info. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">oldrate</span> <span class="o">!=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">)</span> <span class="p">{</span>
+
+		<span class="n">i</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">oldrate</span><span class="p">].</span><span class="n">rev_index</span><span class="p">;</span>
+		<span class="n">j</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">].</span><span class="n">rev_index</span><span class="p">;</span>
+
+		<span class="n">tmp</span> <span class="o">=</span> <span class="p">(</span><span class="n">pf</span> <span class="o">-</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_pf</span><span class="p">);</span>
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">RC_PID_DO_ARITH_RIGHT_SHIFT</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">RC_PID_ARITH_SHIFT</span><span class="p">);</span>
+
+		<span class="n">rinfo</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">diff</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">diff</span> <span class="o">+</span> <span class="n">tmp</span><span class="p">;</span>
+		<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">oldrate</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">rate_control_pid_normalize</span><span class="p">(</span><span class="n">pinfo</span><span class="p">,</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">);</span>
+
+	<span class="cm">/* Compute the proportional, integral and derivative errors. */</span>
+	<span class="n">err_prop</span> <span class="o">=</span> <span class="p">(</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">-</span> <span class="n">pf</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">RC_PID_ARITH_SHIFT</span><span class="p">;</span>
+
+	<span class="n">err_avg</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">err_avg_sc</span> <span class="o">&gt;&gt;</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span><span class="p">;</span>
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">err_avg_sc</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">err_avg_sc</span> <span class="o">-</span> <span class="n">err_avg</span> <span class="o">+</span> <span class="n">err_prop</span><span class="p">;</span>
+	<span class="n">err_int</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">err_avg_sc</span> <span class="o">&gt;&gt;</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span><span class="p">;</span>
+
+	<span class="n">err_der</span> <span class="o">=</span> <span class="p">(</span><span class="n">pf</span> <span class="o">-</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_pf</span><span class="p">)</span> <span class="o">*</span>
+		  <span class="p">(</span><span class="mi">1</span> <span class="o">+</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_factor</span> <span class="o">*</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">sharp_cnt</span><span class="p">);</span>
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_pf</span> <span class="o">=</span> <span class="n">pf</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">sharp_cnt</span><span class="p">)</span>
+			<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">sharp_cnt</span><span class="o">--</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">rate_control_pid_event_pf_sample</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">,</span> <span class="n">pf</span><span class="p">,</span> <span class="n">err_prop</span><span class="p">,</span> <span class="n">err_int</span><span class="p">,</span>
+					 <span class="n">err_der</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* Compute the controller output. */</span>
+	<span class="n">adj</span> <span class="o">=</span> <span class="p">(</span><span class="n">err_prop</span> <span class="o">*</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_p</span> <span class="o">+</span> <span class="n">err_int</span> <span class="o">*</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_i</span>
+	      <span class="o">+</span> <span class="n">err_der</span> <span class="o">*</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_d</span><span class="p">);</span>
+	<span class="n">adj</span> <span class="o">=</span> <span class="n">RC_PID_DO_ARITH_RIGHT_SHIFT</span><span class="p">(</span><span class="n">adj</span><span class="p">,</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">RC_PID_ARITH_SHIFT</span><span class="p">);</span>
+
+	<span class="cm">/* Change rate. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">adj</span><span class="p">)</span>
+		<span class="n">rate_control_pid_adjust_rate</span><span class="p">(</span><span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="n">spinfo</span><span class="p">,</span> <span class="n">adj</span><span class="p">,</span> <span class="n">rinfo</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_tx_status</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">period</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">IEEE80211_SKB_CB</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">spinfo</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* Ignore all frames that were sent with a different rate than the rate</span>
+<span class="cm">	 * we currently advise mac80211 to use. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">rates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">idx</span> <span class="o">!=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span><span class="o">++</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">rate_control_pid_event_tx_status</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">,</span> <span class="n">info</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* We count frames that totally failed to be transmitted as two bad</span>
+<span class="cm">	 * frames, those that made it out but had some retries as one good and</span>
+<span class="cm">	 * one bad frame. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IEEE80211_TX_STAT_ACK</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_failed</span> <span class="o">+=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">info</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">.</span><span class="n">rates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">count</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_failed</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">tx_num_xmit</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Update PID controller state. */</span>
+	<span class="n">period</span> <span class="o">=</span> <span class="n">msecs_to_jiffies</span><span class="p">(</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sampling_period</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_sample</span> <span class="o">+</span> <span class="n">period</span><span class="p">))</span>
+		<span class="n">rate_control_pid_sample</span><span class="p">(</span><span class="n">pinfo</span><span class="p">,</span> <span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">,</span> <span class="n">spinfo</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">rate_control_pid_get_rate</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span>
+			  <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">ieee80211_tx_rate_control</span> <span class="o">*</span><span class="n">txrc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">txrc</span><span class="o">-&gt;</span><span class="n">skb</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span> <span class="o">=</span> <span class="n">txrc</span><span class="o">-&gt;</span><span class="n">sband</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_tx_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span> <span class="n">IEEE80211_SKB_CB</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rateidx</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">txrc</span><span class="o">-&gt;</span><span class="n">rts</span><span class="p">)</span>
+		<span class="n">info</span><span class="o">-&gt;</span><span class="n">control</span><span class="p">.</span><span class="n">rates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">count</span> <span class="o">=</span>
+			<span class="n">txrc</span><span class="o">-&gt;</span><span class="n">hw</span><span class="o">-&gt;</span><span class="n">conf</span><span class="p">.</span><span class="n">long_frame_max_tx_count</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">info</span><span class="o">-&gt;</span><span class="n">control</span><span class="p">.</span><span class="n">rates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">count</span> <span class="o">=</span>
+			<span class="n">txrc</span><span class="o">-&gt;</span><span class="n">hw</span><span class="o">-&gt;</span><span class="n">conf</span><span class="p">.</span><span class="n">short_frame_max_tx_count</span><span class="p">;</span>
+
+	<span class="cm">/* Send management frames and NO_ACK data using lowest rate. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rate_control_send_low</span><span class="p">(</span><span class="n">sta</span><span class="p">,</span> <span class="n">priv_sta</span><span class="p">,</span> <span class="n">txrc</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">rateidx</span> <span class="o">=</span> <span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rateidx</span> <span class="o">&gt;=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">)</span>
+		<span class="n">rateidx</span> <span class="o">=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">control</span><span class="p">.</span><span class="n">rates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">idx</span> <span class="o">=</span> <span class="n">rateidx</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">rate_control_pid_event_tx_rate</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">,</span>
+		<span class="n">rateidx</span><span class="p">,</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">bitrates</span><span class="p">[</span><span class="n">rateidx</span><span class="p">].</span><span class="n">bitrate</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">rate_control_pid_rate_init</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span> <span class="o">=</span> <span class="n">priv_sta</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rc_pid_rateinfo</span> <span class="o">*</span><span class="n">rinfo</span> <span class="o">=</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">rinfo</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">s</span><span class="p">;</span>
+
+	<span class="cm">/* TODO: This routine should consider using RSSI from previous packets</span>
+<span class="cm">	 * as we need to have IEEE 802.1X auth succeed immediately after assoc..</span>
+<span class="cm">	 * Until that method is implemented, we will use the lowest supported</span>
+<span class="cm">	 * rate as a workaround. */</span>
+
+	<span class="cm">/* Sort the rates. This is optimized for the most common case (i.e.</span>
+<span class="cm">	 * almost-sorted CCK+OFDM rates). Kind of bubble-sort with reversed</span>
+<span class="cm">	 * mapping too. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rinfo</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+		<span class="n">rinfo</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">rev_index</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">RC_PID_FAST_START</span><span class="p">)</span>
+			<span class="n">rinfo</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">diff</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">rinfo</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">diff</span> <span class="o">=</span> <span class="n">i</span> <span class="o">*</span> <span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">norm_offset</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">s</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span> <span class="o">-</span> <span class="n">i</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">sband</span><span class="o">-&gt;</span><span class="n">bitrates</span><span class="p">[</span><span class="n">rinfo</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">index</span><span class="p">].</span><span class="n">bitrate</span> <span class="o">&gt;</span>
+				     <span class="n">sband</span><span class="o">-&gt;</span><span class="n">bitrates</span><span class="p">[</span><span class="n">rinfo</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">index</span><span class="p">].</span><span class="n">bitrate</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">tmp</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">index</span><span class="p">;</span>
+				<span class="n">rinfo</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">index</span><span class="p">;</span>
+				<span class="n">rinfo</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">index</span> <span class="o">=</span> <span class="n">tmp</span><span class="p">;</span>
+				<span class="n">rinfo</span><span class="p">[</span><span class="n">rinfo</span><span class="p">[</span><span class="n">j</span><span class="p">].</span><span class="n">index</span><span class="p">].</span><span class="n">rev_index</span> <span class="o">=</span> <span class="n">j</span><span class="p">;</span>
+				<span class="n">rinfo</span><span class="p">[</span><span class="n">rinfo</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">].</span><span class="n">index</span><span class="p">].</span><span class="n">rev_index</span> <span class="o">=</span> <span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">s</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">txrate_idx</span> <span class="o">=</span> <span class="n">rate_lowest_index</span><span class="p">(</span><span class="n">sband</span><span class="p">,</span> <span class="n">sta</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">rate_control_pid_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">ieee80211_hw</span> <span class="o">*</span><span class="n">hw</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">debugfsdir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rc_pid_rateinfo</span> <span class="o">*</span><span class="n">rinfo</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ieee80211_supported_band</span> <span class="o">*</span><span class="n">sband</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">max_rates</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="k">struct</span> <span class="n">rc_pid_debugfs_entries</span> <span class="o">*</span><span class="n">de</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="n">pinfo</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">pinfo</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pinfo</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">IEEE80211_NUM_BANDS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sband</span> <span class="o">=</span> <span class="n">hw</span><span class="o">-&gt;</span><span class="n">wiphy</span><span class="o">-&gt;</span><span class="n">bands</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sband</span> <span class="o">&amp;&amp;</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span> <span class="o">&gt;</span> <span class="n">max_rates</span><span class="p">)</span>
+			<span class="n">max_rates</span> <span class="o">=</span> <span class="n">sband</span><span class="o">-&gt;</span><span class="n">n_bitrates</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rinfo</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rinfo</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_rates</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rinfo</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">pinfo</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">=</span> <span class="n">RC_PID_TARGET_PF</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sampling_period</span> <span class="o">=</span> <span class="n">RC_PID_INTERVAL</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_p</span> <span class="o">=</span> <span class="n">RC_PID_COEFF_P</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_i</span> <span class="o">=</span> <span class="n">RC_PID_COEFF_I</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_d</span> <span class="o">=</span> <span class="n">RC_PID_COEFF_D</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span> <span class="o">=</span> <span class="n">RC_PID_SMOOTHING_SHIFT</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_factor</span> <span class="o">=</span> <span class="n">RC_PID_SHARPENING_FACTOR</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_duration</span> <span class="o">=</span> <span class="n">RC_PID_SHARPENING_DURATION</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">norm_offset</span> <span class="o">=</span> <span class="n">RC_PID_NORM_OFFSET</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">rinfo</span> <span class="o">=</span> <span class="n">rinfo</span><span class="p">;</span>
+	<span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">oldrate</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">de</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">dentries</span><span class="p">;</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;target_pf&quot;</span><span class="p">,</span> <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span>
+					<span class="n">debugfsdir</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">target</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">sampling_period</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;sampling_period&quot;</span><span class="p">,</span>
+						 <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">,</span>
+						 <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sampling_period</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_p</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;coeff_p&quot;</span><span class="p">,</span> <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span>
+					 <span class="n">debugfsdir</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_p</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_i</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;coeff_i&quot;</span><span class="p">,</span> <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span>
+					 <span class="n">debugfsdir</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_i</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_d</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;coeff_d&quot;</span><span class="p">,</span> <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span>
+					 <span class="n">debugfsdir</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">coeff_d</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;smoothing_shift&quot;</span><span class="p">,</span>
+						 <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">,</span>
+						 <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">sharpen_factor</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;sharpen_factor&quot;</span><span class="p">,</span>
+					       <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">,</span>
+					       <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_factor</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">sharpen_duration</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;sharpen_duration&quot;</span><span class="p">,</span>
+						  <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">,</span>
+						  <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">sharpen_duration</span><span class="p">);</span>
+	<span class="n">de</span><span class="o">-&gt;</span><span class="n">norm_offset</span> <span class="o">=</span> <span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;norm_offset&quot;</span><span class="p">,</span>
+					     <span class="n">S_IRUSR</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">,</span> <span class="n">debugfsdir</span><span class="p">,</span>
+					     <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">norm_offset</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">return</span> <span class="n">pinfo</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_info</span> <span class="o">*</span><span class="n">pinfo</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="k">struct</span> <span class="n">rc_pid_debugfs_entries</span> <span class="o">*</span><span class="n">de</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">dentries</span><span class="p">;</span>
+
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">norm_offset</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">sharpen_duration</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">sharpen_factor</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">smoothing_shift</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_d</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_i</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">coeff_p</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">sampling_period</span><span class="p">);</span>
+	<span class="n">debugfs_remove</span><span class="p">(</span><span class="n">de</span><span class="o">-&gt;</span><span class="n">target</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pinfo</span><span class="o">-&gt;</span><span class="n">rinfo</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pinfo</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">rate_control_pid_alloc_sta</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span>
+					<span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rc_pid_sta_info</span> <span class="o">*</span><span class="n">spinfo</span><span class="p">;</span>
+
+	<span class="n">spinfo</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">spinfo</span><span class="p">),</span> <span class="n">gfp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">spinfo</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">last_sample</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">.</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinfo</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">.</span><span class="n">waitqueue</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">return</span> <span class="n">spinfo</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">rate_control_pid_free_sta</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ieee80211_sta</span> <span class="o">*</span><span class="n">sta</span><span class="p">,</span>
+				      <span class="kt">void</span> <span class="o">*</span><span class="n">priv_sta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">priv_sta</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">rate_control_ops</span> <span class="n">mac80211_rcpid</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;pid&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">tx_status</span> <span class="o">=</span> <span class="n">rate_control_pid_tx_status</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">get_rate</span> <span class="o">=</span> <span class="n">rate_control_pid_get_rate</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rate_init</span> <span class="o">=</span> <span class="n">rate_control_pid_rate_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">alloc</span> <span class="o">=</span> <span class="n">rate_control_pid_alloc</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free</span> <span class="o">=</span> <span class="n">rate_control_pid_free</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">alloc_sta</span> <span class="o">=</span> <span class="n">rate_control_pid_alloc_sta</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free_sta</span> <span class="o">=</span> <span class="n">rate_control_pid_free_sta</span><span class="p">,</span>
+<span class="cp">#ifdef CONFIG_MAC80211_DEBUGFS</span>
+	<span class="p">.</span><span class="n">add_sta_debugfs</span> <span class="o">=</span> <span class="n">rate_control_pid_add_sta_debugfs</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">remove_sta_debugfs</span> <span class="o">=</span> <span class="n">rate_control_pid_remove_sta_debugfs</span><span class="p">,</span>
+<span class="cp">#endif</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="nf">rc80211_pid_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">ieee80211_rate_control_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mac80211_rcpid</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">rc80211_pid_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ieee80211_rate_control_unregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mac80211_rcpid</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › x86 › xen › time.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>time.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Xen time implementation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is implemented in terms of a clocksource driver which uses</span>
+<span class="cm"> * the hypervisor clock as a nanosecond timebase, and a clockevent</span>
+<span class="cm"> * driver which uses the hypervisor&#39;s timer mechanism.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Jeremy Fitzhardinge &lt;jeremy@xensource.com&gt;, XenSource Inc, 2007</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/clocksource.h&gt;</span>
+<span class="cp">#include &lt;linux/clockchips.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel_stat.h&gt;</span>
+<span class="cp">#include &lt;linux/math64.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+
+<span class="cp">#include &lt;asm/pvclock.h&gt;</span>
+<span class="cp">#include &lt;asm/xen/hypervisor.h&gt;</span>
+<span class="cp">#include &lt;asm/xen/hypercall.h&gt;</span>
+
+<span class="cp">#include &lt;xen/events.h&gt;</span>
+<span class="cp">#include &lt;xen/features.h&gt;</span>
+<span class="cp">#include &lt;xen/interface/xen.h&gt;</span>
+<span class="cp">#include &lt;xen/interface/vcpu.h&gt;</span>
+
+<span class="cp">#include &quot;xen-ops.h&quot;</span>
+
+<span class="cm">/* Xen may fire a timer up to this many ns early */</span>
+<span class="cp">#define TIMER_SLOP	100000</span>
+<span class="cp">#define NS_PER_TICK	(1000000000LL / HZ)</span>
+
+<span class="cm">/* runstate info updated by Xen */</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">vcpu_runstate_info</span><span class="p">,</span> <span class="n">xen_runstate</span><span class="p">);</span>
+
+<span class="cm">/* snapshots of runstate info */</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">vcpu_runstate_info</span><span class="p">,</span> <span class="n">xen_runstate_snapshot</span><span class="p">);</span>
+
+<span class="cm">/* unused ns of stolen and blocked time */</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="n">u64</span><span class="p">,</span> <span class="n">xen_residual_stolen</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="n">u64</span><span class="p">,</span> <span class="n">xen_residual_blocked</span><span class="p">);</span>
+
+<span class="cm">/* return an consistent snapshot of 64-bit time/counter value */</span>
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">get64</span><span class="p">(</span><span class="k">const</span> <span class="n">u64</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u64</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">BITS_PER_LONG</span> <span class="o">&lt;</span> <span class="mi">64</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">u32</span> <span class="o">*</span><span class="n">p32</span> <span class="o">=</span> <span class="p">(</span><span class="n">u32</span> <span class="o">*</span><span class="p">)</span><span class="n">p</span><span class="p">;</span>
+		<span class="n">u32</span> <span class="n">h</span><span class="p">,</span> <span class="n">l</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Read high then low, and then make sure high is</span>
+<span class="cm">		 * still the same; this will only loop if low wraps</span>
+<span class="cm">		 * and carries into high.</span>
+<span class="cm">		 * XXX some clean way to make this endian-proof?</span>
+<span class="cm">		 */</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="n">h</span> <span class="o">=</span> <span class="n">p32</span><span class="p">[</span><span class="mi">1</span><span class="p">];</span>
+			<span class="n">barrier</span><span class="p">();</span>
+			<span class="n">l</span> <span class="o">=</span> <span class="n">p32</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+			<span class="n">barrier</span><span class="p">();</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">p32</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">h</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="p">(((</span><span class="n">u64</span><span class="p">)</span><span class="n">h</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="mi">32</span><span class="p">)</span> <span class="o">|</span> <span class="n">l</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Runstate accounting</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">get_runstate_snapshot</span><span class="p">(</span><span class="k">struct</span> <span class="n">vcpu_runstate_info</span> <span class="o">*</span><span class="n">res</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u64</span> <span class="n">state_time</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vcpu_runstate_info</span> <span class="o">*</span><span class="n">state</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">preemptible</span><span class="p">());</span>
+
+	<span class="n">state</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">xen_runstate</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The runstate info is always updated by the hypervisor on</span>
+<span class="cm">	 * the current CPU, so there&#39;s no need to use anything</span>
+<span class="cm">	 * stronger than a compiler barrier when fetching it.</span>
+<span class="cm">	 */</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">state_time</span> <span class="o">=</span> <span class="n">get64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">state_entry_time</span><span class="p">);</span>
+		<span class="n">barrier</span><span class="p">();</span>
+		<span class="o">*</span><span class="n">res</span> <span class="o">=</span> <span class="o">*</span><span class="n">state</span><span class="p">;</span>
+		<span class="n">barrier</span><span class="p">();</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">get64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">state_entry_time</span><span class="p">)</span> <span class="o">!=</span> <span class="n">state_time</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* return true when a vcpu could run but has no real cpu to run on */</span>
+<span class="n">bool</span> <span class="nf">xen_vcpu_stolen</span><span class="p">(</span><span class="kt">int</span> <span class="n">vcpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">per_cpu</span><span class="p">(</span><span class="n">xen_runstate</span><span class="p">,</span> <span class="n">vcpu</span><span class="p">).</span><span class="n">state</span> <span class="o">==</span> <span class="n">RUNSTATE_runnable</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_setup_runstate_info</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vcpu_register_runstate_memory_area</span> <span class="n">area</span><span class="p">;</span>
+
+	<span class="n">area</span><span class="p">.</span><span class="n">addr</span><span class="p">.</span><span class="n">v</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">xen_runstate</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_register_runstate_memory_area</span><span class="p">,</span>
+			       <span class="n">cpu</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">area</span><span class="p">))</span>
+		<span class="n">BUG</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">do_stolen_accounting</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vcpu_runstate_info</span> <span class="n">state</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vcpu_runstate_info</span> <span class="o">*</span><span class="n">snap</span><span class="p">;</span>
+	<span class="n">s64</span> <span class="n">blocked</span><span class="p">,</span> <span class="n">runnable</span><span class="p">,</span> <span class="n">offline</span><span class="p">,</span> <span class="n">stolen</span><span class="p">;</span>
+	<span class="n">cputime_t</span> <span class="n">ticks</span><span class="p">;</span>
+
+	<span class="n">get_runstate_snapshot</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state</span><span class="p">);</span>
+
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">state</span><span class="p">.</span><span class="n">state</span> <span class="o">!=</span> <span class="n">RUNSTATE_running</span><span class="p">);</span>
+
+	<span class="n">snap</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">xen_runstate_snapshot</span><span class="p">);</span>
+
+	<span class="cm">/* work out how much time the VCPU has not been runn*ing*  */</span>
+	<span class="n">blocked</span> <span class="o">=</span> <span class="n">state</span><span class="p">.</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_blocked</span><span class="p">]</span> <span class="o">-</span> <span class="n">snap</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_blocked</span><span class="p">];</span>
+	<span class="n">runnable</span> <span class="o">=</span> <span class="n">state</span><span class="p">.</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_runnable</span><span class="p">]</span> <span class="o">-</span> <span class="n">snap</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_runnable</span><span class="p">];</span>
+	<span class="n">offline</span> <span class="o">=</span> <span class="n">state</span><span class="p">.</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_offline</span><span class="p">]</span> <span class="o">-</span> <span class="n">snap</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">[</span><span class="n">RUNSTATE_offline</span><span class="p">];</span>
+
+	<span class="o">*</span><span class="n">snap</span> <span class="o">=</span> <span class="n">state</span><span class="p">;</span>
+
+	<span class="cm">/* Add the appropriate number of ticks of stolen time,</span>
+<span class="cm">	   including any left-overs from last time. */</span>
+	<span class="n">stolen</span> <span class="o">=</span> <span class="n">runnable</span> <span class="o">+</span> <span class="n">offline</span> <span class="o">+</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">xen_residual_stolen</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">stolen</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">stolen</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">ticks</span> <span class="o">=</span> <span class="n">iter_div_u64_rem</span><span class="p">(</span><span class="n">stolen</span><span class="p">,</span> <span class="n">NS_PER_TICK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">stolen</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">xen_residual_stolen</span><span class="p">,</span> <span class="n">stolen</span><span class="p">);</span>
+	<span class="n">account_steal_ticks</span><span class="p">(</span><span class="n">ticks</span><span class="p">);</span>
+
+	<span class="cm">/* Add the appropriate number of ticks of blocked time,</span>
+<span class="cm">	   including any left-overs from last time. */</span>
+	<span class="n">blocked</span> <span class="o">+=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">xen_residual_blocked</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">blocked</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">blocked</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">ticks</span> <span class="o">=</span> <span class="n">iter_div_u64_rem</span><span class="p">(</span><span class="n">blocked</span><span class="p">,</span> <span class="n">NS_PER_TICK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">blocked</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">xen_residual_blocked</span><span class="p">,</span> <span class="n">blocked</span><span class="p">);</span>
+	<span class="n">account_idle_ticks</span><span class="p">(</span><span class="n">ticks</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Get the TSC speed from Xen */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">xen_tsc_khz</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pvclock_vcpu_time_info</span> <span class="o">*</span><span class="n">info</span> <span class="o">=</span>
+		<span class="o">&amp;</span><span class="n">HYPERVISOR_shared_info</span><span class="o">-&gt;</span><span class="n">vcpu_info</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">time</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">pvclock_tsc_khz</span><span class="p">(</span><span class="n">info</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">cycle_t</span> <span class="nf">xen_clocksource_read</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+        <span class="k">struct</span> <span class="n">pvclock_vcpu_time_info</span> <span class="o">*</span><span class="n">src</span><span class="p">;</span>
+	<span class="n">cycle_t</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">preempt_disable_notrace</span><span class="p">();</span>
+	<span class="n">src</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">xen_vcpu</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">pvclock_clocksource_read</span><span class="p">(</span><span class="n">src</span><span class="p">);</span>
+	<span class="n">preempt_enable_notrace</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">cycle_t</span> <span class="nf">xen_clocksource_get_cycles</span><span class="p">(</span><span class="k">struct</span> <span class="n">clocksource</span> <span class="o">*</span><span class="n">cs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">xen_clocksource_read</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_read_wallclock</span><span class="p">(</span><span class="k">struct</span> <span class="n">timespec</span> <span class="o">*</span><span class="n">ts</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">shared_info</span> <span class="o">*</span><span class="n">s</span> <span class="o">=</span> <span class="n">HYPERVISOR_shared_info</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pvclock_wall_clock</span> <span class="o">*</span><span class="n">wall_clock</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">wc</span><span class="p">);</span>
+        <span class="k">struct</span> <span class="n">pvclock_vcpu_time_info</span> <span class="o">*</span><span class="n">vcpu_time</span><span class="p">;</span>
+
+	<span class="n">vcpu_time</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">get_cpu_var</span><span class="p">(</span><span class="n">xen_vcpu</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">;</span>
+	<span class="n">pvclock_read_wallclock</span><span class="p">(</span><span class="n">wall_clock</span><span class="p">,</span> <span class="n">vcpu_time</span><span class="p">,</span> <span class="n">ts</span><span class="p">);</span>
+	<span class="n">put_cpu_var</span><span class="p">(</span><span class="n">xen_vcpu</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">xen_get_wallclock</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">timespec</span> <span class="n">ts</span><span class="p">;</span>
+
+	<span class="n">xen_read_wallclock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ts</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ts</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_set_wallclock</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">now</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_platform_op</span> <span class="n">op</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* do nothing for domU */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_initial_domain</span><span class="p">())</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">op</span><span class="p">.</span><span class="n">cmd</span> <span class="o">=</span> <span class="n">XENPF_settime</span><span class="p">;</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">u</span><span class="p">.</span><span class="n">settime</span><span class="p">.</span><span class="n">secs</span> <span class="o">=</span> <span class="n">now</span><span class="p">;</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">u</span><span class="p">.</span><span class="n">settime</span><span class="p">.</span><span class="n">nsecs</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">u</span><span class="p">.</span><span class="n">settime</span><span class="p">.</span><span class="n">system_time</span> <span class="o">=</span> <span class="n">xen_clocksource_read</span><span class="p">();</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">HYPERVISOR_dom0_op</span><span class="p">(</span><span class="o">&amp;</span><span class="n">op</span><span class="p">);</span>
+	<span class="n">WARN</span><span class="p">(</span><span class="n">rc</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">,</span> <span class="s">&quot;XENPF_settime failed: now=%ld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">now</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">clocksource</span> <span class="n">xen_clocksource</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;xen&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rating</span> <span class="o">=</span> <span class="mi">400</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span> <span class="o">=</span> <span class="n">xen_clocksource_get_cycles</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mask</span> <span class="o">=</span> <span class="o">~</span><span class="mi">0</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">CLOCK_SOURCE_IS_CONTINUOUS</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm">   Xen clockevent implementation</span>
+
+<span class="cm">   Xen has two clockevent implementations:</span>
+
+<span class="cm">   The old timer_op one works with all released versions of Xen prior</span>
+<span class="cm">   to version 3.0.4.  This version of the hypervisor provides a</span>
+<span class="cm">   single-shot timer with nanosecond resolution.  However, sharing the</span>
+<span class="cm">   same event channel is a 100Hz tick which is delivered while the</span>
+<span class="cm">   vcpu is running.  We don&#39;t care about or use this tick, but it will</span>
+<span class="cm">   cause the core time code to think the timer fired too soon, and</span>
+<span class="cm">   will end up resetting it each time.  It could be filtered, but</span>
+<span class="cm">   doing so has complications when the ktime clocksource is not yet</span>
+<span class="cm">   the xen clocksource (ie, at boot time).</span>
+
+<span class="cm">   The new vcpu_op-based timer interface allows the tick timer period</span>
+<span class="cm">   to be changed or turned off.  The tick timer is not useful as a</span>
+<span class="cm">   periodic timer because events are only delivered to running vcpus.</span>
+<span class="cm">   The one-shot timer can report when a timeout is in the past, so</span>
+<span class="cm">   set_next_event is capable of returning -ETIME when appropriate.</span>
+<span class="cm">   This interface is used when available.</span>
+<span class="cm">*/</span>
+
+
+<span class="cm">/*</span>
+<span class="cm">  Get a hypervisor absolute time.  In theory we could maintain an</span>
+<span class="cm">  offset between the kernel&#39;s time and the hypervisor&#39;s time, and</span>
+<span class="cm">  apply that to a kernel&#39;s absolute timeout.  Unfortunately the</span>
+<span class="cm">  hypervisor and kernel times can drift even if the kernel is using</span>
+<span class="cm">  the Xen clocksource, because ntp can warp the kernel&#39;s clocksource.</span>
+<span class="cm">*/</span>
+<span class="k">static</span> <span class="n">s64</span> <span class="nf">get_abs_timeout</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">delta</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">xen_clocksource_read</span><span class="p">()</span> <span class="o">+</span> <span class="n">delta</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_timerop_set_mode</span><span class="p">(</span><span class="k">enum</span> <span class="n">clock_event_mode</span> <span class="n">mode</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">mode</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_PERIODIC</span>:
+		<span class="cm">/* unsupported */</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_ONESHOT</span>:
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_RESUME</span>:
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_UNUSED</span>:
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_SHUTDOWN</span>:
+		<span class="n">HYPERVISOR_set_timer_op</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>  <span class="cm">/* cancel timeout */</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_timerop_set_next_event</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">delta</span><span class="p">,</span>
+				      <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">evt</span><span class="o">-&gt;</span><span class="n">mode</span> <span class="o">!=</span> <span class="n">CLOCK_EVT_MODE_ONESHOT</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_set_timer_op</span><span class="p">(</span><span class="n">get_abs_timeout</span><span class="p">(</span><span class="n">delta</span><span class="p">))</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">BUG</span><span class="p">();</span>
+
+	<span class="cm">/* We may have missed the deadline, but there&#39;s no real way of</span>
+<span class="cm">	   knowing for sure.  If the event was in the past, then we&#39;ll</span>
+<span class="cm">	   get an immediate interrupt. */</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="n">xen_timerop_clockevent</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;xen&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">features</span> <span class="o">=</span> <span class="n">CLOCK_EVT_FEAT_ONESHOT</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">max_delta_ns</span> <span class="o">=</span> <span class="mh">0xffffffff</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">min_delta_ns</span> <span class="o">=</span> <span class="n">TIMER_SLOP</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">mult</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">shift</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rating</span> <span class="o">=</span> <span class="mi">500</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">set_mode</span> <span class="o">=</span> <span class="n">xen_timerop_set_mode</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">set_next_event</span> <span class="o">=</span> <span class="n">xen_timerop_set_next_event</span><span class="p">,</span>
+<span class="p">};</span>
+
+
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_vcpuop_set_mode</span><span class="p">(</span><span class="k">enum</span> <span class="n">clock_event_mode</span> <span class="n">mode</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">mode</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_PERIODIC</span>:
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>	<span class="cm">/* unsupported */</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_ONESHOT</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_stop_periodic_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="n">BUG</span><span class="p">();</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_UNUSED</span>:
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_SHUTDOWN</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_stop_singleshot_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">||</span>
+		    <span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_stop_periodic_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="n">BUG</span><span class="p">();</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">CLOCK_EVT_MODE_RESUME</span>:
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_vcpuop_set_next_event</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">delta</span><span class="p">,</span>
+				     <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="k">struct</span> <span class="n">vcpu_set_singleshot_timer</span> <span class="n">single</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">evt</span><span class="o">-&gt;</span><span class="n">mode</span> <span class="o">!=</span> <span class="n">CLOCK_EVT_MODE_ONESHOT</span><span class="p">);</span>
+
+	<span class="n">single</span><span class="p">.</span><span class="n">timeout_abs_ns</span> <span class="o">=</span> <span class="n">get_abs_timeout</span><span class="p">(</span><span class="n">delta</span><span class="p">);</span>
+	<span class="n">single</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">VCPU_SSHOTTMR_future</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_set_singleshot_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">single</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">ret</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ETIME</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="n">xen_vcpuop_clockevent</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">&quot;xen&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">features</span> <span class="o">=</span> <span class="n">CLOCK_EVT_FEAT_ONESHOT</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">max_delta_ns</span> <span class="o">=</span> <span class="mh">0xffffffff</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">min_delta_ns</span> <span class="o">=</span> <span class="n">TIMER_SLOP</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">mult</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">shift</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rating</span> <span class="o">=</span> <span class="mi">500</span><span class="p">,</span>
+
+	<span class="p">.</span><span class="n">set_mode</span> <span class="o">=</span> <span class="n">xen_vcpuop_set_mode</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">set_next_event</span> <span class="o">=</span> <span class="n">xen_vcpuop_set_next_event</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">xen_clockevent</span> <span class="o">=</span>
+	<span class="o">&amp;</span><span class="n">xen_timerop_clockevent</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">clock_event_device</span><span class="p">,</span> <span class="n">xen_clock_events</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="n">irqreturn_t</span> <span class="nf">xen_timer_interrupt</span><span class="p">(</span><span class="kt">int</span> <span class="n">irq</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">dev_id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">xen_clock_events</span><span class="p">);</span>
+	<span class="n">irqreturn_t</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">IRQ_NONE</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">evt</span><span class="o">-&gt;</span><span class="n">event_handler</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">evt</span><span class="o">-&gt;</span><span class="n">event_handler</span><span class="p">(</span><span class="n">evt</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">IRQ_HANDLED</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">do_stolen_accounting</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_setup_timer</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">irq</span><span class="p">;</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;installing Xen timer for CPU %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+
+	<span class="n">name</span> <span class="o">=</span> <span class="n">kasprintf</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="s">&quot;timer%d&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">name</span><span class="p">)</span>
+		<span class="n">name</span> <span class="o">=</span> <span class="s">&quot;&lt;timer kasprintf failed&gt;&quot;</span><span class="p">;</span>
+
+	<span class="n">irq</span> <span class="o">=</span> <span class="n">bind_virq_to_irqhandler</span><span class="p">(</span><span class="n">VIRQ_TIMER</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">xen_timer_interrupt</span><span class="p">,</span>
+				      <span class="n">IRQF_DISABLED</span><span class="o">|</span><span class="n">IRQF_PERCPU</span><span class="o">|</span>
+				      <span class="n">IRQF_NOBALANCING</span><span class="o">|</span><span class="n">IRQF_TIMER</span><span class="o">|</span>
+				      <span class="n">IRQF_FORCE_RESUME</span><span class="p">,</span>
+				      <span class="n">name</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">evt</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">xen_clock_events</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">evt</span><span class="p">,</span> <span class="n">xen_clockevent</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">evt</span><span class="p">));</span>
+
+	<span class="n">evt</span><span class="o">-&gt;</span><span class="n">cpumask</span> <span class="o">=</span> <span class="n">cpumask_of</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="n">evt</span><span class="o">-&gt;</span><span class="n">irq</span> <span class="o">=</span> <span class="n">irq</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_teardown_timer</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">clock_event_device</span> <span class="o">*</span><span class="n">evt</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">cpu</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">evt</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">xen_clock_events</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="n">unbind_from_irqhandler</span><span class="p">(</span><span class="n">evt</span><span class="o">-&gt;</span><span class="n">irq</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_setup_cpu_clockevents</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">preemptible</span><span class="p">());</span>
+
+	<span class="n">clockevents_register_device</span><span class="p">(</span><span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">xen_clock_events</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_timer_resume</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">pvclock_resume</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">xen_clockevent</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">xen_vcpuop_clockevent</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">for_each_online_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_stop_periodic_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">pv_time_ops</span> <span class="n">xen_time_ops</span> <span class="n">__initconst</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">sched_clock</span> <span class="o">=</span> <span class="n">xen_clocksource_read</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__init</span> <span class="nf">xen_time_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="k">struct</span> <span class="n">timespec</span> <span class="n">tp</span><span class="p">;</span>
+
+	<span class="n">clocksource_register_hz</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xen_clocksource</span><span class="p">,</span> <span class="n">NSEC_PER_SEC</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">HYPERVISOR_vcpu_op</span><span class="p">(</span><span class="n">VCPUOP_stop_periodic_timer</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Successfully turned off 100Hz tick, so we have the</span>
+<span class="cm">		   vcpuop-based timer interface */</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_DEBUG</span> <span class="s">&quot;Xen: using vcpuop timer interface</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">xen_clockevent</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">xen_vcpuop_clockevent</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Set initial system time with full resolution */</span>
+	<span class="n">xen_read_wallclock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tp</span><span class="p">);</span>
+	<span class="n">do_settimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tp</span><span class="p">);</span>
+
+	<span class="n">setup_force_cpu_cap</span><span class="p">(</span><span class="n">X86_FEATURE_TSC</span><span class="p">);</span>
+
+	<span class="n">xen_setup_runstate_info</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="n">xen_setup_timer</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="n">xen_setup_cpu_clockevents</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">xen_init_time_ops</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pv_time_ops</span> <span class="o">=</span> <span class="n">xen_time_ops</span><span class="p">;</span>
+
+	<span class="n">x86_init</span><span class="p">.</span><span class="n">timers</span><span class="p">.</span><span class="n">timer_init</span> <span class="o">=</span> <span class="n">xen_time_init</span><span class="p">;</span>
+	<span class="n">x86_init</span><span class="p">.</span><span class="n">timers</span><span class="p">.</span><span class="n">setup_percpu_clockev</span> <span class="o">=</span> <span class="n">x86_init_noop</span><span class="p">;</span>
+	<span class="n">x86_cpuinit</span><span class="p">.</span><span class="n">setup_percpu_clockev</span> <span class="o">=</span> <span class="n">x86_init_noop</span><span class="p">;</span>
+
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">calibrate_tsc</span> <span class="o">=</span> <span class="n">xen_tsc_khz</span><span class="p">;</span>
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">get_wallclock</span> <span class="o">=</span> <span class="n">xen_get_wallclock</span><span class="p">;</span>
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">set_wallclock</span> <span class="o">=</span> <span class="n">xen_set_wallclock</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_XEN_PVHVM</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_hvm_setup_cpu_clockevents</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="n">xen_setup_runstate_info</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="n">xen_setup_timer</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="n">xen_setup_cpu_clockevents</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">xen_hvm_init_time_ops</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* vector callback is needed otherwise we cannot receive interrupts</span>
+<span class="cm">	 * on cpu &gt; 0 and at this point we don&#39;t know how many cpus are</span>
+<span class="cm">	 * available */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_have_vector_callback</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_feature</span><span class="p">(</span><span class="n">XENFEAT_hvm_safe_pvclock</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;Xen doesn&#39;t support pvclock on HVM,&quot;</span>
+				<span class="s">&quot;disable pv timer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pv_time_ops</span> <span class="o">=</span> <span class="n">xen_time_ops</span><span class="p">;</span>
+	<span class="n">x86_init</span><span class="p">.</span><span class="n">timers</span><span class="p">.</span><span class="n">setup_percpu_clockev</span> <span class="o">=</span> <span class="n">xen_time_init</span><span class="p">;</span>
+	<span class="n">x86_cpuinit</span><span class="p">.</span><span class="n">setup_percpu_clockev</span> <span class="o">=</span> <span class="n">xen_hvm_setup_cpu_clockevents</span><span class="p">;</span>
+
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">calibrate_tsc</span> <span class="o">=</span> <span class="n">xen_tsc_khz</span><span class="p">;</span>
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">get_wallclock</span> <span class="o">=</span> <span class="n">xen_get_wallclock</span><span class="p">;</span>
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">set_wallclock</span> <span class="o">=</span> <span class="n">xen_set_wallclock</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

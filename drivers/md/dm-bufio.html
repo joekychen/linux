@@ -1,0 +1,1786 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › md › dm-bufio.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>dm-bufio.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2009-2011 Red Hat, Inc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Author: Mikulas Patocka &lt;mpatocka@redhat.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPL.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &quot;dm-bufio.h&quot;</span>
+
+<span class="cp">#include &lt;linux/device-mapper.h&gt;</span>
+<span class="cp">#include &lt;linux/dm-io.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/vmalloc.h&gt;</span>
+<span class="cp">#include &lt;linux/shrinker.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+
+<span class="cp">#define DM_MSG_PREFIX &quot;bufio&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Memory management policy:</span>
+<span class="cm"> *	Limit the number of buffers to DM_BUFIO_MEMORY_PERCENT of main memory</span>
+<span class="cm"> *	or DM_BUFIO_VMALLOC_PERCENT of vmalloc memory (whichever is lower).</span>
+<span class="cm"> *	Always allocate at least DM_BUFIO_MIN_BUFFERS buffers.</span>
+<span class="cm"> *	Start background writeback when there are DM_BUFIO_WRITEBACK_PERCENT</span>
+<span class="cm"> *	dirty buffers.</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_MIN_BUFFERS		8</span>
+
+<span class="cp">#define DM_BUFIO_MEMORY_PERCENT		2</span>
+<span class="cp">#define DM_BUFIO_VMALLOC_PERCENT	25</span>
+<span class="cp">#define DM_BUFIO_WRITEBACK_PERCENT	75</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Check buffer ages in this interval (seconds)</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_WORK_TIMER_SECS	10</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free buffers when they are older than this (seconds)</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_DEFAULT_AGE_SECS	60</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The number of bvec entries that are embedded directly in the buffer.</span>
+<span class="cm"> * If the chunk size is larger, dm-io is used to do the io.</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_INLINE_VECS		16</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Buffer hash</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_HASH_BITS	20</span>
+<span class="cp">#define DM_BUFIO_HASH(block) \</span>
+<span class="cp">	((((block) &gt;&gt; DM_BUFIO_HASH_BITS) ^ (block)) &amp; \</span>
+<span class="cp">	 ((1 &lt;&lt; DM_BUFIO_HASH_BITS) - 1))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Don&#39;t try to use kmem_cache_alloc for blocks larger than this.</span>
+<span class="cm"> * For explanation, see alloc_buffer_data below.</span>
+<span class="cm"> */</span>
+<span class="cp">#define DM_BUFIO_BLOCK_SIZE_SLAB_LIMIT	(PAGE_SIZE &gt;&gt; 1)</span>
+<span class="cp">#define DM_BUFIO_BLOCK_SIZE_GFP_LIMIT	(PAGE_SIZE &lt;&lt; (MAX_ORDER - 1))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * dm_buffer-&gt;list_mode</span>
+<span class="cm"> */</span>
+<span class="cp">#define LIST_CLEAN	0</span>
+<span class="cp">#define LIST_DIRTY	1</span>
+<span class="cp">#define LIST_SIZE	2</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Linking of buffers:</span>
+<span class="cm"> *	All buffers are linked to cache_hash with their hash_list field.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Clean buffers that are not being written (B_WRITING not set)</span>
+<span class="cm"> *	are linked to lru[LIST_CLEAN] with their lru_list field.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Dirty and clean buffers that are being written are linked to</span>
+<span class="cm"> *	lru[LIST_DIRTY] with their lru_list field. When the write</span>
+<span class="cm"> *	finishes, the buffer cannot be relinked immediately (because we</span>
+<span class="cm"> *	are in an interrupt context and relinking requires process</span>
+<span class="cm"> *	context), so some clean-not-writing buffers can be held on</span>
+<span class="cm"> *	dirty_lru too.  They are later added to lru in the process</span>
+<span class="cm"> *	context.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mutex</span> <span class="n">lock</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">lru</span><span class="p">[</span><span class="n">LIST_SIZE</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_SIZE</span><span class="p">];</span>
+
+	<span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">block_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">sectors_per_block_bits</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">pages_per_block_bits</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">blocks_per_page_bits</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">aux_size</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">alloc_callback</span><span class="p">)(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">write_callback</span><span class="p">)(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="p">);</span>
+
+	<span class="k">struct</span> <span class="n">dm_io_client</span> <span class="o">*</span><span class="n">dm_io</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">reserved_buffers</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">need_reserved_buffers</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">hlist_head</span> <span class="o">*</span><span class="n">cache_hash</span><span class="p">;</span>
+	<span class="n">wait_queue_head_t</span> <span class="n">free_buffer_wait</span><span class="p">;</span>
+
+	<span class="kt">int</span> <span class="n">async_write_error</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">client_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">shrinker</span> <span class="n">shrinker</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Buffer state bits.</span>
+<span class="cm"> */</span>
+<span class="cp">#define B_READING	0</span>
+<span class="cp">#define B_WRITING	1</span>
+<span class="cp">#define B_DIRTY		2</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Describes how the block was allocated:</span>
+<span class="cm"> * kmem_cache_alloc(), __get_free_pages() or vmalloc().</span>
+<span class="cm"> * See the comment at alloc_buffer_data.</span>
+<span class="cm"> */</span>
+<span class="k">enum</span> <span class="n">data_mode</span> <span class="p">{</span>
+	<span class="n">DATA_MODE_SLAB</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="n">DATA_MODE_GET_FREE_PAGES</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+	<span class="n">DATA_MODE_VMALLOC</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span>
+	<span class="n">DATA_MODE_LIMIT</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hlist_node</span> <span class="n">hash_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">lru_list</span><span class="p">;</span>
+	<span class="n">sector_t</span> <span class="n">block</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">enum</span> <span class="n">data_mode</span> <span class="n">data_mode</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">list_mode</span><span class="p">;</span>		<span class="cm">/* LIST_* */</span>
+	<span class="kt">unsigned</span> <span class="n">hold_count</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">read_error</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">write_error</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">state</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">last_accessed</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio</span> <span class="n">bio</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">bio_vec</span> <span class="n">bio_vec</span><span class="p">[</span><span class="n">DM_BUFIO_INLINE_VECS</span><span class="p">];</span>
+<span class="p">};</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">dm_bufio_caches</span><span class="p">[</span><span class="n">PAGE_SHIFT</span> <span class="o">-</span> <span class="n">SECTOR_SHIFT</span><span class="p">];</span>
+<span class="k">static</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dm_bufio_cache_names</span><span class="p">[</span><span class="n">PAGE_SHIFT</span> <span class="o">-</span> <span class="n">SECTOR_SHIFT</span><span class="p">];</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">dm_bufio_cache_index</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">ret</span> <span class="o">=</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">blocks_per_page_bits</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">ret</span> <span class="o">&gt;=</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">dm_bufio_caches</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define DM_BUFIO_CACHE(c)	(dm_bufio_caches[dm_bufio_cache_index(c)])</span>
+<span class="cp">#define DM_BUFIO_CACHE_NAME(c)	(dm_bufio_cache_names[dm_bufio_cache_index(c)])</span>
+
+<span class="cp">#define dm_bufio_in_request()	(!!current-&gt;bio_list)</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dm_bufio_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_lock_nested</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">dm_bufio_in_request</span><span class="p">());</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dm_bufio_trylock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">mutex_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dm_bufio_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * FIXME Move to sched.h?</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_PREEMPT_VOLUNTARY</span>
+<span class="cp">#  define dm_bufio_cond_resched()		\</span>
+<span class="cp">do {						\</span>
+<span class="cp">	if (unlikely(need_resched()))		\</span>
+<span class="cp">		_cond_resched();		\</span>
+<span class="cp">} while (0)</span>
+<span class="cp">#else</span>
+<span class="cp">#  define dm_bufio_cond_resched()                do { } while (0)</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Default cache size: available memory divided by the ratio.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_default_cache_size</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Total cache size set by the user.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_cache_size</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A copy of dm_bufio_cache_size because dm_bufio_cache_size can change</span>
+<span class="cm"> * at any time.  If it disagrees, the user has changed cache size.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_cache_size_latch</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">param_spinlock</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Buffers are freed after this timeout</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="n">dm_bufio_max_age</span> <span class="o">=</span> <span class="n">DM_BUFIO_DEFAULT_AGE_SECS</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_peak_allocated</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_allocated_kmem_cache</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_allocated_get_free_pages</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_allocated_vmalloc</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_current_allocated</span><span class="p">;</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Per-client cache: dm_bufio_cache_size / dm_bufio_client_count</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">dm_bufio_cache_size_per_client</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The current number of clients.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">dm_bufio_client_count</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The list of all clients.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">dm_bufio_all_clients</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This mutex protects dm_bufio_cache_size_latch,</span>
+<span class="cm"> * dm_bufio_cache_size_per_client and dm_bufio_client_count</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">adjust_total_allocated</span><span class="p">(</span><span class="k">enum</span> <span class="n">data_mode</span> <span class="n">data_mode</span><span class="p">,</span> <span class="kt">long</span> <span class="n">diff</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span> <span class="k">const</span> <span class="n">class_ptr</span><span class="p">[</span><span class="n">DATA_MODE_LIMIT</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="o">&amp;</span><span class="n">dm_bufio_allocated_kmem_cache</span><span class="p">,</span>
+		<span class="o">&amp;</span><span class="n">dm_bufio_allocated_get_free_pages</span><span class="p">,</span>
+		<span class="o">&amp;</span><span class="n">dm_bufio_allocated_vmalloc</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">param_spinlock</span><span class="p">);</span>
+
+	<span class="o">*</span><span class="n">class_ptr</span><span class="p">[</span><span class="n">data_mode</span><span class="p">]</span> <span class="o">+=</span> <span class="n">diff</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_current_allocated</span> <span class="o">+=</span> <span class="n">diff</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_current_allocated</span> <span class="o">&gt;</span> <span class="n">dm_bufio_peak_allocated</span><span class="p">)</span>
+		<span class="n">dm_bufio_peak_allocated</span> <span class="o">=</span> <span class="n">dm_bufio_current_allocated</span><span class="p">;</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">param_spinlock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Change the number of clients and recalculate per-client limit.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__cache_size_refresh</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">mutex_is_locked</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">));</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_client_count</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_cache_size_latch</span> <span class="o">=</span> <span class="n">dm_bufio_cache_size</span><span class="p">;</span>
+
+	<span class="n">barrier</span><span class="p">();</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Use default if set to 0 and report the actual cache size used.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dm_bufio_cache_size_latch</span><span class="p">)</span> <span class="p">{</span>
+		<span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">cmpxchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_cache_size</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+			      <span class="n">dm_bufio_default_cache_size</span><span class="p">);</span>
+		<span class="n">dm_bufio_cache_size_latch</span> <span class="o">=</span> <span class="n">dm_bufio_default_cache_size</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dm_bufio_cache_size_per_client</span> <span class="o">=</span> <span class="n">dm_bufio_cache_size_latch</span> <span class="o">/</span>
+					 <span class="p">(</span><span class="n">dm_bufio_client_count</span> <span class="o">?</span> <span class="o">:</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocating buffer data.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Small buffers are allocated with kmem_cache, to use space optimally.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For large buffers, we choose between get_free_pages and vmalloc.</span>
+<span class="cm"> * Each has advantages and disadvantages.</span>
+<span class="cm"> *</span>
+<span class="cm"> * __get_free_pages can randomly fail if the memory is fragmented.</span>
+<span class="cm"> * __vmalloc won&#39;t randomly fail, but vmalloc space is limited (it may be</span>
+<span class="cm"> * as low as 128M) so using it for caching is not appropriate.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the allocation may fail we use __get_free_pages. Memory fragmentation</span>
+<span class="cm"> * won&#39;t have a fatal effect here, but it just causes flushes of some other</span>
+<span class="cm"> * buffers and more I/O will be performed. Don&#39;t use __get_free_pages if it</span>
+<span class="cm"> * always fails (i.e. order &gt;= MAX_ORDER).</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the allocation shouldn&#39;t fail we use __vmalloc. This is only for the</span>
+<span class="cm"> * initial reserve allocation, so there&#39;s no risk of wasting all vmalloc</span>
+<span class="cm"> * space.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">alloc_buffer_data</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">,</span>
+			       <span class="k">enum</span> <span class="n">data_mode</span> <span class="o">*</span><span class="n">data_mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">&lt;=</span> <span class="n">DM_BUFIO_BLOCK_SIZE_SLAB_LIMIT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">data_mode</span> <span class="o">=</span> <span class="n">DATA_MODE_SLAB</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">kmem_cache_alloc</span><span class="p">(</span><span class="n">DM_BUFIO_CACHE</span><span class="p">(</span><span class="n">c</span><span class="p">),</span> <span class="n">gfp_mask</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">&lt;=</span> <span class="n">DM_BUFIO_BLOCK_SIZE_GFP_LIMIT</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">gfp_mask</span> <span class="o">&amp;</span> <span class="n">__GFP_NORETRY</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">data_mode</span> <span class="o">=</span> <span class="n">DATA_MODE_GET_FREE_PAGES</span><span class="p">;</span>
+		<span class="k">return</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">gfp_mask</span><span class="p">,</span>
+						<span class="n">c</span><span class="o">-&gt;</span><span class="n">pages_per_block_bits</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">data_mode</span> <span class="o">=</span> <span class="n">DATA_MODE_VMALLOC</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">__vmalloc</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">,</span> <span class="n">gfp_mask</span><span class="p">,</span> <span class="n">PAGE_KERNEL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free buffer&#39;s data.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_buffer_data</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span>
+			     <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="k">enum</span> <span class="n">data_mode</span> <span class="n">data_mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">data_mode</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">DATA_MODE_SLAB</span>:
+		<span class="n">kmem_cache_free</span><span class="p">(</span><span class="n">DM_BUFIO_CACHE</span><span class="p">(</span><span class="n">c</span><span class="p">),</span> <span class="n">data</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">DATA_MODE_GET_FREE_PAGES</span>:
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">data</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">pages_per_block_bits</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">DATA_MODE_VMALLOC</span>:
+		<span class="n">vfree</span><span class="p">(</span><span class="n">data</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="nl">default:</span>
+		<span class="n">DMCRIT</span><span class="p">(</span><span class="s">&quot;dm_bufio_free_buffer_data: bad data mode: %d&quot;</span><span class="p">,</span>
+		       <span class="n">data_mode</span><span class="p">);</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate buffer and its data.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">alloc_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">)</span> <span class="o">+</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">aux_size</span><span class="p">,</span>
+				      <span class="n">gfp_mask</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span> <span class="o">=</span> <span class="n">c</span><span class="p">;</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">=</span> <span class="n">alloc_buffer_data</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">gfp_mask</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">adjust_total_allocated</span><span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span><span class="p">,</span> <span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free buffer and its data.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">adjust_total_allocated</span><span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">);</span>
+
+	<span class="n">free_buffer_data</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Link buffer to the hash list and clean or dirty queue.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__link_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dirty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">dirty</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span> <span class="o">=</span> <span class="n">block</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span> <span class="o">=</span> <span class="n">dirty</span><span class="p">;</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">dirty</span><span class="p">]);</span>
+	<span class="n">hlist_add_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">[</span><span class="n">DM_BUFIO_HASH</span><span class="p">(</span><span class="n">block</span><span class="p">)]);</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">last_accessed</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Unlink buffer from the hash list and dirty or clean queue.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__unlink_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">]);</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">]</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">hlist_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hash_list</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Place the buffer to the head of dirty or clean LRU queue.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__relink_lru</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dirty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">]);</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">]</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">dirty</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span> <span class="o">=</span> <span class="n">dirty</span><span class="p">;</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">dirty</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Submit I/O on the buffer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Bio interface is faster but it has some problems:</span>
+<span class="cm"> *	the vector list is limited (increasing this limit increases</span>
+<span class="cm"> *	memory-consumption per buffer, so it is not viable);</span>
+<span class="cm"> *</span>
+<span class="cm"> *	the memory must be direct-mapped, not vmalloced;</span>
+<span class="cm"> *</span>
+<span class="cm"> *	the I/O driver can reject requests spuriously if it thinks that</span>
+<span class="cm"> *	the requests are too big for the device or if they cross a</span>
+<span class="cm"> *	controller-defined memory boundary.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the buffer is small enough (up to DM_BUFIO_INLINE_VECS pages) and</span>
+<span class="cm"> * it is not vmalloced, try using the bio interface.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the buffer is big, if it is vmalloced or if the underlying device</span>
+<span class="cm"> * rejects the bio because it is too large, use dm-io layer to do the I/O.</span>
+<span class="cm"> * The dm-io layer splits the I/O into multiple requests, avoiding the above</span>
+<span class="cm"> * shortcomings.</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * dm-io completion routine. It just calls b-&gt;bio.bi_end_io, pretending</span>
+<span class="cm"> * that the request was handled directly with bio interface.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dmio_complete</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">error</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">context</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">context</span><span class="p">;</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_end_io</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">,</span> <span class="n">error</span> <span class="o">?</span> <span class="o">-</span><span class="n">EIO</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">use_dmio</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rw</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		     <span class="n">bio_end_io_t</span> <span class="o">*</span><span class="n">end_io</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_io_request</span> <span class="n">io_req</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bi_rw</span> <span class="o">=</span> <span class="n">rw</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">notify</span><span class="p">.</span><span class="n">fn</span> <span class="o">=</span> <span class="n">dmio_complete</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">notify</span><span class="p">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">b</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">client</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">,</span>
+	<span class="p">};</span>
+	<span class="k">struct</span> <span class="n">dm_io_region</span> <span class="n">region</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sector</span> <span class="o">=</span> <span class="n">block</span> <span class="o">&lt;&lt;</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">sectors_per_block_bits</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">&gt;&gt;</span> <span class="n">SECTOR_SHIFT</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span> <span class="o">!=</span> <span class="n">DATA_MODE_VMALLOC</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">io_req</span><span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="n">DM_IO_KMEM</span><span class="p">;</span>
+		<span class="n">io_req</span><span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">ptr</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">io_req</span><span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="n">DM_IO_VMA</span><span class="p">;</span>
+		<span class="n">io_req</span><span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">ptr</span><span class="p">.</span><span class="n">vma</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_end_io</span> <span class="o">=</span> <span class="n">end_io</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_io</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_req</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">region</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="n">end_io</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">use_inline_bio</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rw</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+			   <span class="n">bio_end_io_t</span> <span class="o">*</span><span class="n">end_io</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">ptr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">bio_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">);</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_io_vec</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">bio_vec</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_max_vecs</span> <span class="o">=</span> <span class="n">DM_BUFIO_INLINE_VECS</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_sector</span> <span class="o">=</span> <span class="n">block</span> <span class="o">&lt;&lt;</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">sectors_per_block_bits</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_bdev</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">.</span><span class="n">bi_end_io</span> <span class="o">=</span> <span class="n">end_io</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We assume that if len &gt;= PAGE_SIZE ptr is page-aligned.</span>
+<span class="cm">	 * If len &lt; PAGE_SIZE the buffer doesn&#39;t cross page boundary.</span>
+<span class="cm">	 */</span>
+	<span class="n">ptr</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="n">len</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&gt;=</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">ptr</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+	<span class="k">else</span>
+		<span class="n">BUG_ON</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">ptr</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bio_add_page</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">,</span> <span class="n">virt_to_page</span><span class="p">(</span><span class="n">ptr</span><span class="p">),</span>
+				  <span class="n">len</span> <span class="o">&lt;</span> <span class="n">PAGE_SIZE</span> <span class="o">?</span> <span class="n">len</span> <span class="o">:</span> <span class="n">PAGE_SIZE</span><span class="p">,</span>
+				  <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">{</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">&lt;=</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+			<span class="n">use_dmio</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">end_io</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">len</span> <span class="o">-=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">ptr</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">submit_bio</span><span class="p">(</span><span class="n">rw</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">bio</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">submit_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">rw</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		      <span class="n">bio_end_io_t</span> <span class="o">*</span><span class="n">end_io</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rw</span> <span class="o">==</span> <span class="n">WRITE</span> <span class="o">&amp;&amp;</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">write_callback</span><span class="p">)</span>
+		<span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">write_callback</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">&lt;=</span> <span class="n">DM_BUFIO_INLINE_VECS</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">b</span><span class="o">-&gt;</span><span class="n">data_mode</span> <span class="o">!=</span> <span class="n">DATA_MODE_VMALLOC</span><span class="p">)</span>
+		<span class="n">use_inline_bio</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">end_io</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">use_dmio</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">rw</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">end_io</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Writing dirty buffers</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The endio routine for write.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Set the error, clear B_WRITING bit and wake anyone who was waiting on</span>
+<span class="cm"> * it.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">write_endio</span><span class="p">(</span><span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">bio</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">write_error</span> <span class="o">=</span> <span class="n">error</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">error</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+		<span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">cmpxchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">async_write_error</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+	<span class="n">smp_mb__before_clear_bit</span><span class="p">();</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+	<span class="n">smp_mb__after_clear_bit</span><span class="p">();</span>
+
+	<span class="n">wake_up_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This function is called when wait_on_bit is actually waiting.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">do_io_schedule</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">word</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">io_schedule</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Initiate a write on a dirty buffer, but don&#39;t wait for it.</span>
+<span class="cm"> *</span>
+<span class="cm"> * - If the buffer is not dirty, exit.</span>
+<span class="cm"> * - If there some previous write going on, wait for it to finish (we can&#39;t</span>
+<span class="cm"> *   have two writes on the same buffer simultaneously).</span>
+<span class="cm"> * - Submit our write and don&#39;t wait on it. We set B_WRITING indicating</span>
+<span class="cm"> *   that there is a write in progress.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__write_dirty_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+	<span class="n">wait_on_bit_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+			 <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+
+	<span class="n">submit_io</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">WRITE</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">,</span> <span class="n">write_endio</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wait until any activity on the buffer finishes.  Possibly write the</span>
+<span class="cm"> * buffer if it is dirty.  When this function finishes, there is no I/O</span>
+<span class="cm"> * running on the buffer and the buffer is not dirty.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__make_buffer_clean</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span>	<span class="cm">/* fast case */</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_READING</span><span class="p">,</span> <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+	<span class="n">__write_dirty_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span> <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find some buffer that is not held by anybody, clean it, unlink it and</span>
+<span class="cm"> * return it.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">__get_unclaimed_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_reverse</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_CLEAN</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">__make_buffer_clean</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+			<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_entry_reverse</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">__make_buffer_clean</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+			<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wait until some other threads free some buffer or release hold count on</span>
+<span class="cm"> * some buffer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function is entered with c-&gt;lock held, drops it and regains it</span>
+<span class="cm"> * before exiting.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__wait_for_free_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">DECLARE_WAITQUEUE</span><span class="p">(</span><span class="n">wait</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+
+	<span class="n">add_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+	<span class="n">set_task_state</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">io_schedule</span><span class="p">();</span>
+
+	<span class="n">set_task_state</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">TASK_RUNNING</span><span class="p">);</span>
+	<span class="n">remove_wait_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wait</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">enum</span> <span class="n">new_flag</span> <span class="p">{</span>
+	<span class="n">NF_FRESH</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="n">NF_READ</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+	<span class="n">NF_GET</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span>
+	<span class="n">NF_PREFETCH</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate a new buffer. If the allocation is not possible, wait until</span>
+<span class="cm"> * some other thread frees a buffer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * May drop the lock and regain it.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">__alloc_buffer_wait_no_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="k">enum</span> <span class="n">new_flag</span> <span class="n">nf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * dm-bufio is resistant to allocation failures (it just keeps</span>
+<span class="cm">	 * one buffer reserved in cases all the allocations fail).</span>
+<span class="cm">	 * So set flags to not try too hard:</span>
+<span class="cm">	 *	GFP_NOIO: don&#39;t recurse into the I/O layer</span>
+<span class="cm">	 *	__GFP_NORETRY: don&#39;t retry and rather return failure</span>
+<span class="cm">	 *	__GFP_NOMEMALLOC: don&#39;t use emergency reserves</span>
+<span class="cm">	 *	__GFP_NOWARN: don&#39;t print a warning in case of failure</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * For debugging, if we set the cache size to 1, no new buffers will</span>
+<span class="cm">	 * be allocated.</span>
+<span class="cm">	 */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_cache_size_latch</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">b</span> <span class="o">=</span> <span class="n">alloc_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">GFP_NOIO</span> <span class="o">|</span> <span class="n">__GFP_NORETRY</span> <span class="o">|</span> <span class="n">__GFP_NOMEMALLOC</span> <span class="o">|</span> <span class="n">__GFP_NOWARN</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nf</span> <span class="o">==</span> <span class="n">NF_PREFETCH</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">b</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">lru_list</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">);</span>
+			<span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span><span class="o">++</span><span class="p">;</span>
+
+			<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">b</span> <span class="o">=</span> <span class="n">__get_unclaimed_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+
+		<span class="n">__wait_for_free_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">__alloc_buffer_wait</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="k">enum</span> <span class="n">new_flag</span> <span class="n">nf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">__alloc_buffer_wait_no_callback</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">nf</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">alloc_callback</span><span class="p">)</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">alloc_callback</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free a buffer and wake other threads waiting for free buffers.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__free_buffer_wake</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span><span class="p">)</span>
+		<span class="n">free_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="k">else</span> <span class="p">{</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">);</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__write_dirty_buffers_async</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="kt">int</span> <span class="n">no_wait</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe_reverse</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">__relink_lru</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">LIST_CLEAN</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">no_wait</span> <span class="o">&amp;&amp;</span> <span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="n">__write_dirty_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Get writeback threshold and buffer limit for a given client.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__get_memory_limit</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span>
+			       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">threshold_buffers</span><span class="p">,</span>
+			       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">limit_buffers</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buffers</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_cache_size</span> <span class="o">!=</span> <span class="n">dm_bufio_cache_size_latch</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+		<span class="n">__cache_size_refresh</span><span class="p">();</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">buffers</span> <span class="o">=</span> <span class="n">dm_bufio_cache_size_per_client</span> <span class="o">&gt;&gt;</span>
+		  <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">sectors_per_block_bits</span> <span class="o">+</span> <span class="n">SECTOR_SHIFT</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">buffers</span> <span class="o">&lt;</span> <span class="n">DM_BUFIO_MIN_BUFFERS</span><span class="p">)</span>
+		<span class="n">buffers</span> <span class="o">=</span> <span class="n">DM_BUFIO_MIN_BUFFERS</span><span class="p">;</span>
+
+	<span class="o">*</span><span class="n">limit_buffers</span> <span class="o">=</span> <span class="n">buffers</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">threshold_buffers</span> <span class="o">=</span> <span class="n">buffers</span> <span class="o">*</span> <span class="n">DM_BUFIO_WRITEBACK_PERCENT</span> <span class="o">/</span> <span class="mi">100</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Check if we&#39;re over watermark.</span>
+<span class="cm"> * If we are over threshold_buffers, start freeing buffers.</span>
+<span class="cm"> * If we&#39;re over &quot;limit_buffers&quot;, block until we get under the limit.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__check_watermark</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">threshold_buffers</span><span class="p">,</span> <span class="n">limit_buffers</span><span class="p">;</span>
+
+	<span class="n">__get_memory_limit</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">threshold_buffers</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">limit_buffers</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_CLEAN</span><span class="p">]</span> <span class="o">+</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">]</span> <span class="o">&gt;</span>
+	       <span class="n">limit_buffers</span><span class="p">)</span> <span class="p">{</span>
+
+		<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">__get_unclaimed_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">threshold_buffers</span><span class="p">)</span>
+		<span class="n">__write_dirty_buffers_async</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find a buffer in the hash.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">__find</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">hlist_node</span> <span class="o">*</span><span class="n">hn</span><span class="p">;</span>
+
+	<span class="n">hlist_for_each_entry</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">hn</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">[</span><span class="n">DM_BUFIO_HASH</span><span class="p">(</span><span class="n">block</span><span class="p">)],</span>
+			     <span class="n">hash_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span> <span class="o">==</span> <span class="n">block</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Getting a buffer</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">__bufio_new</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+				     <span class="k">enum</span> <span class="n">new_flag</span> <span class="n">nf</span><span class="p">,</span> <span class="kt">int</span> <span class="o">*</span><span class="n">need_submit</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="o">*</span><span class="n">new_b</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="o">*</span><span class="n">need_submit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">b</span> <span class="o">=</span> <span class="n">__find</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">found_buffer</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nf</span> <span class="o">==</span> <span class="n">NF_GET</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">new_b</span> <span class="o">=</span> <span class="n">__alloc_buffer_wait</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">nf</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">new_b</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We&#39;ve had a period where the mutex was unlocked, so need to</span>
+<span class="cm">	 * recheck the hash table.</span>
+<span class="cm">	 */</span>
+	<span class="n">b</span> <span class="o">=</span> <span class="n">__find</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">new_b</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">found_buffer</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">__check_watermark</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">b</span> <span class="o">=</span> <span class="n">new_b</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">read_error</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">write_error</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">__link_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">LIST_CLEAN</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nf</span> <span class="o">==</span> <span class="n">NF_FRESH</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">B_READING</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">need_submit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+
+<span class="nl">found_buffer:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nf</span> <span class="o">==</span> <span class="n">NF_PREFETCH</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Note: it is essential that we don&#39;t wait for the buffer to be</span>
+<span class="cm">	 * read if dm_bufio_get function is used. Both dm_bufio_get and</span>
+<span class="cm">	 * dm_bufio_prefetch can be used in the driver request routine.</span>
+<span class="cm">	 * If the user called both dm_bufio_prefetch and dm_bufio_get on</span>
+<span class="cm">	 * the same buffer, it would deadlock if we waited.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nf</span> <span class="o">==</span> <span class="n">NF_GET</span> <span class="o">&amp;&amp;</span> <span class="n">unlikely</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">__relink_lru</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">||</span>
+		     <span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+	<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The endio routine for reading: set the error, clear the bit and wake up</span>
+<span class="cm"> * anyone waiting on the buffer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">read_endio</span><span class="p">(</span><span class="k">struct</span> <span class="n">bio</span> <span class="o">*</span><span class="n">bio</span><span class="p">,</span> <span class="kt">int</span> <span class="n">error</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">bio</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">bio</span><span class="p">);</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">read_error</span> <span class="o">=</span> <span class="n">error</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+	<span class="n">smp_mb__before_clear_bit</span><span class="p">();</span>
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+	<span class="n">smp_mb__after_clear_bit</span><span class="p">();</span>
+
+	<span class="n">wake_up_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_READING</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A common routine for dm_bufio_new and dm_bufio_read.  Operation of these</span>
+<span class="cm"> * functions is similar except that dm_bufio_new doesn&#39;t read the</span>
+<span class="cm"> * buffer from the disk (assuming that the caller overwrites all the data</span>
+<span class="cm"> * and uses dm_bufio_mark_buffer_dirty to write new data back).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">new_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		      <span class="k">enum</span> <span class="n">new_flag</span> <span class="n">nf</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="n">bp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">need_submit</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="n">b</span> <span class="o">=</span> <span class="n">__bufio_new</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">nf</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">need_submit</span><span class="p">);</span>
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">b</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">need_submit</span><span class="p">)</span>
+		<span class="n">submit_io</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">READ</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">,</span> <span class="n">read_endio</span><span class="p">);</span>
+
+	<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_READING</span><span class="p">,</span> <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">read_error</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">error</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">read_error</span><span class="p">;</span>
+
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">error</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="o">*</span><span class="n">bp</span> <span class="o">=</span> <span class="n">b</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_bufio_get</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		   <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="n">bp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">new_read</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">NF_GET</span><span class="p">,</span> <span class="n">bp</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_bufio_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="n">bp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="k">return</span> <span class="n">new_read</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">NF_READ</span><span class="p">,</span> <span class="n">bp</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_read</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_bufio_new</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span>
+		   <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="n">bp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="k">return</span> <span class="n">new_read</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">NF_FRESH</span><span class="p">,</span> <span class="n">bp</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_new</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_bufio_prefetch</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span>
+		       <span class="n">sector_t</span> <span class="n">block</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">n_blocks</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">blk_plug</span> <span class="n">plug</span><span class="p">;</span>
+
+	<span class="n">blk_start_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(;</span> <span class="n">n_blocks</span><span class="o">--</span><span class="p">;</span> <span class="n">block</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">need_submit</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+		<span class="n">b</span> <span class="o">=</span> <span class="n">__bufio_new</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">NF_PREFETCH</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">need_submit</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">b</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">need_submit</span><span class="p">)</span>
+				<span class="n">submit_io</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">READ</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">,</span> <span class="n">read_endio</span><span class="p">);</span>
+			<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+			<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">n_blocks</span><span class="p">)</span>
+				<span class="k">goto</span> <span class="n">flush_plug</span><span class="p">;</span>
+			<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+		<span class="p">}</span>
+
+	<span class="p">}</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+<span class="nl">flush_plug:</span>
+	<span class="n">blk_finish_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_prefetch</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_bufio_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">);</span>
+
+	<span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="o">--</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * If there were errors on the buffer, and the buffer is not</span>
+<span class="cm">		 * to be written, free the buffer. There is no point in caching</span>
+<span class="cm">		 * invalid buffer.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">read_error</span> <span class="o">||</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">write_error</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+			<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_release</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_bufio_mark_buffer_dirty</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+		<span class="n">__relink_lru</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">LIST_DIRTY</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_mark_buffer_dirty</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_bufio_write_dirty_buffers_async</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="n">__write_dirty_buffers_async</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_write_dirty_buffers_async</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * For performance, it is essential that the buffers are written asynchronously</span>
+<span class="cm"> * and simultaneously (so that the block layer can merge the writes) and then</span>
+<span class="cm"> * waited upon.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Finally, we flush hardware disk cache.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">dm_bufio_write_dirty_buffers</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">a</span><span class="p">,</span> <span class="n">f</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">buffers_processed</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="n">__write_dirty_buffers_async</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+<span class="nl">again:</span>
+	<span class="n">list_for_each_entry_safe_reverse</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">dropped_lock</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">buffers_processed</span> <span class="o">&lt;</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">])</span>
+			<span class="n">buffers_processed</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">buffers_processed</span> <span class="o">&lt;</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">])</span> <span class="p">{</span>
+				<span class="n">dropped_lock</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="o">++</span><span class="p">;</span>
+				<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+				<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+					    <span class="n">do_io_schedule</span><span class="p">,</span>
+					    <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+				<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+				<span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="o">--</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span>
+				<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+					    <span class="n">do_io_schedule</span><span class="p">,</span>
+					    <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+			<span class="n">__relink_lru</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">LIST_CLEAN</span><span class="p">);</span>
+
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * If we dropped the lock, the list is no longer consistent,</span>
+<span class="cm">		 * so we must restart the search.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * In the most common case, the buffer just processed is</span>
+<span class="cm">		 * relinked to the clean list, so we won&#39;t loop scanning the</span>
+<span class="cm">		 * same buffer again and again.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * This may livelock if there is another thread simultaneously</span>
+<span class="cm">		 * dirtying buffers, so we count the number of buffers walked</span>
+<span class="cm">		 * and if it exceeds the total number of buffers, it means that</span>
+<span class="cm">		 * someone is doing some writes simultaneously with us.  In</span>
+<span class="cm">		 * this case, stop, dropping the lock.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dropped_lock</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">);</span>
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">a</span> <span class="o">=</span> <span class="n">xchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">async_write_error</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">f</span> <span class="o">=</span> <span class="n">dm_bufio_issue_flush</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">a</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">a</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">f</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_write_dirty_buffers</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Use dm-io to send and empty barrier flush the device.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">dm_bufio_issue_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_io_request</span> <span class="n">io_req</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bi_rw</span> <span class="o">=</span> <span class="n">REQ_FLUSH</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="n">DM_IO_KMEM</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">mem</span><span class="p">.</span><span class="n">ptr</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">client</span> <span class="o">=</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">,</span>
+	<span class="p">};</span>
+	<span class="k">struct</span> <span class="n">dm_io_region</span> <span class="n">io_reg</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">sector</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="k">return</span> <span class="n">dm_io</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_req</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">io_reg</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_issue_flush</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We first delete any other buffer that may be at that new location.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Then, we write the buffer to the original location if it was dirty.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Then, if we are the only one who is holding the buffer, relink the buffer</span>
+<span class="cm"> * in the hash queue for the new location.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If there was someone else holding the buffer, we write it to the new</span>
+<span class="cm"> * location but not relink it, because that other user needs to have the buffer</span>
+<span class="cm"> * at the same place.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dm_bufio_release_move</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="n">sector_t</span> <span class="n">new_block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">new</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+<span class="nl">retry:</span>
+	<span class="n">new</span> <span class="o">=</span> <span class="n">__find</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">new_block</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">new</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">new</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">__wait_for_free_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">retry</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * FIXME: Is there any point waiting for a write that&#39;s going</span>
+<span class="cm">		 * to be overwritten in a bit?</span>
+<span class="cm">		 */</span>
+		<span class="n">__make_buffer_clean</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+		<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+		<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">new</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">));</span>
+
+	<span class="n">__write_dirty_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+			    <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+		<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">__link_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">new_block</span><span class="p">,</span> <span class="n">LIST_DIRTY</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">sector_t</span> <span class="n">old_block</span><span class="p">;</span>
+		<span class="n">wait_on_bit_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+				 <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Relink buffer to &quot;new_block&quot; so that write_callback</span>
+<span class="cm">		 * sees &quot;new_block&quot; as a block number.</span>
+<span class="cm">		 * After the write, link the buffer back to old_block.</span>
+<span class="cm">		 * All this must be done in bufio lock, so that block number</span>
+<span class="cm">		 * change isn&#39;t visible to other threads.</span>
+<span class="cm">		 */</span>
+		<span class="n">old_block</span> <span class="o">=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">;</span>
+		<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">__link_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">new_block</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">);</span>
+		<span class="n">submit_io</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">WRITE</span><span class="p">,</span> <span class="n">new_block</span><span class="p">,</span> <span class="n">write_endio</span><span class="p">);</span>
+		<span class="n">wait_on_bit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">,</span> <span class="n">B_WRITING</span><span class="p">,</span>
+			    <span class="n">do_io_schedule</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+		<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+		<span class="n">__link_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">old_block</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">list_mode</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_release_move</span><span class="p">);</span>
+
+<span class="kt">unsigned</span> <span class="nf">dm_bufio_get_block_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_block_size</span><span class="p">);</span>
+
+<span class="n">sector_t</span> <span class="nf">dm_bufio_get_device_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">bdev</span><span class="o">-&gt;</span><span class="n">bd_inode</span><span class="p">)</span> <span class="o">&gt;&gt;</span>
+			   <span class="p">(</span><span class="n">SECTOR_SHIFT</span> <span class="o">+</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">sectors_per_block_bits</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_device_size</span><span class="p">);</span>
+
+<span class="n">sector_t</span> <span class="nf">dm_bufio_get_block_number</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_block_number</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_bufio_get_block_data</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_block_data</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_bufio_get_aux_data</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">b</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_aux_data</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="nf">dm_bufio_get_client</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">c</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_get_client</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">drop_buffers</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dm_bufio_in_request</span><span class="p">());</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * An optimization so that the buffers are not written one-by-one.</span>
+<span class="cm">	 */</span>
+	<span class="n">dm_bufio_write_dirty_buffers_async</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">b</span> <span class="o">=</span> <span class="n">__get_unclaimed_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">)))</span>
+		<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;leaked buffer %llx, hold count %u, list %d&quot;</span><span class="p">,</span>
+			      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">i</span><span class="p">]));</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Test if the buffer is unused and too old, and commit it.</span>
+<span class="cm"> * At if noio is set, we must not do any I/O because we hold</span>
+<span class="cm"> * dm_bufio_clients_lock and we would risk deadlock if the I/O gets rerouted to</span>
+<span class="cm"> * different bufio client.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__cleanup_old_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp</span><span class="p">,</span>
+				<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max_jiffies</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">jiffies</span> <span class="o">-</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">last_accessed</span> <span class="o">&lt;</span> <span class="n">max_jiffies</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">gfp</span> <span class="o">&amp;</span> <span class="n">__GFP_IO</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">B_READING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">||</span>
+		    <span class="n">test_bit</span><span class="p">(</span><span class="n">B_WRITING</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">)</span> <span class="o">||</span>
+		    <span class="n">test_bit</span><span class="p">(</span><span class="n">B_DIRTY</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+			<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">hold_count</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">__make_buffer_clean</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="n">__unlink_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__scan</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_to_scan</span><span class="p">,</span>
+		   <span class="k">struct</span> <span class="n">shrink_control</span> <span class="o">*</span><span class="n">sc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">l</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">l</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">l</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">l</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_for_each_entry_safe_reverse</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">l</span><span class="p">],</span> <span class="n">lru_list</span><span class="p">)</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">__cleanup_old_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">sc</span><span class="o">-&gt;</span><span class="n">gfp_mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+			    <span class="o">!--</span><span class="n">nr_to_scan</span><span class="p">)</span>
+				<span class="k">return</span><span class="p">;</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">shrink</span><span class="p">(</span><span class="k">struct</span> <span class="n">shrinker</span> <span class="o">*</span><span class="n">shrinker</span><span class="p">,</span> <span class="k">struct</span> <span class="n">shrink_control</span> <span class="o">*</span><span class="n">sc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span> <span class="o">=</span>
+	    <span class="n">container_of</span><span class="p">(</span><span class="n">shrinker</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_bufio_client</span><span class="p">,</span> <span class="n">shrinker</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">r</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_to_scan</span> <span class="o">=</span> <span class="n">sc</span><span class="o">-&gt;</span><span class="n">nr_to_scan</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sc</span><span class="o">-&gt;</span><span class="n">gfp_mask</span> <span class="o">&amp;</span> <span class="n">__GFP_IO</span><span class="p">)</span>
+		<span class="n">dm_bufio_lock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dm_bufio_trylock</span><span class="p">(</span><span class="n">c</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">!</span><span class="n">nr_to_scan</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_to_scan</span><span class="p">)</span>
+		<span class="n">__scan</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">nr_to_scan</span><span class="p">,</span> <span class="n">sc</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_CLEAN</span><span class="p">]</span> <span class="o">+</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">LIST_DIRTY</span><span class="p">];</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&gt;</span> <span class="n">INT_MAX</span><span class="p">)</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">INT_MAX</span><span class="p">;</span>
+
+	<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Create the buffering interface</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="nf">dm_bufio_client_create</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">block_size</span><span class="p">,</span>
+					       <span class="kt">unsigned</span> <span class="n">reserved_buffers</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">aux_size</span><span class="p">,</span>
+					       <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">alloc_callback</span><span class="p">)(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="p">),</span>
+					       <span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">write_callback</span><span class="p">)(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="p">))</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">block_size</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">SECTOR_SHIFT</span> <span class="o">||</span>
+	       <span class="p">(</span><span class="n">block_size</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">block_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)));</span>
+
+	<span class="n">c</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">c</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">c</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">bad_client</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span> <span class="o">=</span> <span class="n">vmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">hlist_head</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">DM_BUFIO_HASH_BITS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">bad_hash</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">bdev</span> <span class="o">=</span> <span class="n">bdev</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">block_size</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">sectors_per_block_bits</span> <span class="o">=</span> <span class="n">ffs</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">SECTOR_SHIFT</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">pages_per_block_bits</span> <span class="o">=</span> <span class="p">(</span><span class="n">ffs</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">&gt;=</span> <span class="n">PAGE_SHIFT</span><span class="p">)</span> <span class="o">?</span>
+				  <span class="n">ffs</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">PAGE_SHIFT</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">blocks_per_page_bits</span> <span class="o">=</span> <span class="p">(</span><span class="n">ffs</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">&lt;</span> <span class="n">PAGE_SHIFT</span> <span class="o">?</span>
+				  <span class="n">PAGE_SHIFT</span> <span class="o">-</span> <span class="p">(</span><span class="n">ffs</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">aux_size</span> <span class="o">=</span> <span class="n">aux_size</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">alloc_callback</span> <span class="o">=</span> <span class="n">alloc_callback</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">write_callback</span> <span class="o">=</span> <span class="n">write_callback</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">DM_BUFIO_HASH_BITS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">INIT_HLIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">);</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span> <span class="o">=</span> <span class="n">reserved_buffers</span><span class="p">;</span>
+
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">free_buffer_wait</span><span class="p">);</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">async_write_error</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span> <span class="o">=</span> <span class="n">dm_io_client_create</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">bad_dm_io</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">blocks_per_page_bits</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">DM_BUFIO_CACHE_NAME</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">DM_BUFIO_CACHE_NAME</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="o">=</span> <span class="n">kasprintf</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="s">&quot;dm_bufio_cache-%u&quot;</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">DM_BUFIO_CACHE_NAME</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+				<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+				<span class="k">goto</span> <span class="n">bad_cache</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">DM_BUFIO_CACHE</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">DM_BUFIO_CACHE</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="o">=</span> <span class="n">kmem_cache_create</span><span class="p">(</span><span class="n">DM_BUFIO_CACHE_NAME</span><span class="p">(</span><span class="n">c</span><span class="p">),</span>
+							      <span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">,</span>
+							      <span class="n">c</span><span class="o">-&gt;</span><span class="n">block_size</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">DM_BUFIO_CACHE</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+				<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+				<span class="k">goto</span> <span class="n">bad_cache</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">alloc_buffer</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">b</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">bad_buffer</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">__free_buffer_wake</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+	<span class="n">dm_bufio_client_count</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">client_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dm_bufio_all_clients</span><span class="p">);</span>
+	<span class="n">__cache_size_refresh</span><span class="p">();</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">shrinker</span><span class="p">.</span><span class="n">shrink</span> <span class="o">=</span> <span class="n">shrink</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">shrinker</span><span class="p">.</span><span class="n">seeks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">c</span><span class="o">-&gt;</span><span class="n">shrinker</span><span class="p">.</span><span class="n">batch</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">register_shrinker</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">shrinker</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">c</span><span class="p">;</span>
+
+<span class="nl">bad_buffer:</span>
+<span class="nl">bad_cache:</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+						 <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">lru_list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">);</span>
+		<span class="n">free_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">dm_io_client_destroy</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">);</span>
+<span class="nl">bad_dm_io:</span>
+	<span class="n">vfree</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">);</span>
+<span class="nl">bad_hash:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="nl">bad_client:</span>
+	<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_client_create</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free the buffering interface.</span>
+<span class="cm"> * It is required that there are no references on any buffers.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">dm_bufio_client_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">drop_buffers</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+
+	<span class="n">unregister_shrinker</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">shrinker</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">client_list</span><span class="p">);</span>
+	<span class="n">dm_bufio_client_count</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">__cache_size_refresh</span><span class="p">();</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">DM_BUFIO_HASH_BITS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">hlist_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">[</span><span class="n">i</span><span class="p">]));</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">need_reserved_buffers</span><span class="p">);</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">reserved_buffers</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+						 <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">lru_list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">lru_list</span><span class="p">);</span>
+		<span class="n">free_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;leaked buffer count %d: %ld&quot;</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">LIST_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">n_buffers</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="n">dm_io_client_destroy</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">dm_io</span><span class="p">);</span>
+	<span class="n">vfree</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">cache_hash</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bufio_client_destroy</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">cleanup_old_buffers</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max_age</span> <span class="o">=</span> <span class="n">dm_bufio_max_age</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="n">c</span><span class="p">;</span>
+
+	<span class="n">barrier</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">max_age</span> <span class="o">&gt;</span> <span class="n">ULONG_MAX</span> <span class="o">/</span> <span class="n">HZ</span><span class="p">)</span>
+		<span class="n">max_age</span> <span class="o">=</span> <span class="n">ULONG_MAX</span> <span class="o">/</span> <span class="n">HZ</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dm_bufio_all_clients</span><span class="p">,</span> <span class="n">client_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dm_bufio_trylock</span><span class="p">(</span><span class="n">c</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_CLEAN</span><span class="p">]))</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+			<span class="n">b</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">[</span><span class="n">LIST_CLEAN</span><span class="p">].</span><span class="n">prev</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">dm_buffer</span><span class="p">,</span> <span class="n">lru_list</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">__cleanup_old_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">max_age</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">))</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+		<span class="p">}</span>
+
+		<span class="n">dm_bufio_unlock</span><span class="p">(</span><span class="n">c</span><span class="p">);</span>
+		<span class="n">dm_bufio_cond_resched</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">workqueue_struct</span> <span class="o">*</span><span class="n">dm_bufio_wq</span><span class="p">;</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">delayed_work</span> <span class="n">dm_bufio_work</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">work_fn</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">w</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">cleanup_old_buffers</span><span class="p">();</span>
+
+	<span class="n">queue_delayed_work</span><span class="p">(</span><span class="n">dm_bufio_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dm_bufio_work</span><span class="p">,</span>
+			   <span class="n">DM_BUFIO_WORK_TIMER_SECS</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Module setup</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is called only once for the whole dm_bufio module.</span>
+<span class="cm"> * It initializes memory limit.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">dm_bufio_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__u64</span> <span class="n">mem</span><span class="p">;</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_caches</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span> <span class="n">dm_bufio_caches</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_cache_names</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span> <span class="n">dm_bufio_cache_names</span><span class="p">);</span>
+
+	<span class="n">mem</span> <span class="o">=</span> <span class="p">(</span><span class="n">__u64</span><span class="p">)((</span><span class="n">totalram_pages</span> <span class="o">-</span> <span class="n">totalhigh_pages</span><span class="p">)</span> <span class="o">*</span>
+		      <span class="n">DM_BUFIO_MEMORY_PERCENT</span> <span class="o">/</span> <span class="mi">100</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mem</span> <span class="o">&gt;</span> <span class="n">ULONG_MAX</span><span class="p">)</span>
+		<span class="n">mem</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_MMU</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Get the size of vmalloc space the same way as VMALLOC_TOTAL</span>
+<span class="cm">	 * in fs/proc/internal.h</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mem</span> <span class="o">&gt;</span> <span class="p">(</span><span class="n">VMALLOC_END</span> <span class="o">-</span> <span class="n">VMALLOC_START</span><span class="p">)</span> <span class="o">*</span> <span class="n">DM_BUFIO_VMALLOC_PERCENT</span> <span class="o">/</span> <span class="mi">100</span><span class="p">)</span>
+		<span class="n">mem</span> <span class="o">=</span> <span class="p">(</span><span class="n">VMALLOC_END</span> <span class="o">-</span> <span class="n">VMALLOC_START</span><span class="p">)</span> <span class="o">*</span> <span class="n">DM_BUFIO_VMALLOC_PERCENT</span> <span class="o">/</span> <span class="mi">100</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="n">dm_bufio_default_cache_size</span> <span class="o">=</span> <span class="n">mem</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+	<span class="n">__cache_size_refresh</span><span class="p">();</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_clients_lock</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_wq</span> <span class="o">=</span> <span class="n">create_singlethread_workqueue</span><span class="p">(</span><span class="s">&quot;dm_bufio_cache&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dm_bufio_wq</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">INIT_DELAYED_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_work</span><span class="p">,</span> <span class="n">work_fn</span><span class="p">);</span>
+	<span class="n">queue_delayed_work</span><span class="p">(</span><span class="n">dm_bufio_wq</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dm_bufio_work</span><span class="p">,</span>
+			   <span class="n">DM_BUFIO_WORK_TIMER_SECS</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is called once when unloading the dm_bufio module.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">dm_bufio_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">bug</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">cancel_delayed_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dm_bufio_work</span><span class="p">);</span>
+	<span class="n">destroy_workqueue</span><span class="p">(</span><span class="n">dm_bufio_wq</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">dm_bufio_caches</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">kc</span> <span class="o">=</span> <span class="n">dm_bufio_caches</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">kc</span><span class="p">)</span>
+			<span class="n">kmem_cache_destroy</span><span class="p">(</span><span class="n">kc</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">dm_bufio_cache_names</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">dm_bufio_cache_names</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_client_count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMCRIT</span><span class="p">(</span><span class="s">&quot;%s: dm_bufio_client_count leaked: %d&quot;</span><span class="p">,</span>
+			<span class="n">__func__</span><span class="p">,</span> <span class="n">dm_bufio_client_count</span><span class="p">);</span>
+		<span class="n">bug</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_current_allocated</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMCRIT</span><span class="p">(</span><span class="s">&quot;%s: dm_bufio_current_allocated leaked: %lu&quot;</span><span class="p">,</span>
+			<span class="n">__func__</span><span class="p">,</span> <span class="n">dm_bufio_current_allocated</span><span class="p">);</span>
+		<span class="n">bug</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_allocated_get_free_pages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMCRIT</span><span class="p">(</span><span class="s">&quot;%s: dm_bufio_allocated_get_free_pages leaked: %lu&quot;</span><span class="p">,</span>
+		       <span class="n">__func__</span><span class="p">,</span> <span class="n">dm_bufio_allocated_get_free_pages</span><span class="p">);</span>
+		<span class="n">bug</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dm_bufio_allocated_vmalloc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">DMCRIT</span><span class="p">(</span><span class="s">&quot;%s: dm_bufio_vmalloc leaked: %lu&quot;</span><span class="p">,</span>
+		       <span class="n">__func__</span><span class="p">,</span> <span class="n">dm_bufio_allocated_vmalloc</span><span class="p">);</span>
+		<span class="n">bug</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bug</span><span class="p">)</span>
+		<span class="n">BUG</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">dm_bufio_init</span><span class="p">)</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">dm_bufio_exit</span><span class="p">)</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">max_cache_size_bytes</span><span class="p">,</span> <span class="n">dm_bufio_cache_size</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">max_cache_size_bytes</span><span class="p">,</span> <span class="s">&quot;Size of metadata cache&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">max_age_seconds</span><span class="p">,</span> <span class="n">dm_bufio_max_age</span><span class="p">,</span> <span class="n">uint</span><span class="p">,</span> <span class="n">S_IRUGO</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">max_age_seconds</span><span class="p">,</span> <span class="s">&quot;Max age of a buffer in seconds&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">peak_allocated_bytes</span><span class="p">,</span> <span class="n">dm_bufio_peak_allocated</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span> <span class="o">|</span> <span class="n">S_IWUSR</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">peak_allocated_bytes</span><span class="p">,</span> <span class="s">&quot;Tracks the maximum allocated memory&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">allocated_kmem_cache_bytes</span><span class="p">,</span> <span class="n">dm_bufio_allocated_kmem_cache</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">allocated_kmem_cache_bytes</span><span class="p">,</span> <span class="s">&quot;Memory allocated with kmem_cache_alloc&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">allocated_get_free_pages_bytes</span><span class="p">,</span> <span class="n">dm_bufio_allocated_get_free_pages</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">allocated_get_free_pages_bytes</span><span class="p">,</span> <span class="s">&quot;Memory allocated with get_free_pages&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">allocated_vmalloc_bytes</span><span class="p">,</span> <span class="n">dm_bufio_allocated_vmalloc</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">allocated_vmalloc_bytes</span><span class="p">,</span> <span class="s">&quot;Memory allocated with vmalloc&quot;</span><span class="p">);</span>
+
+<span class="n">module_param_named</span><span class="p">(</span><span class="n">current_allocated_bytes</span><span class="p">,</span> <span class="n">dm_bufio_current_allocated</span><span class="p">,</span> <span class="n">ulong</span><span class="p">,</span> <span class="n">S_IRUGO</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">current_allocated_bytes</span><span class="p">,</span> <span class="s">&quot;Memory currently used by the cache&quot;</span><span class="p">);</span>
+
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Mikulas Patocka &lt;dm-devel@redhat.com&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="n">DM_NAME</span> <span class="s">&quot; buffered I/O library&quot;</span><span class="p">);</span>
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,1698 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » kernel › events › uprobes.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>uprobes.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * User-space Probes (UProbes)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify</span>
+<span class="cm"> * it under the terms of the GNU General Public License as published by</span>
+<span class="cm"> * the Free Software Foundation; either version 2 of the License, or</span>
+<span class="cm"> * (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</span>
+<span class="cm"> * GNU General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License</span>
+<span class="cm"> * along with this program; if not, write to the Free Software</span>
+<span class="cm"> * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) IBM Corporation, 2008-2012</span>
+<span class="cm"> * Authors:</span>
+<span class="cm"> *	Srikar Dronamraju</span>
+<span class="cm"> *	Jim Keniston</span>
+<span class="cm"> * Copyright (C) 2011-2012 Red Hat, Inc., Peter Zijlstra &lt;pzijlstr@redhat.com&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/highmem.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;	</span><span class="cm">/* read_mapping_page */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/rmap.h&gt;		</span><span class="cm">/* anon_vma_prepare */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/mmu_notifier.h&gt;	</span><span class="cm">/* set_pte_at_notify */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/swap.h&gt;		</span><span class="cm">/* try_to_free_swap */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/ptrace.h&gt;	</span><span class="cm">/* user_enable_single_step */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/kdebug.h&gt;	</span><span class="cm">/* notifier mechanism */</span><span class="cp"></span>
+
+<span class="cp">#include &lt;linux/uprobes.h&gt;</span>
+
+<span class="cp">#define UINSNS_PER_PAGE			(PAGE_SIZE/UPROBE_XOL_SLOT_BYTES)</span>
+<span class="cp">#define MAX_UPROBE_XOL_SLOTS		UINSNS_PER_PAGE</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">srcu_struct</span> <span class="n">uprobes_srcu</span><span class="p">;</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">rb_root</span> <span class="n">uprobes_tree</span> <span class="o">=</span> <span class="n">RB_ROOT</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">uprobes_treelock</span><span class="p">);</span>	<span class="cm">/* serialize rbtree access */</span>
+
+<span class="cp">#define UPROBES_HASH_SZ	13</span>
+
+<span class="cm">/* serialize (un)register */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">mutex</span> <span class="n">uprobes_mutex</span><span class="p">[</span><span class="n">UPROBES_HASH_SZ</span><span class="p">];</span>
+
+<span class="cp">#define uprobes_hash(v)		(&amp;uprobes_mutex[((unsigned long)(v)) % UPROBES_HASH_SZ])</span>
+
+<span class="cm">/* serialize uprobe-&gt;pending_list */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">mutex</span> <span class="n">uprobes_mmap_mutex</span><span class="p">[</span><span class="n">UPROBES_HASH_SZ</span><span class="p">];</span>
+<span class="cp">#define uprobes_mmap_hash(v)	(&amp;uprobes_mmap_mutex[((unsigned long)(v)) % UPROBES_HASH_SZ])</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_events allows us to skip the uprobe_mmap if there are no uprobe</span>
+<span class="cm"> * events active at this time.  Probably a fine grained per inode count is</span>
+<span class="cm"> * better?</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">uprobe_events</span> <span class="o">=</span> <span class="n">ATOMIC_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Maintain a temporary per vma info that can be used to search if a vma</span>
+<span class="cm"> * has already been handled. This structure is introduced since extending</span>
+<span class="cm"> * vm_area_struct wasnt recommended.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">vma_info</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">probe_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span>	<span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="n">loff_t</span>			<span class="n">vaddr</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">uprobe</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_node</span>		<span class="n">rb_node</span><span class="p">;</span>	<span class="cm">/* node in the rb tree */</span>
+	<span class="n">atomic_t</span>		<span class="n">ref</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rw_semaphore</span>	<span class="n">consumer_rwsem</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">pending_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe_consumer</span>	<span class="o">*</span><span class="n">consumers</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span>		<span class="o">*</span><span class="n">inode</span><span class="p">;</span>		<span class="cm">/* Also hold a ref to inode */</span>
+	<span class="n">loff_t</span>			<span class="n">offset</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">arch_uprobe</span>	<span class="n">arch</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * valid_vma: Verify if the specified vma is an executable vma</span>
+<span class="cm"> * Relax restrictions while unregistering: vm_flags might have</span>
+<span class="cm"> * changed after breakpoint was inserted.</span>
+<span class="cm"> *	- is_register: indicates if we are in register context.</span>
+<span class="cm"> *	- Return 1 if the specified virtual address is in an</span>
+<span class="cm"> *	  executable vma.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">valid_vma</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="n">bool</span> <span class="n">is_register</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">is_register</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">VM_READ</span><span class="o">|</span><span class="n">VM_WRITE</span><span class="o">|</span><span class="n">VM_EXEC</span><span class="o">|</span><span class="n">VM_SHARED</span><span class="p">))</span> <span class="o">==</span> <span class="p">(</span><span class="n">VM_READ</span><span class="o">|</span><span class="n">VM_EXEC</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">loff_t</span> <span class="nf">vma_address</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="n">vaddr</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span> <span class="o">+</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">vaddr</span> <span class="o">-=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_pgoff</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">vaddr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * __replace_page - replace page in vma by new page.</span>
+<span class="cm"> * based on replace_page in mm/ksm.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * @vma:      vma that holds the pte pointing to page</span>
+<span class="cm"> * @page:     the cowed page we are replacing by kpage</span>
+<span class="cm"> * @kpage:    the modified page we replace page by</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, -EFAULT on failure.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__replace_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">kpage</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">;</span>
+	<span class="n">pgd_t</span> <span class="o">*</span><span class="n">pgd</span><span class="p">;</span>
+	<span class="n">pud_t</span> <span class="o">*</span><span class="n">pud</span><span class="p">;</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmd</span><span class="p">;</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">ptep</span><span class="p">;</span>
+	<span class="n">spinlock_t</span> <span class="o">*</span><span class="n">ptl</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+	<span class="n">addr</span> <span class="o">=</span> <span class="n">page_address_in_vma</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">vma</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">addr</span> <span class="o">==</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">pgd</span> <span class="o">=</span> <span class="n">pgd_offset</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pgd_present</span><span class="p">(</span><span class="o">*</span><span class="n">pgd</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">pud</span> <span class="o">=</span> <span class="n">pud_offset</span><span class="p">(</span><span class="n">pgd</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pud_present</span><span class="p">(</span><span class="o">*</span><span class="n">pud</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">pmd</span> <span class="o">=</span> <span class="n">pmd_offset</span><span class="p">(</span><span class="n">pud</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pmd_present</span><span class="p">(</span><span class="o">*</span><span class="n">pmd</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">ptep</span> <span class="o">=</span> <span class="n">pte_offset_map_lock</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">pmd</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ptl</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ptep</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">get_page</span><span class="p">(</span><span class="n">kpage</span><span class="p">);</span>
+	<span class="n">page_add_new_anon_rmap</span><span class="p">(</span><span class="n">kpage</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageAnon</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dec_mm_counter</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">MM_FILEPAGES</span><span class="p">);</span>
+		<span class="n">inc_mm_counter</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">MM_ANONPAGES</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">flush_cache_page</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">pte_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">ptep</span><span class="p">));</span>
+	<span class="n">ptep_clear_flush</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">ptep</span><span class="p">);</span>
+	<span class="n">set_pte_at_notify</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">ptep</span><span class="p">,</span> <span class="n">mk_pte</span><span class="p">(</span><span class="n">kpage</span><span class="p">,</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_page_prot</span><span class="p">));</span>
+
+	<span class="n">page_remove_rmap</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page_mapped</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="n">try_to_free_swap</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">pte_unmap_unlock</span><span class="p">(</span><span class="n">ptep</span><span class="p">,</span> <span class="n">ptl</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * is_swbp_insn - check if instruction is breakpoint instruction.</span>
+<span class="cm"> * @insn: instruction to be checked.</span>
+<span class="cm"> * Default implementation of is_swbp_insn</span>
+<span class="cm"> * Returns true if @insn is a breakpoint instruction.</span>
+<span class="cm"> */</span>
+<span class="n">bool</span> <span class="n">__weak</span> <span class="nf">is_swbp_insn</span><span class="p">(</span><span class="n">uprobe_opcode_t</span> <span class="o">*</span><span class="n">insn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">*</span><span class="n">insn</span> <span class="o">==</span> <span class="n">UPROBE_SWBP_INSN</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * NOTE:</span>
+<span class="cm"> * Expect the breakpoint instruction to be the smallest size instruction for</span>
+<span class="cm"> * the architecture. If an arch has variable length instruction and the</span>
+<span class="cm"> * breakpoint instruction is not of the smallest length instruction</span>
+<span class="cm"> * supported by that architecture then we need to modify read_opcode /</span>
+<span class="cm"> * write_opcode accordingly. This would never be a problem for archs that</span>
+<span class="cm"> * have fixed length instructions.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * write_opcode - write the opcode at a given virtual address.</span>
+<span class="cm"> * @auprobe: arch breakpointing information.</span>
+<span class="cm"> * @mm: the probed process address space.</span>
+<span class="cm"> * @vaddr: the virtual address to store the opcode.</span>
+<span class="cm"> * @opcode: opcode to be written at @vaddr.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Called with mm-&gt;mmap_sem held (for read and with a reference to</span>
+<span class="cm"> * mm).</span>
+<span class="cm"> *</span>
+<span class="cm"> * For mm @mm, write the opcode at @vaddr.</span>
+<span class="cm"> * Return 0 (success) or a negative errno.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">write_opcode</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_uprobe</span> <span class="o">*</span><span class="n">auprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">uprobe_opcode_t</span> <span class="n">opcode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">old_page</span><span class="p">,</span> <span class="o">*</span><span class="n">new_page</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">vaddr_old</span><span class="p">,</span> <span class="o">*</span><span class="n">vaddr_new</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">addr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="cm">/* Read the page with vaddr into memory */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">get_user_pages</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">old_page</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">vma</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We are interested in text pages only. Our pages of interest</span>
+<span class="cm">	 * should be mapped for read and execute only. We desist from</span>
+<span class="cm">	 * adding probes in write mapped pages since the breakpoints</span>
+<span class="cm">	 * might end up in the file copy.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">is_swbp_insn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">opcode</span><span class="p">)))</span>
+		<span class="k">goto</span> <span class="n">put_out</span><span class="p">;</span>
+
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">auprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span><span class="p">,</span> <span class="n">arch</span><span class="p">);</span>
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mapping</span> <span class="o">!=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">put_out</span><span class="p">;</span>
+
+	<span class="n">addr</span> <span class="o">=</span> <span class="n">vma_address</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">!=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">addr</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">put_out</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="n">new_page</span> <span class="o">=</span> <span class="n">alloc_page_vma</span><span class="p">(</span><span class="n">GFP_HIGHUSER_MOVABLE</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">new_page</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">put_out</span><span class="p">;</span>
+
+	<span class="n">__SetPageUptodate</span><span class="p">(</span><span class="n">new_page</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * lock page will serialize against do_wp_page()&#39;s</span>
+<span class="cm">	 * PageAnon() handling</span>
+<span class="cm">	 */</span>
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">old_page</span><span class="p">);</span>
+	<span class="cm">/* copy the page now that we&#39;ve got it stable */</span>
+	<span class="n">vaddr_old</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">old_page</span><span class="p">);</span>
+	<span class="n">vaddr_new</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">new_page</span><span class="p">);</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">vaddr_new</span><span class="p">,</span> <span class="n">vaddr_old</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+
+	<span class="cm">/* poke the new insn in, ASSUMES we don&#39;t cross page boundary */</span>
+	<span class="n">vaddr</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">UPROBE_SWBP_INSN_SIZE</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">vaddr_new</span> <span class="o">+</span> <span class="n">vaddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">opcode</span><span class="p">,</span> <span class="n">UPROBE_SWBP_INSN_SIZE</span><span class="p">);</span>
+
+	<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">vaddr_new</span><span class="p">);</span>
+	<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">vaddr_old</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">anon_vma_prepare</span><span class="p">(</span><span class="n">vma</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">unlock_out</span><span class="p">;</span>
+
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">new_page</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">__replace_page</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">old_page</span><span class="p">,</span> <span class="n">new_page</span><span class="p">);</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">new_page</span><span class="p">);</span>
+
+<span class="nl">unlock_out:</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">old_page</span><span class="p">);</span>
+	<span class="n">page_cache_release</span><span class="p">(</span><span class="n">new_page</span><span class="p">);</span>
+
+<span class="nl">put_out:</span>
+	<span class="n">put_page</span><span class="p">(</span><span class="n">old_page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * read_opcode - read the opcode at a given virtual address.</span>
+<span class="cm"> * @mm: the probed process address space.</span>
+<span class="cm"> * @vaddr: the virtual address to read the opcode.</span>
+<span class="cm"> * @opcode: location to store the read opcode.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Called with mm-&gt;mmap_sem held (for read and with a reference to</span>
+<span class="cm"> * mm.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For mm @mm, read the opcode at @vaddr and store it in @opcode.</span>
+<span class="cm"> * Return 0 (success) or a negative errno.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">read_opcode</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">uprobe_opcode_t</span> <span class="o">*</span><span class="n">opcode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">vaddr_new</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">get_user_pages</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">page</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">vaddr_new</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">vaddr</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">opcode</span><span class="p">,</span> <span class="n">vaddr_new</span> <span class="o">+</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">UPROBE_SWBP_INSN_SIZE</span><span class="p">);</span>
+	<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">vaddr_new</span><span class="p">);</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">is_swbp_at_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">uprobe_opcode_t</span> <span class="n">opcode</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">read_opcode</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">opcode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_swbp_insn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">opcode</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * set_swbp - store breakpoint at a given address.</span>
+<span class="cm"> * @auprobe: arch specific probepoint information.</span>
+<span class="cm"> * @mm: the probed process address space.</span>
+<span class="cm"> * @vaddr: the virtual address to insert the opcode.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For mm @mm, store the breakpoint instruction at @vaddr.</span>
+<span class="cm"> * Return 0 (success) or a negative errno.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="n">__weak</span> <span class="nf">set_swbp</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_uprobe</span> <span class="o">*</span><span class="n">auprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">is_swbp_at_addr</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">write_opcode</span><span class="p">(</span><span class="n">auprobe</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">UPROBE_SWBP_INSN</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * set_orig_insn - Restore the original instruction.</span>
+<span class="cm"> * @mm: the probed process address space.</span>
+<span class="cm"> * @auprobe: arch specific probepoint information.</span>
+<span class="cm"> * @vaddr: the virtual address to insert the opcode.</span>
+<span class="cm"> * @verify: if true, verify existance of breakpoint instruction.</span>
+<span class="cm"> *</span>
+<span class="cm"> * For mm @mm, restore the original opcode (opcode) at @vaddr.</span>
+<span class="cm"> * Return 0 (success) or a negative errno.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="n">__weak</span>
+<span class="nf">set_orig_insn</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_uprobe</span> <span class="o">*</span><span class="n">auprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">bool</span> <span class="n">verify</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">verify</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+		<span class="n">result</span> <span class="o">=</span> <span class="n">is_swbp_at_addr</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">result</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">write_opcode</span><span class="p">(</span><span class="n">auprobe</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">uprobe_opcode_t</span> <span class="o">*</span><span class="p">)</span><span class="n">auprobe</span><span class="o">-&gt;</span><span class="n">insn</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">match_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">l</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">r</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">&lt;</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">inode</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">&gt;</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">inode</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">&lt;</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">&gt;</span> <span class="n">r</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="nf">__find_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="n">u</span> <span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">,</span> <span class="p">.</span><span class="n">offset</span> <span class="o">=</span> <span class="n">offset</span> <span class="p">};</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">n</span> <span class="o">=</span> <span class="n">uprobes_tree</span><span class="p">.</span><span class="n">rb_node</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">match</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">uprobe</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span><span class="p">,</span> <span class="n">rb_node</span><span class="p">);</span>
+		<span class="n">match</span> <span class="o">=</span> <span class="n">match_uprobe</span><span class="p">(</span><span class="o">&amp;</span><span class="n">u</span><span class="p">,</span> <span class="n">uprobe</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">match</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">ref</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">uprobe</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">match</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">n</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">n</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find a uprobe corresponding to a given inode:offset</span>
+<span class="cm"> * Acquires uprobes_treelock</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="nf">find_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">__find_uprobe</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">uprobe</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="nf">__insert_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">**</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">uprobes_tree</span><span class="p">.</span><span class="n">rb_node</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">u</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">match</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">parent</span> <span class="o">=</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+		<span class="n">u</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span><span class="p">,</span> <span class="n">rb_node</span><span class="p">);</span>
+		<span class="n">match</span> <span class="o">=</span> <span class="n">match_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">u</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">match</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">ref</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">u</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">match</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">parent</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+
+	<span class="p">}</span>
+
+	<span class="n">u</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">rb_link_node</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="n">parent</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+	<span class="n">rb_insert_color</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uprobes_tree</span><span class="p">);</span>
+	<span class="cm">/* get access + creation ref */</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">ref</span><span class="p">,</span> <span class="mi">2</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">u</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Acquire uprobes_treelock.</span>
+<span class="cm"> * Matching uprobe already exists in rbtree;</span>
+<span class="cm"> *	increment (access refcount) and return the matching uprobe.</span>
+<span class="cm"> *</span>
+<span class="cm"> * No matching uprobe; insert the uprobe in rb_tree;</span>
+<span class="cm"> *	get a double refcount (access + creation) and return NULL.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="nf">insert_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">u</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">u</span> <span class="o">=</span> <span class="n">__insert_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* For now assume that the instruction need not be single-stepped */</span>
+	<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">UPROBE_SKIP_SSTEP</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">u</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">put_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">ref</span><span class="p">))</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="nf">alloc_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="o">*</span><span class="n">cur_uprobe</span><span class="p">;</span>
+
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uprobe</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">=</span> <span class="n">igrab</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">init_rwsem</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">pending_list</span><span class="p">);</span>
+
+	<span class="cm">/* add to uprobes_tree, sorted on inode:offset */</span>
+	<span class="n">cur_uprobe</span> <span class="o">=</span> <span class="n">insert_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+
+	<span class="cm">/* a uprobe exists for this inode:offset combination */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cur_uprobe</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+		<span class="n">uprobe</span> <span class="o">=</span> <span class="n">cur_uprobe</span><span class="p">;</span>
+		<span class="n">iput</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe_events</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">uprobe</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">handler_chain</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span><span class="n">uc</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UPROBE_RUN_HANDLER</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">uc</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span><span class="p">;</span> <span class="n">uc</span><span class="p">;</span> <span class="n">uc</span> <span class="o">=</span> <span class="n">uc</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uc</span><span class="o">-&gt;</span><span class="n">filter</span> <span class="o">||</span> <span class="n">uc</span><span class="o">-&gt;</span><span class="n">filter</span><span class="p">(</span><span class="n">uc</span><span class="p">,</span> <span class="n">current</span><span class="p">))</span>
+			<span class="n">uc</span><span class="o">-&gt;</span><span class="n">handler</span><span class="p">(</span><span class="n">uc</span><span class="p">,</span> <span class="n">regs</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Returns the previous consumer */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span>
+<span class="nf">consumer_add</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span><span class="n">uc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+	<span class="n">uc</span><span class="o">-&gt;</span><span class="n">next</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span><span class="p">;</span>
+	<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span> <span class="o">=</span> <span class="n">uc</span><span class="p">;</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">uc</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * For uprobe @uprobe, delete the consumer @uc.</span>
+<span class="cm"> * Return true if the @uc is deleted successfully</span>
+<span class="cm"> * or return false.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">consumer_del</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span><span class="n">uc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">**</span><span class="n">con</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">ret</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">con</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span><span class="p">;</span> <span class="o">*</span><span class="n">con</span><span class="p">;</span> <span class="n">con</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="o">*</span><span class="n">con</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">con</span> <span class="o">==</span> <span class="n">uc</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">con</span> <span class="o">=</span> <span class="n">uc</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumer_rwsem</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">__copy_insn</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">insn</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nbytes</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">off1</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">idx</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">filp</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">idx</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)(</span><span class="n">offset</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">);</span>
+	<span class="n">off1</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ensure that the page that has the original instruction is</span>
+<span class="cm">	 * populated and in page-cache.</span>
+<span class="cm">	 */</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">read_mapping_page</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="n">filp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">vaddr</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">insn</span><span class="p">,</span> <span class="n">vaddr</span> <span class="o">+</span> <span class="n">off1</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">);</span>
+	<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">vaddr</span><span class="p">);</span>
+	<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">copy_insn</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nbytes</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">bytes</span><span class="p">;</span>
+
+	<span class="n">addr</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">nbytes</span> <span class="o">=</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">addr</span><span class="p">;</span>
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">;</span>
+
+	<span class="cm">/* Instruction at end of binary; copy only available bytes */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">MAX_UINSN_BYTES</span> <span class="o">&gt;</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span>
+		<span class="n">bytes</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span> <span class="o">-</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">bytes</span> <span class="o">=</span> <span class="n">MAX_UINSN_BYTES</span><span class="p">;</span>
+
+	<span class="cm">/* Instruction at the page-boundary; copy bytes in second page */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nbytes</span> <span class="o">&lt;</span> <span class="n">bytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">__copy_insn</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">.</span><span class="n">insn</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">,</span>
+				<span class="n">bytes</span> <span class="o">-</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+		<span class="n">bytes</span> <span class="o">=</span> <span class="n">nbytes</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">__copy_insn</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">.</span><span class="n">insn</span><span class="p">,</span> <span class="n">bytes</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * How mm-&gt;uprobes_state.count gets updated</span>
+<span class="cm"> * uprobe_mmap() increments the count if</span>
+<span class="cm"> * 	- it successfully adds a breakpoint.</span>
+<span class="cm"> * 	- it cannot add a breakpoint, but sees that there is a underlying</span>
+<span class="cm"> * 	  breakpoint (via a is_swbp_at_addr()).</span>
+<span class="cm"> *</span>
+<span class="cm"> * uprobe_munmap() decrements the count if</span>
+<span class="cm"> * 	- it sees a underlying breakpoint, (via is_swbp_at_addr)</span>
+<span class="cm"> * 	  (Subsequent uprobe_unregister wouldnt find the breakpoint</span>
+<span class="cm"> * 	  unless a uprobe_mmap kicks in, since the old vma would be</span>
+<span class="cm"> * 	  dropped just after uprobe_munmap.)</span>
+<span class="cm"> *</span>
+<span class="cm"> * uprobe_register increments the count if:</span>
+<span class="cm"> * 	- it successfully adds a breakpoint.</span>
+<span class="cm"> *</span>
+<span class="cm"> * uprobe_unregister decrements the count if:</span>
+<span class="cm"> * 	- it sees a underlying breakpoint and removes successfully.</span>
+<span class="cm"> * 	  (via is_swbp_at_addr)</span>
+<span class="cm"> * 	  (Subsequent uprobe_munmap wouldnt find the breakpoint</span>
+<span class="cm"> * 	  since there is no underlying breakpoint after the</span>
+<span class="cm"> * 	  breakpoint removal.)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">install_breakpoint</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If probe is being deleted, unregister thread could be done with</span>
+<span class="cm">	 * the vma-rmap-walk through. Adding a probe now can be fatal since</span>
+<span class="cm">	 * nobody will be able to cleanup. Also we could be from fork or</span>
+<span class="cm">	 * mremap path, where the probe might have already been inserted.</span>
+<span class="cm">	 * Hence behave as if probe already existed.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+	<span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UPROBE_COPY_INSN</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">copy_insn</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_swbp_insn</span><span class="p">((</span><span class="n">uprobe_opcode_t</span> <span class="o">*</span><span class="p">)</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">.</span><span class="n">insn</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">arch_uprobe_analyze_insn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">mm</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">UPROBE_COPY_INSN</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ideally, should be updating the probe count after the breakpoint</span>
+<span class="cm">	 * has been successfully inserted. However a thread could hit the</span>
+<span class="cm">	 * breakpoint we just inserted even before the probe count is</span>
+<span class="cm">	 * incremented. If this is the first breakpoint placed, breakpoint</span>
+<span class="cm">	 * notifier might ignore uprobes and pass the trap to the thread.</span>
+<span class="cm">	 * Hence increment before and decrement on failure.</span>
+<span class="cm">	 */</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">set_swbp</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">remove_breakpoint</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">set_orig_insn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">vaddr</span><span class="p">,</span> <span class="nb">true</span><span class="p">))</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * There could be threads that have hit the breakpoint and are entering the</span>
+<span class="cm"> * notifier code and trying to acquire the uprobes_treelock. The thread</span>
+<span class="cm"> * calling delete_uprobe() that is removing the uprobe from the rb_tree can</span>
+<span class="cm"> * race with these threads and might acquire the uprobes_treelock compared</span>
+<span class="cm"> * to some of the breakpoint hit threads. In such a case, the breakpoint</span>
+<span class="cm"> * hit threads will not find the uprobe. The current unregistering thread</span>
+<span class="cm"> * waits till all other threads have hit a breakpoint, to acquire the</span>
+<span class="cm"> * uprobes_treelock before the uprobe is removed from the rbtree.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">delete_uprobe</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">synchronize_srcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_srcu</span><span class="p">);</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">rb_erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">uprobes_tree</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">iput</span><span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe_events</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span>
+<span class="nf">__find_next_vma_info</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span><span class="n">vi</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="n">bool</span> <span class="n">is_register</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">prio_tree_iter</span> <span class="n">iter</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span><span class="n">tmpvi</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pgoff</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">existing_vma</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="n">pgoff</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">vma_prio_tree_foreach</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iter</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap</span><span class="p">,</span> <span class="n">pgoff</span><span class="p">,</span> <span class="n">pgoff</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">is_register</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">existing_vma</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">vaddr</span> <span class="o">=</span> <span class="n">vma_address</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">tmpvi</span><span class="p">,</span> <span class="n">head</span><span class="p">,</span> <span class="n">probe_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">tmpvi</span><span class="o">-&gt;</span><span class="n">mm</span> <span class="o">==</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span> <span class="o">&amp;&amp;</span> <span class="n">tmpvi</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">==</span> <span class="n">vaddr</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">existing_vma</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Another vma needs a probe to be installed. However skip</span>
+<span class="cm">		 * installing the probe if the vma is about to be unlinked.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">existing_vma</span> <span class="o">&amp;&amp;</span> <span class="n">atomic_inc_not_zero</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="o">-&gt;</span><span class="n">mm_users</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">vi</span><span class="o">-&gt;</span><span class="n">mm</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">;</span>
+			<span class="n">vi</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">=</span> <span class="n">vaddr</span><span class="p">;</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vi</span><span class="o">-&gt;</span><span class="n">probe_list</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+
+			<span class="k">return</span> <span class="n">vi</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Iterate in the rmap prio tree  and find a vma where a probe has not</span>
+<span class="cm"> * yet been inserted.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span>
+<span class="nf">find_next_vma_info</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">,</span>
+		<span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="n">bool</span> <span class="n">is_register</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span><span class="n">vi</span><span class="p">,</span> <span class="o">*</span><span class="n">retvi</span><span class="p">;</span>
+
+	<span class="n">vi</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">vma_info</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">vi</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap_mutex</span><span class="p">);</span>
+	<span class="n">retvi</span> <span class="o">=</span> <span class="n">__find_next_vma_info</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">head</span><span class="p">,</span> <span class="n">vi</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">is_register</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap_mutex</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">retvi</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">vi</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">retvi</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">register_for_each_vma</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">bool</span> <span class="n">is_register</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">try_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">vma_info</span> <span class="o">*</span><span class="n">vi</span><span class="p">,</span> <span class="o">*</span><span class="n">tmpvi</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">try_list</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">vi</span> <span class="o">=</span> <span class="n">find_next_vma_info</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">try_list</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">,</span> <span class="n">is_register</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">vi</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">vi</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">vi</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">mm</span> <span class="o">=</span> <span class="n">vi</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">;</span>
+		<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+		<span class="n">vma</span> <span class="o">=</span> <span class="n">find_vma</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">vi</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">vma</span> <span class="o">||</span> <span class="o">!</span><span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">is_register</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vi</span><span class="o">-&gt;</span><span class="n">probe_list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">vi</span><span class="p">);</span>
+			<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+			<span class="n">mmput</span><span class="p">(</span><span class="n">mm</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">vaddr</span> <span class="o">=</span> <span class="n">vma_address</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span> <span class="o">!=</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">||</span>
+						<span class="n">vaddr</span> <span class="o">!=</span> <span class="n">vi</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vi</span><span class="o">-&gt;</span><span class="n">probe_list</span><span class="p">);</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">vi</span><span class="p">);</span>
+			<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+			<span class="n">mmput</span><span class="p">(</span><span class="n">mm</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_register</span><span class="p">)</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">install_breakpoint</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">vi</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">remove_breakpoint</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">vi</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">);</span>
+
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+		<span class="n">mmput</span><span class="p">(</span><span class="n">mm</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_register</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&amp;&amp;</span> <span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">)</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">vi</span><span class="p">,</span> <span class="n">tmpvi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">try_list</span><span class="p">,</span> <span class="n">probe_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vi</span><span class="o">-&gt;</span><span class="n">probe_list</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">vi</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__uprobe_register</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">register_for_each_vma</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__uprobe_unregister</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">register_for_each_vma</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="nb">false</span><span class="p">))</span>
+		<span class="n">delete_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+
+	<span class="cm">/* TODO : cant unregister? schedule a worker thread */</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_register - register a probe</span>
+<span class="cm"> * @inode: the file in which the probe has to be placed.</span>
+<span class="cm"> * @offset: offset from the start of the file.</span>
+<span class="cm"> * @uc: information on howto handle the probe..</span>
+<span class="cm"> *</span>
+<span class="cm"> * Apart from the access refcount, uprobe_register() takes a creation</span>
+<span class="cm"> * refcount (thro alloc_uprobe) if and only if this @uprobe is getting</span>
+<span class="cm"> * inserted into the rbtree (i.e first consumer for a @inode:@offset</span>
+<span class="cm"> * tuple).  Creation refcount stops uprobe_unregister from freeing the</span>
+<span class="cm"> * @uprobe even before the register operation is complete. Creation</span>
+<span class="cm"> * refcount is released when the last @uc for the @uprobe</span>
+<span class="cm"> * unregisters.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return errno if it cannot successully install probes</span>
+<span class="cm"> * else return 0 (success)</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">uprobe_register</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span><span class="n">uc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">inode</span> <span class="o">||</span> <span class="o">!</span><span class="n">uc</span> <span class="o">||</span> <span class="n">uc</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="n">uprobes_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">alloc_uprobe</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">consumer_add</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">uc</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">__uprobe_register</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">__uprobe_unregister</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">UPROBE_RUN_HANDLER</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="n">uprobes_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+	<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_unregister - unregister a already registered probe.</span>
+<span class="cm"> * @inode: the file in which the probe has to be removed.</span>
+<span class="cm"> * @offset: offset from the start of the file.</span>
+<span class="cm"> * @uc: identify which probe if multiple probes are colocated.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_unregister</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe_consumer</span> <span class="o">*</span><span class="n">uc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">inode</span> <span class="o">||</span> <span class="o">!</span><span class="n">uc</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">find_uprobe</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uprobe</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="n">uprobes_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">consumer_del</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">uc</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">consumers</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">__uprobe_unregister</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+			<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">UPROBE_RUN_HANDLER</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="n">uprobes_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="p">)</span>
+		<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Of all the nodes that correspond to the given inode, return the node</span>
+<span class="cm"> * with the least offset.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="nf">find_least_offset_node</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="n">u</span> <span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">,</span> <span class="p">.</span><span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">};</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">n</span> <span class="o">=</span> <span class="n">uprobes_tree</span><span class="p">.</span><span class="n">rb_node</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">close_node</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">match</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">uprobe</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span><span class="p">,</span> <span class="n">rb_node</span><span class="p">);</span>
+		<span class="n">match</span> <span class="o">=</span> <span class="n">match_uprobe</span><span class="p">(</span><span class="o">&amp;</span><span class="n">u</span><span class="p">,</span> <span class="n">uprobe</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">==</span> <span class="n">inode</span><span class="p">)</span>
+			<span class="n">close_node</span> <span class="o">=</span> <span class="n">n</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">match</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">close_node</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">match</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">n</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">n</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">close_node</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * For a given inode, build a list of probes that need to be inserted.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">build_probe_list</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">n</span> <span class="o">=</span> <span class="n">find_least_offset_node</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(;</span> <span class="n">n</span><span class="p">;</span> <span class="n">n</span> <span class="o">=</span> <span class="n">rb_next</span><span class="p">(</span><span class="n">n</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">uprobe</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="k">struct</span> <span class="n">uprobe</span><span class="p">,</span> <span class="n">rb_node</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">inode</span> <span class="o">!=</span> <span class="n">inode</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">pending_list</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">ref</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_treelock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called from mmap_region.</span>
+<span class="cm"> * called with mm-&gt;mmap_sem acquired.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return -ve no if we fail to insert probes and we cannot</span>
+<span class="cm"> * bail-out.</span>
+<span class="cm"> * Return 0 otherwise. i.e:</span>
+<span class="cm"> *</span>
+<span class="cm"> *	- successful insertion of probes</span>
+<span class="cm"> *	- (or) no possible probes to be inserted.</span>
+<span class="cm"> *	- (or) insertion of probes failed but we can bail-out.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">uprobe_mmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">tmp_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="o">*</span><span class="n">u</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">,</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe_events</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="nb">true</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">inode</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">inode</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">);</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="n">uprobes_mmap_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+	<span class="n">build_probe_list</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">,</span> <span class="n">pending_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">;</span>
+
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">pending_list</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">vaddr</span> <span class="o">=</span> <span class="n">vma_address</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">&lt;</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span> <span class="o">||</span> <span class="n">vaddr</span> <span class="o">&gt;=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_end</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">install_breakpoint</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+
+			<span class="cm">/* Ignore double add: */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EEXIST</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">is_swbp_at_addr</span><span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">))</span>
+					<span class="k">continue</span><span class="p">;</span>
+
+				<span class="cm">/*</span>
+<span class="cm">				 * Unable to insert a breakpoint, but</span>
+<span class="cm">				 * breakpoint lies underneath. Increment the</span>
+<span class="cm">				 * probe count.</span>
+<span class="cm">				 */</span>
+				<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+				<span class="n">count</span><span class="o">++</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="n">uprobes_mmap_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">atomic_sub</span><span class="p">(</span><span class="n">count</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called in context of a munmap of a vma.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_munmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">start</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">end</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">tmp_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="o">*</span><span class="n">u</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe_events</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="nb">false</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">inode</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">inode</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">);</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="n">uprobes_mmap_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+	<span class="n">build_probe_list</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">);</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmp_list</span><span class="p">,</span> <span class="n">pending_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">loff_t</span> <span class="n">vaddr</span><span class="p">;</span>
+
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">pending_list</span><span class="p">);</span>
+		<span class="n">vaddr</span> <span class="o">=</span> <span class="n">vma_address</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">&gt;=</span> <span class="n">start</span> <span class="o">&amp;&amp;</span> <span class="n">vaddr</span> <span class="o">&lt;</span> <span class="n">end</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * An unregister could have removed the probe before</span>
+<span class="cm">			 * unmap. So check before we decrement the count.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">is_swbp_at_addr</span><span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+				<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="n">uprobes_mmap_hash</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="cm">/* Slot allocation for XOL */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xol_add_vma</span><span class="p">(</span><span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span> <span class="o">=</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_HIGHUSER</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EALREADY</span><span class="p">;</span>
+	<span class="n">mm</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="cm">/* Try to map as high as possible, this is only a hint. */</span>
+	<span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">=</span> <span class="n">get_unmapped_area</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">TASK_SIZE</span> <span class="o">-</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">install_special_mapping</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span>
+				<span class="n">VM_EXEC</span><span class="o">|</span><span class="n">VM_MAYEXEC</span><span class="o">|</span><span class="n">VM_DONTCOPY</span><span class="o">|</span><span class="n">VM_IO</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+
+	<span class="n">smp_wmb</span><span class="p">();</span>	<span class="cm">/* pairs with get_xol_area() */</span>
+	<span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span> <span class="o">=</span> <span class="n">area</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">fail:</span>
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">__free_page</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="nf">get_xol_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">;</span>
+
+	<span class="n">area</span> <span class="o">=</span> <span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span><span class="p">;</span>
+	<span class="n">smp_read_barrier_depends</span><span class="p">();</span>	<span class="cm">/* pairs with wmb in xol_add_vma() */</span>
+
+	<span class="k">return</span> <span class="n">area</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * xol_alloc_area - Allocate process&#39;s xol_area.</span>
+<span class="cm"> * This area will be used for storing instructions for execution out of</span>
+<span class="cm"> * line.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns the allocated area or NULL.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="nf">xol_alloc_area</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">;</span>
+
+	<span class="n">area</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">area</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">BITS_TO_LONGS</span><span class="p">(</span><span class="n">UINSNS_PER_PAGE</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">long</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xol_add_vma</span><span class="p">(</span><span class="n">area</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">area</span><span class="p">;</span>
+
+<span class="nl">fail:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">area</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">get_xol_area</span><span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_clear_state - Free the area allocated for slots.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_clear_state</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span> <span class="o">=</span> <span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">put_page</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">area</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_reset_state - Free the area allocated for slots.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_reset_state</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *  - search for a free slot.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">xol_take_insn_slot</span><span class="p">(</span><span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">slot_addr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">slot_nr</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">slot_nr</span> <span class="o">=</span> <span class="n">find_first_zero_bit</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">,</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot_nr</span> <span class="o">&lt;</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_and_set_bit</span><span class="p">(</span><span class="n">slot_nr</span><span class="p">,</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">))</span>
+				<span class="k">break</span><span class="p">;</span>
+
+			<span class="n">slot_nr</span> <span class="o">=</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">wait_event</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">,</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">slot_count</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">slot_nr</span> <span class="o">&gt;=</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">);</span>
+
+	<span class="n">slot_addr</span> <span class="o">=</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">+</span> <span class="p">(</span><span class="n">slot_nr</span> <span class="o">*</span> <span class="n">UPROBE_XOL_SLOT_BYTES</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">slot_count</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">slot_addr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * xol_get_insn_slot - If was not allocated a slot, then</span>
+<span class="cm"> * allocate a slot.</span>
+<span class="cm"> * Returns the allocated slot address or 0.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">xol_get_insn_slot</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">slot_addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="n">area</span> <span class="o">=</span> <span class="n">get_xol_area</span><span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">area</span> <span class="o">=</span> <span class="n">xol_alloc_area</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">area</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span> <span class="o">=</span> <span class="n">xol_take_insn_slot</span><span class="p">(</span><span class="n">area</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Initialize the slot if xol_vaddr points to valid</span>
+<span class="cm">	 * instruction slot.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">=</span> <span class="n">slot_addr</span><span class="p">;</span>
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+	<span class="n">vaddr</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">,</span> <span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">.</span><span class="n">insn</span><span class="p">,</span> <span class="n">MAX_UINSN_BYTES</span><span class="p">);</span>
+	<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">vaddr</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * xol_free_insn_slot - If slot was earlier allocated by</span>
+<span class="cm"> * @xol_get_insn_slot(), make the slot available for</span>
+<span class="cm"> * subsequent requests.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xol_free_insn_slot</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xol_area</span> <span class="o">*</span><span class="n">area</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vma_end</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">slot_addr</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span> <span class="o">||</span> <span class="o">!</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span> <span class="o">||</span> <span class="o">!</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">slot_addr</span> <span class="o">=</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">slot_addr</span> <span class="o">||</span> <span class="n">IS_ERR_VALUE</span><span class="p">(</span><span class="n">slot_addr</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">area</span> <span class="o">=</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">xol_area</span><span class="p">;</span>
+	<span class="n">vma_end</span> <span class="o">=</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">+</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span> <span class="o">&lt;=</span> <span class="n">slot_addr</span> <span class="o">&amp;&amp;</span> <span class="n">slot_addr</span> <span class="o">&lt;</span> <span class="n">vma_end</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">slot_nr</span><span class="p">;</span>
+
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">slot_addr</span> <span class="o">-</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">vaddr</span><span class="p">;</span>
+		<span class="n">slot_nr</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">/</span> <span class="n">UPROBE_XOL_SLOT_BYTES</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot_nr</span> <span class="o">&gt;=</span> <span class="n">UINSNS_PER_PAGE</span><span class="p">)</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="n">clear_bit</span><span class="p">(</span><span class="n">slot_nr</span><span class="p">,</span> <span class="n">area</span><span class="o">-&gt;</span><span class="n">bitmap</span><span class="p">);</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">slot_count</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">waitqueue_active</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">))</span>
+			<span class="n">wake_up</span><span class="p">(</span><span class="o">&amp;</span><span class="n">area</span><span class="o">-&gt;</span><span class="n">wq</span><span class="p">);</span>
+
+		<span class="n">tsk</span><span class="o">-&gt;</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">xol_vaddr</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * uprobe_get_swbp_addr - compute address of swbp given post-swbp regs</span>
+<span class="cm"> * @regs: Reflects the saved state of the task after it has hit a breakpoint</span>
+<span class="cm"> * instruction.</span>
+<span class="cm"> * Return the address of the breakpoint instruction.</span>
+<span class="cm"> */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">__weak</span> <span class="nf">uprobe_get_swbp_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">instruction_pointer</span><span class="p">(</span><span class="n">regs</span><span class="p">)</span> <span class="o">-</span> <span class="n">UPROBE_SWBP_INSN_SIZE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called with no locks held.</span>
+<span class="cm"> * Called in context of a exiting or a exec-ing thread.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_free_utask</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span> <span class="o">=</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="n">srcu_read_unlock_raw</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_srcu</span><span class="p">,</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">utask</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span><span class="p">)</span>
+		<span class="n">put_uprobe</span><span class="p">(</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span><span class="p">);</span>
+
+	<span class="n">xol_free_insn_slot</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">utask</span><span class="p">);</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">utask</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called in context of a new clone/fork from copy_process.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_copy_process</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">utask</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocate a uprobe_task object for the task.</span>
+<span class="cm"> * Called when the thread hits a breakpoint for the first time.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns:</span>
+<span class="cm"> * - pointer to new uprobe_task on success</span>
+<span class="cm"> * - NULL otherwise</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="nf">add_utask</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="n">utask</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span> <span class="o">*</span><span class="n">utask</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">utask</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span> <span class="o">=</span> <span class="n">utask</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">utask</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Prepare to single-step probed instruction out of line. */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">pre_ssout</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">xol_get_insn_slot</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">arch_uprobe_pre_xol</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">regs</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If we are singlestepping, then ensure this thread is not connected to</span>
+<span class="cm"> * non-fatal signals until completion of singlestep.  When xol insn itself</span>
+<span class="cm"> * triggers the signal,  restart the original insn even if the task is</span>
+<span class="cm"> * already SIGKILL&#39;ed (since coredump should report the correct ip).  This</span>
+<span class="cm"> * is even more important if the task has a handler for SIGSEGV/etc, The</span>
+<span class="cm"> * _same_ instruction should be repeated again after return from the signal</span>
+<span class="cm"> * handler, and SSTEP can never finish in this case.</span>
+<span class="cm"> */</span>
+<span class="n">bool</span> <span class="nf">uprobe_deny_signal</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">t</span> <span class="o">=</span> <span class="n">current</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span> <span class="o">=</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="o">!</span><span class="n">utask</span> <span class="o">||</span> <span class="o">!</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">!=</span> <span class="n">UTASK_SSTEP</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">signal_pending</span><span class="p">(</span><span class="n">t</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+		<span class="n">clear_tsk_thread_flag</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">TIF_SIGPENDING</span><span class="p">);</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">__fatal_signal_pending</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="o">||</span> <span class="n">arch_uprobe_xol_was_trapped</span><span class="p">(</span><span class="n">t</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_SSTEP_TRAPPED</span><span class="p">;</span>
+			<span class="n">set_tsk_thread_flag</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">TIF_UPROBE</span><span class="p">);</span>
+			<span class="n">set_tsk_thread_flag</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">TIF_NOTIFY_RESUME</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Avoid singlestepping the original instruction if the original instruction</span>
+<span class="cm"> * is a NOP or can be emulated.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">can_skip_sstep</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">,</span> <span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">arch_uprobe_skip_sstep</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">regs</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">UPROBE_SKIP_SSTEP</span><span class="p">;</span>
+	<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Run handler and ask thread to singlestep.</span>
+<span class="cm"> * Ensure all non-fatal signals cannot interrupt thread while it singlesteps.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">handle_swbp</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">bp_vaddr</span><span class="p">;</span>
+
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">bp_vaddr</span> <span class="o">=</span> <span class="n">uprobe_get_swbp_addr</span><span class="p">(</span><span class="n">regs</span><span class="p">);</span>
+	<span class="n">mm</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">;</span>
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+	<span class="n">vma</span> <span class="o">=</span> <span class="n">find_vma</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">bp_vaddr</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">vma</span> <span class="o">&amp;&amp;</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span> <span class="o">&lt;=</span> <span class="n">bp_vaddr</span> <span class="o">&amp;&amp;</span> <span class="n">valid_vma</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="nb">false</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+		<span class="n">loff_t</span> <span class="n">offset</span><span class="p">;</span>
+
+		<span class="n">inode</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">bp_vaddr</span> <span class="o">-</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_pgoff</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+		<span class="n">uprobe</span> <span class="o">=</span> <span class="n">find_uprobe</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">srcu_read_unlock_raw</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_srcu</span><span class="p">,</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span><span class="p">);</span>
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">mmap_sem</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">uprobe</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* No matching uprobe; signal SIGTRAP. */</span>
+		<span class="n">send_sig</span><span class="p">(</span><span class="n">SIGTRAP</span><span class="p">,</span> <span class="n">current</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">utask</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">utask</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">utask</span> <span class="o">=</span> <span class="n">add_utask</span><span class="p">();</span>
+		<span class="cm">/* Cannot allocate; re-execute the instruction. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">utask</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">cleanup_ret</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span> <span class="o">=</span> <span class="n">uprobe</span><span class="p">;</span>
+	<span class="n">handler_chain</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">regs</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UPROBE_SKIP_SSTEP</span> <span class="o">&amp;&amp;</span> <span class="n">can_skip_sstep</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">regs</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">cleanup_ret</span><span class="p">;</span>
+
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_SSTEP</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pre_ssout</span><span class="p">(</span><span class="n">uprobe</span><span class="p">,</span> <span class="n">regs</span><span class="p">,</span> <span class="n">bp_vaddr</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">user_enable_single_step</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">cleanup_ret:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">utask</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_RUNNING</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">uprobe</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UPROBE_SKIP_SSTEP</span><span class="p">))</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * cannot singlestep; cannot skip instruction;</span>
+<span class="cm">			 * re-execute the instruction.</span>
+<span class="cm">			 */</span>
+			<span class="n">instruction_pointer_set</span><span class="p">(</span><span class="n">regs</span><span class="p">,</span> <span class="n">bp_vaddr</span><span class="p">);</span>
+
+		<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Perform required fix-ups and disable singlestep.</span>
+<span class="cm"> * Allow pending signals to take effect.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">handle_singlestep</span><span class="p">(</span><span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span><span class="p">,</span> <span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe</span> <span class="o">*</span><span class="n">uprobe</span><span class="p">;</span>
+
+	<span class="n">uprobe</span> <span class="o">=</span> <span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">UTASK_SSTEP_ACK</span><span class="p">)</span>
+		<span class="n">arch_uprobe_post_xol</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">regs</span><span class="p">);</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">UTASK_SSTEP_TRAPPED</span><span class="p">)</span>
+		<span class="n">arch_uprobe_abort_xol</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe</span><span class="o">-&gt;</span><span class="n">arch</span><span class="p">,</span> <span class="n">regs</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+	<span class="n">put_uprobe</span><span class="p">(</span><span class="n">uprobe</span><span class="p">);</span>
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_RUNNING</span><span class="p">;</span>
+	<span class="n">user_disable_single_step</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="n">xol_free_insn_slot</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+	<span class="n">recalc_sigpending</span><span class="p">();</span> <span class="cm">/* see uprobe_deny_signal() */</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">sighand</span><span class="o">-&gt;</span><span class="n">siglock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * On breakpoint hit, breakpoint notifier sets the TIF_UPROBE flag.  (and on</span>
+<span class="cm"> * subsequent probe hits on the thread sets the state to UTASK_BP_HIT) and</span>
+<span class="cm"> * allows the thread to return from interrupt.</span>
+<span class="cm"> *</span>
+<span class="cm"> * On singlestep exception, singlestep notifier sets the TIF_UPROBE flag and</span>
+<span class="cm"> * also sets the state to UTASK_SSTEP_ACK and allows the thread to return from</span>
+<span class="cm"> * interrupt.</span>
+<span class="cm"> *</span>
+<span class="cm"> * While returning to userspace, thread notices the TIF_UPROBE flag and calls</span>
+<span class="cm"> * uprobe_notify_resume().</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">uprobe_notify_resume</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="n">utask</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">utask</span> <span class="o">||</span> <span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">==</span> <span class="n">UTASK_BP_HIT</span><span class="p">)</span>
+		<span class="n">handle_swbp</span><span class="p">(</span><span class="n">regs</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">handle_singlestep</span><span class="p">(</span><span class="n">utask</span><span class="p">,</span> <span class="n">regs</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_pre_sstep_notifier gets called from interrupt context as part of</span>
+<span class="cm"> * notifier mechanism. Set TIF_UPROBE flag and indicate breakpoint hit.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">uprobe_pre_sstep_notifier</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span> <span class="o">||</span> <span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="o">-&gt;</span><span class="n">uprobes_state</span><span class="p">.</span><span class="n">count</span><span class="p">))</span>
+		<span class="cm">/* task is currently not uprobed */</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">utask</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">utask</span><span class="p">)</span>
+		<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_BP_HIT</span><span class="p">;</span>
+
+	<span class="n">set_thread_flag</span><span class="p">(</span><span class="n">TIF_UPROBE</span><span class="p">);</span>
+	<span class="n">current</span><span class="o">-&gt;</span><span class="n">uprobe_srcu_id</span> <span class="o">=</span> <span class="n">srcu_read_lock_raw</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_srcu</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * uprobe_post_sstep_notifier gets called in interrupt context as part of notifier</span>
+<span class="cm"> * mechanism. Set TIF_UPROBE flag and indicate completion of singlestep.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">uprobe_post_sstep_notifier</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">uprobe_task</span> <span class="o">*</span><span class="n">utask</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">utask</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span> <span class="o">||</span> <span class="o">!</span><span class="n">utask</span> <span class="o">||</span> <span class="o">!</span><span class="n">utask</span><span class="o">-&gt;</span><span class="n">active_uprobe</span><span class="p">)</span>
+		<span class="cm">/* task is currently not uprobed */</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">utask</span><span class="o">-&gt;</span><span class="n">state</span> <span class="o">=</span> <span class="n">UTASK_SSTEP_ACK</span><span class="p">;</span>
+	<span class="n">set_thread_flag</span><span class="p">(</span><span class="n">TIF_UPROBE</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">notifier_block</span> <span class="n">uprobe_exception_nb</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">notifier_call</span>		<span class="o">=</span> <span class="n">arch_uprobe_exception_notify</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">priority</span>		<span class="o">=</span> <span class="n">INT_MAX</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>	<span class="cm">/* notified after kprobes, kgdb */</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">init_uprobes</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">UPROBES_HASH_SZ</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_mutex</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_mmap_mutex</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+	<span class="p">}</span>
+	<span class="n">init_srcu_struct</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobes_srcu</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">register_die_notifier</span><span class="p">(</span><span class="o">&amp;</span><span class="n">uprobe_exception_nb</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">module_init</span><span class="p">(</span><span class="n">init_uprobes</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">exit_uprobes</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">exit_uprobes</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

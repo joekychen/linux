@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › x86 › mm › tlb.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>tlb.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cp">#include &lt;linux/init.h&gt;</span>
+
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/smp.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/cpu.h&gt;</span>
+
+<span class="cp">#include &lt;asm/tlbflush.h&gt;</span>
+<span class="cp">#include &lt;asm/mmu_context.h&gt;</span>
+<span class="cp">#include &lt;asm/cache.h&gt;</span>
+<span class="cp">#include &lt;asm/apic.h&gt;</span>
+<span class="cp">#include &lt;asm/uv/uv.h&gt;</span>
+
+<span class="n">DEFINE_PER_CPU_SHARED_ALIGNED</span><span class="p">(</span><span class="k">struct</span> <span class="n">tlb_state</span><span class="p">,</span> <span class="n">cpu_tlbstate</span><span class="p">)</span>
+			<span class="o">=</span> <span class="p">{</span> <span class="o">&amp;</span><span class="n">init_mm</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *	Smarter SMP flushing macros.</span>
+<span class="cm"> *		c/o Linus Torvalds.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	These mean you can really definitely utterly forget about</span>
+<span class="cm"> *	writing to user space from interrupts. (Its not allowed anyway).</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Optimizations Manfred Spraul &lt;manfred@colorfullife.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> *	More scalable flush, from Andi Kleen</span>
+<span class="cm"> *</span>
+<span class="cm"> *	To avoid global state use 8 different call vectors.</span>
+<span class="cm"> *	Each CPU uses a specific vector to trigger flushes on other</span>
+<span class="cm"> *	CPUs. Depending on the received vector the target CPUs look into</span>
+<span class="cm"> *	the right array slot for the flush data.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	With more than 8 CPUs they are hashed to the 8 available</span>
+<span class="cm"> *	vectors. The limited global vector space forces us to this right now.</span>
+<span class="cm"> *	In future when interrupts are split into per CPU domains this could be</span>
+<span class="cm"> *	fixed, at the cost of triggering multiple IPIs in some cases.</span>
+<span class="cm"> */</span>
+
+<span class="k">union</span> <span class="n">smp_flush_state</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">flush_mm</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flush_va</span><span class="p">;</span>
+		<span class="n">raw_spinlock_t</span> <span class="n">tlbstate_lock</span><span class="p">;</span>
+		<span class="n">DECLARE_BITMAP</span><span class="p">(</span><span class="n">flush_cpumask</span><span class="p">,</span> <span class="n">NR_CPUS</span><span class="p">);</span>
+	<span class="p">};</span>
+	<span class="kt">char</span> <span class="n">pad</span><span class="p">[</span><span class="n">INTERNODE_CACHE_BYTES</span><span class="p">];</span>
+<span class="p">}</span> <span class="n">____cacheline_internodealigned_in_smp</span><span class="p">;</span>
+
+<span class="cm">/* State is put into the per CPU data section, but padded</span>
+<span class="cm">   to a full cache line because other CPUs can access it and we don&#39;t</span>
+<span class="cm">   want false sharing in the per cpu data segment. */</span>
+<span class="k">static</span> <span class="k">union</span> <span class="n">smp_flush_state</span> <span class="n">flush_state</span><span class="p">[</span><span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="p">];</span>
+
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU_READ_MOSTLY</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span> <span class="n">tlb_vector_offset</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We cannot call mmdrop() because we are in interrupt context,</span>
+<span class="cm"> * instead update mm-&gt;cpu_vm_mask.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">leave_mm</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">active_mm</span> <span class="o">=</span> <span class="n">this_cpu_read</span><span class="p">(</span><span class="n">cpu_tlbstate</span><span class="p">.</span><span class="n">active_mm</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">this_cpu_read</span><span class="p">(</span><span class="n">cpu_tlbstate</span><span class="p">.</span><span class="n">state</span><span class="p">)</span> <span class="o">==</span> <span class="n">TLBSTATE_OK</span><span class="p">)</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpumask_test_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">mm_cpumask</span><span class="p">(</span><span class="n">active_mm</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">cpumask_clear_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">mm_cpumask</span><span class="p">(</span><span class="n">active_mm</span><span class="p">));</span>
+		<span class="n">load_cr3</span><span class="p">(</span><span class="n">swapper_pg_dir</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">leave_mm</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *</span>
+<span class="cm"> * The flush IPI assumes that a thread switch happens in this order:</span>
+<span class="cm"> * [cpu0: the cpu that switches]</span>
+<span class="cm"> * 1) switch_mm() either 1a) or 1b)</span>
+<span class="cm"> * 1a) thread switch to a different mm</span>
+<span class="cm"> * 1a1) cpu_clear(cpu, old_mm-&gt;cpu_vm_mask);</span>
+<span class="cm"> *	Stop ipi delivery for the old mm. This is not synchronized with</span>
+<span class="cm"> *	the other cpus, but smp_invalidate_interrupt ignore flush ipis</span>
+<span class="cm"> *	for the wrong mm, and in the worst case we perform a superfluous</span>
+<span class="cm"> *	tlb flush.</span>
+<span class="cm"> * 1a2) set cpu mmu_state to TLBSTATE_OK</span>
+<span class="cm"> *	Now the smp_invalidate_interrupt won&#39;t call leave_mm if cpu0</span>
+<span class="cm"> *	was in lazy tlb mode.</span>
+<span class="cm"> * 1a3) update cpu active_mm</span>
+<span class="cm"> *	Now cpu0 accepts tlb flushes for the new mm.</span>
+<span class="cm"> * 1a4) cpu_set(cpu, new_mm-&gt;cpu_vm_mask);</span>
+<span class="cm"> *	Now the other cpus will send tlb flush ipis.</span>
+<span class="cm"> * 1a4) change cr3.</span>
+<span class="cm"> * 1b) thread switch without mm change</span>
+<span class="cm"> *	cpu active_mm is correct, cpu0 already handles</span>
+<span class="cm"> *	flush ipis.</span>
+<span class="cm"> * 1b1) set cpu mmu_state to TLBSTATE_OK</span>
+<span class="cm"> * 1b2) test_and_set the cpu bit in cpu_vm_mask.</span>
+<span class="cm"> *	Atomically set the bit [other cpus will start sending flush ipis],</span>
+<span class="cm"> *	and test the bit.</span>
+<span class="cm"> * 1b3) if the bit was 0: leave_mm was called, flush the tlb.</span>
+<span class="cm"> * 2) switch %%esp, ie current</span>
+<span class="cm"> *</span>
+<span class="cm"> * The interrupt must handle 2 special cases:</span>
+<span class="cm"> * - cr3 is changed before %%esp, ie. it cannot use current-&gt;{active_,}mm.</span>
+<span class="cm"> * - the cpu performs speculative tlb reads, i.e. even if the cpu only</span>
+<span class="cm"> *   runs in kernel space, the cpu could load tlb entries for user space</span>
+<span class="cm"> *   pages.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The good news is that cpu mmu_state is local to each cpu, no</span>
+<span class="cm"> * write/read ordering problems.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * TLB flush IPI:</span>
+<span class="cm"> *</span>
+<span class="cm"> * 1) Flush the tlb entries if the cpu uses the mm that&#39;s being flushed.</span>
+<span class="cm"> * 2) Leave the mm if we are in the lazy tlb mode.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Interrupts are disabled.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * FIXME: use of asmlinkage is not consistent.  On x86_64 it&#39;s noop</span>
+<span class="cm"> * but still used for documentation purpose but the usage is slightly</span>
+<span class="cm"> * inconsistent.  On x86_32, asmlinkage is regparm(0) but interrupt</span>
+<span class="cm"> * entry calls in with the first parameter in %eax.  Maybe define</span>
+<span class="cm"> * intrlinkage?</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_X86_64</span>
+<span class="n">asmlinkage</span>
+<span class="cp">#endif</span>
+<span class="kt">void</span> <span class="n">smp_invalidate_interrupt</span><span class="p">(</span><span class="k">struct</span> <span class="n">pt_regs</span> <span class="o">*</span><span class="n">regs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">sender</span><span class="p">;</span>
+	<span class="k">union</span> <span class="n">smp_flush_state</span> <span class="o">*</span><span class="n">f</span><span class="p">;</span>
+
+	<span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * orig_rax contains the negated interrupt vector.</span>
+<span class="cm">	 * Use that to determine where the sender put the data.</span>
+<span class="cm">	 */</span>
+	<span class="n">sender</span> <span class="o">=</span> <span class="o">~</span><span class="n">regs</span><span class="o">-&gt;</span><span class="n">orig_ax</span> <span class="o">-</span> <span class="n">INVALIDATE_TLB_VECTOR_START</span><span class="p">;</span>
+	<span class="n">f</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">flush_state</span><span class="p">[</span><span class="n">sender</span><span class="p">];</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cpumask_test_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">to_cpumask</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_cpumask</span><span class="p">)))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * This was a BUG() but until someone can quote me the</span>
+<span class="cm">		 * line from the intel manual that guarantees an IPI to</span>
+<span class="cm">		 * multiple CPUs is retried _only_ on the erroring CPUs</span>
+<span class="cm">		 * its staying as a return</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * BUG();</span>
+<span class="cm">		 */</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_mm</span> <span class="o">==</span> <span class="n">this_cpu_read</span><span class="p">(</span><span class="n">cpu_tlbstate</span><span class="p">.</span><span class="n">active_mm</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">this_cpu_read</span><span class="p">(</span><span class="n">cpu_tlbstate</span><span class="p">.</span><span class="n">state</span><span class="p">)</span> <span class="o">==</span> <span class="n">TLBSTATE_OK</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_va</span> <span class="o">==</span> <span class="n">TLB_FLUSH_ALL</span><span class="p">)</span>
+				<span class="n">local_flush_tlb</span><span class="p">();</span>
+			<span class="k">else</span>
+				<span class="n">__flush_tlb_one</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_va</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">leave_mm</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">ack_APIC_irq</span><span class="p">();</span>
+	<span class="n">smp_mb__before_clear_bit</span><span class="p">();</span>
+	<span class="n">cpumask_clear_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">to_cpumask</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_cpumask</span><span class="p">));</span>
+	<span class="n">smp_mb__after_clear_bit</span><span class="p">();</span>
+	<span class="n">inc_irq_stat</span><span class="p">(</span><span class="n">irq_tlb_count</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">flush_tlb_others_ipi</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">cpumask</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">va</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">sender</span><span class="p">;</span>
+	<span class="k">union</span> <span class="n">smp_flush_state</span> <span class="o">*</span><span class="n">f</span><span class="p">;</span>
+
+	<span class="cm">/* Caller has disabled preemption */</span>
+	<span class="n">sender</span> <span class="o">=</span> <span class="n">this_cpu_read</span><span class="p">(</span><span class="n">tlb_vector_offset</span><span class="p">);</span>
+	<span class="n">f</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">flush_state</span><span class="p">[</span><span class="n">sender</span><span class="p">];</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_cpu_ids</span> <span class="o">&gt;</span> <span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="p">)</span>
+		<span class="n">raw_spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">tlbstate_lock</span><span class="p">);</span>
+
+	<span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_mm</span> <span class="o">=</span> <span class="n">mm</span><span class="p">;</span>
+	<span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_va</span> <span class="o">=</span> <span class="n">va</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpumask_andnot</span><span class="p">(</span><span class="n">to_cpumask</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_cpumask</span><span class="p">),</span> <span class="n">cpumask</span><span class="p">,</span> <span class="n">cpumask_of</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">())))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * We have to send the IPI only to</span>
+<span class="cm">		 * CPUs affected.</span>
+<span class="cm">		 */</span>
+		<span class="n">apic</span><span class="o">-&gt;</span><span class="n">send_IPI_mask</span><span class="p">(</span><span class="n">to_cpumask</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_cpumask</span><span class="p">),</span>
+			      <span class="n">INVALIDATE_TLB_VECTOR_START</span> <span class="o">+</span> <span class="n">sender</span><span class="p">);</span>
+
+		<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">cpumask_empty</span><span class="p">(</span><span class="n">to_cpumask</span><span class="p">(</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_cpumask</span><span class="p">)))</span>
+			<span class="n">cpu_relax</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_mm</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">f</span><span class="o">-&gt;</span><span class="n">flush_va</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_cpu_ids</span> <span class="o">&gt;</span> <span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="p">)</span>
+		<span class="n">raw_spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">f</span><span class="o">-&gt;</span><span class="n">tlbstate_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">native_flush_tlb_others</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">cpumask</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">va</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_uv_system</span><span class="p">())</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+		<span class="n">cpu</span> <span class="o">=</span> <span class="n">smp_processor_id</span><span class="p">();</span>
+		<span class="n">cpumask</span> <span class="o">=</span> <span class="n">uv_flush_tlb_others</span><span class="p">(</span><span class="n">cpumask</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">va</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cpumask</span><span class="p">)</span>
+			<span class="n">flush_tlb_others_ipi</span><span class="p">(</span><span class="n">cpumask</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">va</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">flush_tlb_others_ipi</span><span class="p">(</span><span class="n">cpumask</span><span class="p">,</span> <span class="n">mm</span><span class="p">,</span> <span class="n">va</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__cpuinit</span> <span class="n">calculate_tlb_offset</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">node</span><span class="p">,</span> <span class="n">nr_node_vecs</span><span class="p">,</span> <span class="n">idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * we are changing tlb_vector_offset for each CPU in runtime, but this</span>
+<span class="cm">	 * will not cause inconsistency, as the write is atomic under X86. we</span>
+<span class="cm">	 * might see more lock contentions in a short time, but after all CPU&#39;s</span>
+<span class="cm">	 * tlb_vector_offset are changed, everything should go normal</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Note: if NUM_INVALIDATE_TLB_VECTORS % nr_online_nodes !=0, we might</span>
+<span class="cm">	 * waste some vectors.</span>
+<span class="cm">	 **/</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">nr_online_nodes</span> <span class="o">&gt;</span> <span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="p">)</span>
+		<span class="n">nr_node_vecs</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">nr_node_vecs</span> <span class="o">=</span> <span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="o">/</span><span class="n">nr_online_nodes</span><span class="p">;</span>
+
+	<span class="n">for_each_online_node</span><span class="p">(</span><span class="n">node</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">node_offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">idx</span> <span class="o">%</span> <span class="n">NUM_INVALIDATE_TLB_VECTORS</span><span class="p">)</span> <span class="o">*</span>
+			<span class="n">nr_node_vecs</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">cpu_offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">for_each_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">cpumask_of_node</span><span class="p">(</span><span class="n">node</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">per_cpu</span><span class="p">(</span><span class="n">tlb_vector_offset</span><span class="p">,</span> <span class="n">cpu</span><span class="p">)</span> <span class="o">=</span> <span class="n">node_offset</span> <span class="o">+</span>
+				<span class="n">cpu_offset</span><span class="p">;</span>
+			<span class="n">cpu_offset</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">cpu_offset</span> <span class="o">=</span> <span class="n">cpu_offset</span> <span class="o">%</span> <span class="n">nr_node_vecs</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">idx</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__cpuinit</span> <span class="n">tlb_cpuhp_notify</span><span class="p">(</span><span class="k">struct</span> <span class="n">notifier_block</span> <span class="o">*</span><span class="n">n</span><span class="p">,</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">action</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">hcpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">action</span> <span class="o">&amp;</span> <span class="mh">0xf</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">CPU_ONLINE</span>:
+	<span class="k">case</span> <span class="n">CPU_DEAD</span>:
+		<span class="n">calculate_tlb_offset</span><span class="p">();</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">NOTIFY_OK</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__cpuinit</span> <span class="n">init_smp_flush</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">flush_state</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">raw_spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">flush_state</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">tlbstate_lock</span><span class="p">);</span>
+
+	<span class="n">calculate_tlb_offset</span><span class="p">();</span>
+	<span class="n">hotcpu_notifier</span><span class="p">(</span><span class="n">tlb_cpuhp_notify</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">core_initcall</span><span class="p">(</span><span class="n">init_smp_flush</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">flush_tlb_current_task</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span> <span class="o">=</span> <span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">;</span>
+
+	<span class="n">preempt_disable</span><span class="p">();</span>
+
+	<span class="n">local_flush_tlb</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpumask_any_but</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">smp_processor_id</span><span class="p">())</span> <span class="o">&lt;</span> <span class="n">nr_cpu_ids</span><span class="p">)</span>
+		<span class="n">flush_tlb_others</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">mm</span><span class="p">,</span> <span class="n">TLB_FLUSH_ALL</span><span class="p">);</span>
+	<span class="n">preempt_enable</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">flush_tlb_mm</span><span class="p">(</span><span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">preempt_disable</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">active_mm</span> <span class="o">==</span> <span class="n">mm</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">)</span>
+			<span class="n">local_flush_tlb</span><span class="p">();</span>
+		<span class="k">else</span>
+			<span class="n">leave_mm</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">());</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpumask_any_but</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">smp_processor_id</span><span class="p">())</span> <span class="o">&lt;</span> <span class="n">nr_cpu_ids</span><span class="p">)</span>
+		<span class="n">flush_tlb_others</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">mm</span><span class="p">,</span> <span class="n">TLB_FLUSH_ALL</span><span class="p">);</span>
+
+	<span class="n">preempt_enable</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">flush_tlb_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">va</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mm_struct</span> <span class="o">*</span><span class="n">mm</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span><span class="p">;</span>
+
+	<span class="n">preempt_disable</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">active_mm</span> <span class="o">==</span> <span class="n">mm</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">)</span>
+			<span class="n">__flush_tlb_one</span><span class="p">(</span><span class="n">va</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">leave_mm</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">());</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cpumask_any_but</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">smp_processor_id</span><span class="p">())</span> <span class="o">&lt;</span> <span class="n">nr_cpu_ids</span><span class="p">)</span>
+		<span class="n">flush_tlb_others</span><span class="p">(</span><span class="n">mm_cpumask</span><span class="p">(</span><span class="n">mm</span><span class="p">),</span> <span class="n">mm</span><span class="p">,</span> <span class="n">va</span><span class="p">);</span>
+
+	<span class="n">preempt_enable</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">do_flush_tlb_all</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__flush_tlb_all</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">this_cpu_read</span><span class="p">(</span><span class="n">cpu_tlbstate</span><span class="p">.</span><span class="n">state</span><span class="p">)</span> <span class="o">==</span> <span class="n">TLBSTATE_LAZY</span><span class="p">)</span>
+		<span class="n">leave_mm</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">());</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">flush_tlb_all</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">on_each_cpu</span><span class="p">(</span><span class="n">do_flush_tlb_all</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

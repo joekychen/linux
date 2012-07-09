@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › arm › net › bpf_jit_32.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>bpf_jit_32.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Just-In-Time compiler for BPF filters on 32bit ARM</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2011 Mircea Gherzan &lt;mgherzan@gmail.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify it</span>
+<span class="cm"> * under the terms of the GNU General Public License as published by the</span>
+<span class="cm"> * Free Software Foundation; version 2 of the License.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/bitops.h&gt;</span>
+<span class="cp">#include &lt;linux/compiler.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/filter.h&gt;</span>
+<span class="cp">#include &lt;linux/moduleloader.h&gt;</span>
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;asm/cacheflush.h&gt;</span>
+<span class="cp">#include &lt;asm/hwcap.h&gt;</span>
+
+<span class="cp">#include &quot;bpf_jit_32.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * ABI:</span>
+<span class="cm"> *</span>
+<span class="cm"> * r0	scratch register</span>
+<span class="cm"> * r4	BPF register A</span>
+<span class="cm"> * r5	BPF register X</span>
+<span class="cm"> * r6	pointer to the skb</span>
+<span class="cm"> * r7	skb-&gt;data</span>
+<span class="cm"> * r8	skb_headlen(skb)</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define r_scratch	ARM_R0</span>
+<span class="cm">/* r1-r3 are (also) used for the unaligned loads on the non-ARMv7 slowpath */</span>
+<span class="cp">#define r_off		ARM_R1</span>
+<span class="cp">#define r_A		ARM_R4</span>
+<span class="cp">#define r_X		ARM_R5</span>
+<span class="cp">#define r_skb		ARM_R6</span>
+<span class="cp">#define r_skb_data	ARM_R7</span>
+<span class="cp">#define r_skb_hl	ARM_R8</span>
+
+<span class="cp">#define SCRATCH_SP_OFFSET	0</span>
+<span class="cp">#define SCRATCH_OFF(k)		(SCRATCH_SP_OFFSET + (k))</span>
+
+<span class="cp">#define SEEN_MEM		((1 &lt;&lt; BPF_MEMWORDS) - 1)</span>
+<span class="cp">#define SEEN_MEM_WORD(k)	(1 &lt;&lt; (k))</span>
+<span class="cp">#define SEEN_X			(1 &lt;&lt; BPF_MEMWORDS)</span>
+<span class="cp">#define SEEN_CALL		(1 &lt;&lt; (BPF_MEMWORDS + 1))</span>
+<span class="cp">#define SEEN_SKB		(1 &lt;&lt; (BPF_MEMWORDS + 2))</span>
+<span class="cp">#define SEEN_DATA		(1 &lt;&lt; (BPF_MEMWORDS + 3))</span>
+
+<span class="cp">#define FLAG_NEED_X_RESET	(1 &lt;&lt; 0)</span>
+
+<span class="k">struct</span> <span class="n">jit_ctx</span> <span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">sk_filter</span> <span class="o">*</span><span class="n">skf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">idx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">prologue_bytes</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret0_fp_idx</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">seen</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="o">*</span><span class="n">offsets</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="o">*</span><span class="n">target</span><span class="p">;</span>
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 7</span>
+	<span class="n">u16</span> <span class="n">epilogue_bytes</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">imm_count</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="o">*</span><span class="n">imms</span><span class="p">;</span>
+<span class="cp">#endif</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="n">bpf_jit_enable</span> <span class="n">__read_mostly</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">jit_get_skb_b</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u8</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">skb_copy_bits</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ret</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">err</span> <span class="o">&lt;&lt;</span> <span class="mi">32</span> <span class="o">|</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">jit_get_skb_h</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u16</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">skb_copy_bits</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ret</span><span class="p">,</span> <span class="mi">2</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">err</span> <span class="o">&lt;&lt;</span> <span class="mi">32</span> <span class="o">|</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u64</span> <span class="nf">jit_get_skb_w</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">skb_copy_bits</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ret</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">err</span> <span class="o">&lt;&lt;</span> <span class="mi">32</span> <span class="o">|</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wrapper that handles both OABI and EABI and assures Thumb2 interworking</span>
+<span class="cm"> * (where the assembly routines like __aeabi_uidiv could cause problems).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">u32</span> <span class="nf">jit_udiv</span><span class="p">(</span><span class="n">u32</span> <span class="n">dividend</span><span class="p">,</span> <span class="n">u32</span> <span class="n">divisor</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dividend</span> <span class="o">/</span> <span class="n">divisor</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">_emit</span><span class="p">(</span><span class="kt">int</span> <span class="n">cond</span><span class="p">,</span> <span class="n">u32</span> <span class="n">inst</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span><span class="p">[</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">inst</span> <span class="o">|</span> <span class="p">(</span><span class="n">cond</span> <span class="o">&lt;&lt;</span> <span class="mi">28</span><span class="p">);</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Emit an instruction that will be executed unconditionally.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit</span><span class="p">(</span><span class="n">u32</span> <span class="n">inst</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">ARM_COND_AL</span><span class="p">,</span> <span class="n">inst</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u16</span> <span class="nf">saved_regs</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u16</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">insns</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">code</span> <span class="o">==</span> <span class="n">BPF_S_RET_A</span><span class="p">))</span>
+		<span class="n">ret</span> <span class="o">|=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">r_A</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_FRAME_POINTER</span>
+	<span class="n">ret</span> <span class="o">|=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_FP</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_IP</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_LR</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_PC</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_CALL</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">|=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_LR</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">SEEN_DATA</span> <span class="o">|</span> <span class="n">SEEN_SKB</span><span class="p">))</span>
+		<span class="n">ret</span> <span class="o">|=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">r_skb</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_DATA</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">|=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">r_skb_data</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">r_skb_hl</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_X</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">|=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">r_X</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">mem_words_used</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* yes, we do waste some stack space IF there are &quot;holes&quot; in the set&quot; */</span>
+	<span class="k">return</span> <span class="n">fls</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_MEM</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">bool</span> <span class="nf">is_load_to_a</span><span class="p">(</span><span class="n">u16</span> <span class="n">inst</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">inst</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">BPF_S_LD_W_LEN</span>:
+	<span class="k">case</span> <span class="n">BPF_S_LD_W_ABS</span>:
+	<span class="k">case</span> <span class="n">BPF_S_LD_H_ABS</span>:
+	<span class="k">case</span> <span class="n">BPF_S_LD_B_ABS</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_CPU</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_IFINDEX</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_MARK</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_PROTOCOL</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_RXHASH</span>:
+	<span class="k">case</span> <span class="n">BPF_S_ANC_QUEUE</span>:
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">build_prologue</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u16</span> <span class="n">reg_set</span> <span class="o">=</span> <span class="n">saved_regs</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="n">u16</span> <span class="n">first_inst</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">insns</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">code</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">off</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_FRAME_POINTER</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_IP</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_PUSH</span><span class="p">(</span><span class="n">reg_set</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_SUB_I</span><span class="p">(</span><span class="n">ARM_FP</span><span class="p">,</span> <span class="n">ARM_IP</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">reg_set</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_PUSH</span><span class="p">(</span><span class="n">reg_set</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">SEEN_DATA</span> <span class="o">|</span> <span class="n">SEEN_SKB</span><span class="p">))</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">r_skb</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_DATA</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">data</span><span class="p">);</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_skb_data</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="cm">/* headlen = len - data_len */</span>
+		<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_skb_hl</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">data_len</span><span class="p">);</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_SUB_R</span><span class="p">(</span><span class="n">r_skb_hl</span><span class="p">,</span> <span class="n">r_skb_hl</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">FLAG_NEED_X_RESET</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="cm">/* do not leak kernel data to userspace */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">first_inst</span> <span class="o">!=</span> <span class="n">BPF_S_RET_K</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="p">(</span><span class="n">is_load_to_a</span><span class="p">(</span><span class="n">first_inst</span><span class="p">)))</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="cm">/* stack space for the BPF_MEM words */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_MEM</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_SUB_I</span><span class="p">(</span><span class="n">ARM_SP</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">mem_words_used</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span> <span class="o">*</span> <span class="mi">4</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">build_epilogue</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u16</span> <span class="n">reg_set</span> <span class="o">=</span> <span class="n">saved_regs</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_MEM</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_ADD_I</span><span class="p">(</span><span class="n">ARM_SP</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">mem_words_used</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span> <span class="o">*</span> <span class="mi">4</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="n">reg_set</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_LR</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_FRAME_POINTER</span>
+	<span class="cm">/* the first instruction of the prologue was: mov ip, sp */</span>
+	<span class="n">reg_set</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_IP</span><span class="p">);</span>
+	<span class="n">reg_set</span> <span class="o">|=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_SP</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDM</span><span class="p">(</span><span class="n">ARM_SP</span><span class="p">,</span> <span class="n">reg_set</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">reg_set</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_CALL</span><span class="p">)</span>
+			<span class="n">reg_set</span> <span class="o">|=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">ARM_PC</span><span class="p">;</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_POP</span><span class="p">(</span><span class="n">reg_set</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_CALL</span><span class="p">))</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_BX</span><span class="p">(</span><span class="n">ARM_LR</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int16_t</span> <span class="nf">imm8m</span><span class="p">(</span><span class="n">u32</span> <span class="n">x</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">rot</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">rot</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">rot</span> <span class="o">&lt;</span> <span class="mi">16</span><span class="p">;</span> <span class="n">rot</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">x</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">ror32</span><span class="p">(</span><span class="mh">0xff</span><span class="p">,</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">rot</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">rol32</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">rot</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">rot</span> <span class="o">&lt;&lt;</span> <span class="mi">8</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 7</span>
+
+<span class="k">static</span> <span class="n">u16</span> <span class="nf">imm_offset</span><span class="p">(</span><span class="n">u32</span> <span class="n">k</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">u16</span> <span class="n">imm</span><span class="p">;</span>
+
+	<span class="cm">/* on the &quot;fake&quot; run we just count them (duplicates included) */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imm_count</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">i</span> <span class="o">&lt;</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imm_count</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imms</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imms</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">k</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">i</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imms</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">imms</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">k</span><span class="p">;</span>
+
+	<span class="cm">/* constants go just after the epilogue */</span>
+	<span class="n">offset</span> <span class="o">=</span>  <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">offsets</span><span class="p">[</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">];</span>
+	<span class="n">offset</span> <span class="o">+=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">prologue_bytes</span><span class="p">;</span>
+	<span class="n">offset</span> <span class="o">+=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">epilogue_bytes</span><span class="p">;</span>
+	<span class="n">offset</span> <span class="o">+=</span> <span class="n">i</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span><span class="p">[</span><span class="n">offset</span> <span class="o">/</span> <span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="n">k</span><span class="p">;</span>
+
+	<span class="cm">/* PC in ARM mode == address of the instruction + 8 */</span>
+	<span class="n">imm</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">-</span> <span class="p">(</span><span class="mi">8</span> <span class="o">+</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">*</span> <span class="mi">4</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">imm</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#endif </span><span class="cm">/* __LINUX_ARM_ARCH__ */</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Move an immediate that&#39;s not an imm8m to a core register.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_mov_i_no8m</span><span class="p">(</span><span class="kt">int</span> <span class="n">rd</span><span class="p">,</span> <span class="n">u32</span> <span class="n">val</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 7</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">ARM_PC</span><span class="p">,</span> <span class="n">imm_offset</span><span class="p">(</span><span class="n">val</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOVW</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">val</span> <span class="o">&amp;</span> <span class="mh">0xffff</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">val</span> <span class="o">&gt;</span> <span class="mh">0xffff</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOVT</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">val</span> <span class="o">&gt;&gt;</span> <span class="mi">16</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_mov_i</span><span class="p">(</span><span class="kt">int</span> <span class="n">rd</span><span class="p">,</span> <span class="n">u32</span> <span class="n">val</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">imm12</span> <span class="o">=</span> <span class="n">imm8m</span><span class="p">(</span><span class="n">val</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">imm12</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_I</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">imm12</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">emit_mov_i_no8m</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">val</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 6</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">emit_load_be32</span><span class="p">(</span><span class="n">u8</span> <span class="n">cond</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_res</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_addr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R2</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LSL_I</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R3</span><span class="p">,</span> <span class="mi">16</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_ORR_S</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R1</span><span class="p">,</span> <span class="n">SRTYPE_LSL</span><span class="p">,</span> <span class="mi">24</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_ORR_R</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R2</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_ORR_S</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">,</span> <span class="n">SRTYPE_LSL</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">emit_load_be16</span><span class="p">(</span><span class="n">u8</span> <span class="n">cond</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_res</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_addr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">ARM_R2</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_ORR_S</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">ARM_R2</span><span class="p">,</span> <span class="n">ARM_R1</span><span class="p">,</span> <span class="n">SRTYPE_LSL</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_swap16</span><span class="p">(</span><span class="n">u8</span> <span class="n">r_dst</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_src</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_R</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="n">r_src</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_ORR_S</span><span class="p">(</span><span class="n">r_dst</span><span class="p">,</span> <span class="n">ARM_R1</span><span class="p">,</span> <span class="n">r_src</span><span class="p">,</span> <span class="n">SRTYPE_LSL</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_I</span><span class="p">(</span><span class="n">r_dst</span><span class="p">,</span> <span class="n">r_dst</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_R</span><span class="p">(</span><span class="n">r_dst</span><span class="p">,</span> <span class="n">r_dst</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#else  </span><span class="cm">/* ARMv6+ */</span><span class="cp"></span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">emit_load_be32</span><span class="p">(</span><span class="n">u8</span> <span class="n">cond</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_res</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_addr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#ifdef __LITTLE_ENDIAN</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_REV</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">r_res</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">emit_load_be16</span><span class="p">(</span><span class="n">u8</span> <span class="n">cond</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_res</span><span class="p">,</span> <span class="n">u8</span> <span class="n">r_addr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_LDRH_I</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">r_addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#ifdef __LITTLE_ENDIAN</span>
+	<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_REV16</span><span class="p">(</span><span class="n">r_res</span><span class="p">,</span> <span class="n">r_res</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_swap16</span><span class="p">(</span><span class="n">u8</span> <span class="n">r_dst</span> <span class="n">__maybe_unused</span><span class="p">,</span>
+			       <span class="n">u8</span> <span class="n">r_src</span> <span class="n">__maybe_unused</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span> <span class="n">__maybe_unused</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#ifdef __LITTLE_ENDIAN</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_REV16</span><span class="p">(</span><span class="n">r_dst</span><span class="p">,</span> <span class="n">r_src</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="cp">#endif </span><span class="cm">/* __LINUX_ARM_ARCH__ &lt; 6 */</span><span class="cp"></span>
+
+
+<span class="cm">/* Compute the immediate value for a PC-relative branch. */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u32</span> <span class="nf">b_imm</span><span class="p">(</span><span class="kt">unsigned</span> <span class="n">tgt</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">imm</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * BPF allows only forward jumps and the offset of the target is</span>
+<span class="cm">	 * still the one computed during the first pass.</span>
+<span class="cm">	 */</span>
+	<span class="n">imm</span>  <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">offsets</span><span class="p">[</span><span class="n">tgt</span><span class="p">]</span> <span class="o">+</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">prologue_bytes</span> <span class="o">-</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">+</span> <span class="mi">8</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">imm</span> <span class="o">&gt;&gt;</span> <span class="mi">2</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define OP_IMM3(op, r1, r2, imm_val, ctx)				\</span>
+<span class="cp">	do {								\</span>
+<span class="cp">		imm12 = imm8m(imm_val);					\</span>
+<span class="cp">		if (imm12 &lt; 0) {					\</span>
+<span class="cp">			emit_mov_i_no8m(r_scratch, imm_val, ctx);	\</span>
+<span class="cp">			emit(op ## _R((r1), (r2), r_scratch), ctx);	\</span>
+<span class="cp">		} else {						\</span>
+<span class="cp">			emit(op ## _I((r1), (r2), imm12), ctx);		\</span>
+<span class="cp">		}							\</span>
+<span class="cp">	} while (0)</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_err_ret</span><span class="p">(</span><span class="n">u8</span> <span class="n">cond</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ret0_fp_idx</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ret0_fp_idx</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="cm">/* NOP to keep the size constant between passes */</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_MOV_I</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="n">_emit</span><span class="p">(</span><span class="n">cond</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_blx_r</span><span class="p">(</span><span class="n">u8</span> <span class="n">tgt_reg</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 5</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_LR</span><span class="p">,</span> <span class="n">ARM_PC</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">elf_hwcap</span> <span class="o">&amp;</span> <span class="n">HWCAP_THUMB</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_BX</span><span class="p">(</span><span class="n">tgt_reg</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_PC</span><span class="p">,</span> <span class="n">tgt_reg</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="n">emit</span><span class="p">(</span><span class="n">ARM_BLX_R</span><span class="p">(</span><span class="n">tgt_reg</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">emit_udiv</span><span class="p">(</span><span class="n">u8</span> <span class="n">rd</span><span class="p">,</span> <span class="n">u8</span> <span class="n">rm</span><span class="p">,</span> <span class="n">u8</span> <span class="n">rn</span><span class="p">,</span> <span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if __LINUX_ARM_ARCH__ == 7</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">elf_hwcap</span> <span class="o">&amp;</span> <span class="n">HWCAP_IDIVA</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_UDIV</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">rm</span><span class="p">,</span> <span class="n">rn</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="cp">#endif</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rm</span> <span class="o">!=</span> <span class="n">ARM_R0</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">rm</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rn</span> <span class="o">!=</span> <span class="n">ARM_R1</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="n">rn</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_CALL</span><span class="p">;</span>
+	<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">jit_udiv</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+	<span class="n">emit_blx_r</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rd</span> <span class="o">!=</span> <span class="n">ARM_R0</span><span class="p">)</span>
+		<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">rd</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">update_on_xread</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">&amp;</span> <span class="n">SEEN_X</span><span class="p">))</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">FLAG_NEED_X_RESET</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">build_body</span><span class="p">(</span><span class="k">struct</span> <span class="n">jit_ctx</span> <span class="o">*</span><span class="n">ctx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">load_func</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span><span class="n">jit_get_skb_b</span><span class="p">,</span> <span class="n">jit_get_skb_h</span><span class="p">,</span> <span class="n">jit_get_skb_w</span><span class="p">};</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">sk_filter</span> <span class="o">*</span><span class="n">prog</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="p">;</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">sock_filter</span> <span class="o">*</span><span class="n">inst</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">,</span> <span class="n">load_order</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">condt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">imm12</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">k</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">prog</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">inst</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">prog</span><span class="o">-&gt;</span><span class="n">insns</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="cm">/* K as an immediate value operand */</span>
+		<span class="n">k</span> <span class="o">=</span> <span class="n">inst</span><span class="o">-&gt;</span><span class="n">k</span><span class="p">;</span>
+
+		<span class="cm">/* compute offsets only in the fake pass */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">offsets</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">inst</span><span class="o">-&gt;</span><span class="n">code</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_IMM</span>:
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_W_LEN</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">len</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span>
+				       <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">len</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_MEM</span>:
+			<span class="cm">/* A = scratch[k] */</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_MEM_WORD</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">SCRATCH_OFF</span><span class="p">(</span><span class="n">k</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_W_ABS</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">load</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_H_ABS</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">load</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_B_ABS</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">load:</span>
+			<span class="cm">/* the interpreter will deal with the negative K */</span>
+			<span class="k">if</span> <span class="p">((</span><span class="kt">int</span><span class="p">)</span><span class="n">k</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span> <span class="o">-</span><span class="n">ENOTSUPP</span><span class="p">;</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_off</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="nl">load_common:</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_DATA</span> <span class="o">|</span> <span class="n">SEEN_CALL</span><span class="p">;</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">load_order</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_SUB_I</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_skb_hl</span><span class="p">,</span>
+					       <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">load_order</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_R</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+				<span class="n">condt</span> <span class="o">=</span> <span class="n">ARM_COND_HS</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_R</span><span class="p">(</span><span class="n">r_skb_hl</span><span class="p">,</span> <span class="n">r_off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+				<span class="n">condt</span> <span class="o">=</span> <span class="n">ARM_COND_HI</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">_emit</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">ARM_ADD_R</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_off</span><span class="p">,</span> <span class="n">r_skb_data</span><span class="p">),</span>
+			      <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">load_order</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">_emit</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">ARM_LDRB_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+				      <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">load_order</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+				<span class="n">emit_load_be16</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">load_order</span> <span class="o">==</span> <span class="mi">2</span><span class="p">)</span>
+				<span class="n">emit_load_be32</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="n">_emit</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="cm">/* the slowpath */</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">load_func</span><span class="p">[</span><span class="n">load_order</span><span class="p">],</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* the offset is already in R1 */</span>
+			<span class="n">emit_blx_r</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* check the result of skb_copy_bits */</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_I</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_err_ret</span><span class="p">(</span><span class="n">ARM_COND_NE</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_W_IND</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">load_ind</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_H_IND</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">load_ind</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LD_B_IND</span>:
+			<span class="n">load_order</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">load_ind:</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_ADD</span><span class="p">,</span> <span class="n">r_off</span><span class="p">,</span> <span class="n">r_X</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">load_common</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LDX_IMM</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span><span class="p">;</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LDX_W_LEN</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span> <span class="o">|</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span>
+				       <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">len</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LDX_MEM</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span> <span class="o">|</span> <span class="n">SEEN_MEM_WORD</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">SCRATCH_OFF</span><span class="p">(</span><span class="n">k</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_LDX_B_MSH</span>:
+			<span class="cm">/* x = ((*(frame + k)) &amp; 0xf) &lt;&lt; 2; */</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span> <span class="o">|</span> <span class="n">SEEN_DATA</span> <span class="o">|</span> <span class="n">SEEN_CALL</span><span class="p">;</span>
+			<span class="cm">/* the interpreter should deal with the negative K */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">k</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+			<span class="cm">/* offset in r1: we might have to take the slow path */</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_off</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_R</span><span class="p">(</span><span class="n">r_skb_hl</span><span class="p">,</span> <span class="n">r_off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="cm">/* load in r0: common with the slowpath */</span>
+			<span class="n">_emit</span><span class="p">(</span><span class="n">ARM_COND_HI</span><span class="p">,</span> <span class="n">ARM_LDRB_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">r_skb_data</span><span class="p">,</span>
+						      <span class="n">ARM_R1</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * emit_mov_i() might generate one or two instructions,</span>
+<span class="cm">			 * the same holds for emit_blx_r()</span>
+<span class="cm">			 */</span>
+			<span class="n">_emit</span><span class="p">(</span><span class="n">ARM_COND_HI</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span> <span class="o">-</span> <span class="mi">2</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* r_off is r1 */</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">jit_get_skb_b</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_blx_r</span><span class="p">(</span><span class="n">ARM_R3</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* check the return value of skb_copy_bits */</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_I</span><span class="p">(</span><span class="n">ARM_R1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_err_ret</span><span class="p">(</span><span class="n">ARM_COND_NE</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_AND_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">ARM_R0</span><span class="p">,</span> <span class="mh">0x00f</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">r_X</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ST</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_MEM_WORD</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_STR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">SCRATCH_OFF</span><span class="p">(</span><span class="n">k</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_STX</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_MEM_WORD</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_STR_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">SCRATCH_OFF</span><span class="p">(</span><span class="n">k</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_ADD_K</span>:
+			<span class="cm">/* A += K */</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_ADD</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_ADD_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_ADD_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_SUB_K</span>:
+			<span class="cm">/* A -= K */</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_SUB</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_SUB_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_SUB_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_MUL_K</span>:
+			<span class="cm">/* A *= K */</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MUL</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_MUL_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MUL</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_DIV_K</span>:
+			<span class="cm">/* current k == reciprocal_value(userspace k) */</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* A = top 32 bits of the product */</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_UMULL</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_DIV_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_I</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_err_ret</span><span class="p">(</span><span class="n">ARM_COND_EQ</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_udiv</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_OR_K</span>:
+			<span class="cm">/* A |= K */</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_ORR</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_OR_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_ORR_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_AND_K</span>:
+			<span class="cm">/* A &amp;= K */</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_AND</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_AND_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_AND_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_LSH_K</span>:
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">k</span> <span class="o">&gt;</span> <span class="mi">31</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_LSH_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSL_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_RSH_K</span>:
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">k</span> <span class="o">&gt;</span> <span class="mi">31</span><span class="p">))</span>
+				<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">k</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_RSH_X</span>:
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LSR_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ALU_NEG</span>:
+			<span class="cm">/* A = -A */</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_RSB_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JA</span>:
+			<span class="cm">/* pc += K */</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="n">k</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JEQ_K</span>:
+			<span class="cm">/* pc += (A == K) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>  <span class="o">=</span> <span class="n">ARM_COND_EQ</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">cmp_imm</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JGT_K</span>:
+			<span class="cm">/* pc += (A &gt; K) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>  <span class="o">=</span> <span class="n">ARM_COND_HI</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">cmp_imm</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JGE_K</span>:
+			<span class="cm">/* pc += (A &gt;= K) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>  <span class="o">=</span> <span class="n">ARM_COND_HS</span><span class="p">;</span>
+<span class="nl">cmp_imm:</span>
+			<span class="n">imm12</span> <span class="o">=</span> <span class="n">imm8m</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">imm12</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">emit_mov_i_no8m</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">imm12</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="p">}</span>
+<span class="nl">cond_jump:</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">inst</span><span class="o">-&gt;</span><span class="n">jt</span><span class="p">)</span>
+				<span class="n">_emit</span><span class="p">(</span><span class="n">condt</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="n">inst</span><span class="o">-&gt;</span><span class="n">jt</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+						   <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">inst</span><span class="o">-&gt;</span><span class="n">jf</span><span class="p">)</span>
+				<span class="n">_emit</span><span class="p">(</span><span class="n">condt</span> <span class="o">^</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="n">inst</span><span class="o">-&gt;</span><span class="n">jf</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+							     <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JEQ_X</span>:
+			<span class="cm">/* pc += (A == X) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>   <span class="o">=</span> <span class="n">ARM_COND_EQ</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">cmp_x</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JGT_X</span>:
+			<span class="cm">/* pc += (A &gt; X) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>   <span class="o">=</span> <span class="n">ARM_COND_HI</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">cmp_x</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JGE_X</span>:
+			<span class="cm">/* pc += (A &gt;= X) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>   <span class="o">=</span> <span class="n">ARM_COND_CS</span><span class="p">;</span>
+<span class="nl">cmp_x:</span>
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">cond_jump</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JSET_K</span>:
+			<span class="cm">/* pc += (A &amp; K) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">condt</span>  <span class="o">=</span> <span class="n">ARM_COND_NE</span><span class="p">;</span>
+			<span class="cm">/* not set iff all zeroes iff Z==1 iff EQ */</span>
+
+			<span class="n">imm12</span> <span class="o">=</span> <span class="n">imm8m</span><span class="p">(</span><span class="n">k</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">imm12</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">emit_mov_i_no8m</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_TST_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_TST_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">imm12</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">goto</span> <span class="n">cond_jump</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_JMP_JSET_X</span>:
+			<span class="cm">/* pc += (A &amp; X) ? pc-&gt;jt : pc-&gt;jf */</span>
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">condt</span>  <span class="o">=</span> <span class="n">ARM_COND_NE</span><span class="p">;</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_TST_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">cond_jump</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_RET_A</span>:
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">r_A</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">b_epilogue</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_RET_K</span>:
+			<span class="k">if</span> <span class="p">((</span><span class="n">k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ret0_fp_idx</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">))</span>
+				<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">ret0_fp_idx</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="n">emit_mov_i</span><span class="p">(</span><span class="n">ARM_R0</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+<span class="nl">b_epilogue:</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">!=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+				<span class="n">emit</span><span class="p">(</span><span class="n">ARM_B</span><span class="p">(</span><span class="n">b_imm</span><span class="p">(</span><span class="n">prog</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_MISC_TAX</span>:
+			<span class="cm">/* X = A */</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_X</span><span class="p">;</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">r_X</span><span class="p">,</span> <span class="n">r_A</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_MISC_TXA</span>:
+			<span class="cm">/* A = X */</span>
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_MOV_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_ALU_XOR_X</span>:
+			<span class="cm">/* A ^= X */</span>
+			<span class="n">update_on_xread</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_EOR_R</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_A</span><span class="p">,</span> <span class="n">r_X</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_PROTOCOL</span>:
+			<span class="cm">/* A = ntohs(skb-&gt;protocol) */</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span>
+						  <span class="n">protocol</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">2</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">protocol</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDRH_I</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_swap16</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_CPU</span>:
+			<span class="cm">/* r_scratch = current_thread_info() */</span>
+			<span class="n">OP_IMM3</span><span class="p">(</span><span class="n">ARM_BIC</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">ARM_SP</span><span class="p">,</span> <span class="n">THREAD_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="cm">/* A = current_thread_info()-&gt;cpu */</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">thread_info</span><span class="p">,</span> <span class="n">cpu</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">thread_info</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_IFINDEX</span>:
+			<span class="cm">/* A = skb-&gt;dev-&gt;ifindex */</span>
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_CMP_I</span><span class="p">(</span><span class="n">r_scratch</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="n">emit_err_ret</span><span class="p">(</span><span class="n">ARM_COND_EQ</span><span class="p">,</span> <span class="n">ctx</span><span class="p">);</span>
+
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span><span class="p">,</span>
+						  <span class="n">ifindex</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span><span class="p">,</span> <span class="n">ifindex</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_scratch</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_MARK</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">mark</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">mark</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_RXHASH</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">rxhash</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">rxhash</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDR_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">BPF_S_ANC_QUEUE</span>:
+			<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">seen</span> <span class="o">|=</span> <span class="n">SEEN_SKB</span><span class="p">;</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">FIELD_SIZEOF</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span>
+						  <span class="n">queue_mapping</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">2</span><span class="p">);</span>
+			<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span>
+					      <span class="n">queue_mapping</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mh">0xff</span><span class="p">);</span>
+			<span class="n">off</span> <span class="o">=</span> <span class="n">offsetof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span><span class="p">,</span> <span class="n">queue_mapping</span><span class="p">);</span>
+			<span class="n">emit</span><span class="p">(</span><span class="n">ARM_LDRH_I</span><span class="p">(</span><span class="n">r_A</span><span class="p">,</span> <span class="n">r_skb</span><span class="p">,</span> <span class="n">off</span><span class="p">),</span> <span class="n">ctx</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="nl">default:</span>
+			<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* compute offsets only during the first pass */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">target</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">ctx</span><span class="o">-&gt;</span><span class="n">offsets</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">-&gt;</span><span class="n">idx</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="kt">void</span> <span class="nf">bpf_jit_compile</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_filter</span> <span class="o">*</span><span class="n">fp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">jit_ctx</span> <span class="n">ctx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">tmp_idx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">alloc_size</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bpf_jit_enable</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ctx</span><span class="p">));</span>
+	<span class="n">ctx</span><span class="p">.</span><span class="n">skf</span>		<span class="o">=</span> <span class="n">fp</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="p">.</span><span class="n">ret0_fp_idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="p">.</span><span class="n">offsets</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">skf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">offsets</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* fake pass to fill in the ctx-&gt;seen */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">build_body</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">)))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">tmp_idx</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">idx</span><span class="p">;</span>
+	<span class="n">build_prologue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="n">ctx</span><span class="p">.</span><span class="n">prologue_bytes</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">idx</span> <span class="o">-</span> <span class="n">tmp_idx</span><span class="p">)</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 7</span>
+	<span class="n">tmp_idx</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">idx</span><span class="p">;</span>
+	<span class="n">build_epilogue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="n">ctx</span><span class="p">.</span><span class="n">epilogue_bytes</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">idx</span> <span class="o">-</span> <span class="n">tmp_idx</span><span class="p">)</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="p">.</span><span class="n">idx</span> <span class="o">+=</span> <span class="n">ctx</span><span class="p">.</span><span class="n">imm_count</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">imm_count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ctx</span><span class="p">.</span><span class="n">imms</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">ctx</span><span class="p">.</span><span class="n">imm_count</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">imms</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="cp">#else</span>
+	<span class="cm">/* there&#39;s nothing after the epilogue on ARMv7 */</span>
+	<span class="n">build_epilogue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">alloc_size</span> <span class="o">=</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">ctx</span><span class="p">.</span><span class="n">idx</span><span class="p">;</span>
+	<span class="n">ctx</span><span class="p">.</span><span class="n">target</span> <span class="o">=</span> <span class="n">module_alloc</span><span class="p">(</span><span class="n">max</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span><span class="p">),</span>
+				      <span class="n">alloc_size</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">target</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">ctx</span><span class="p">.</span><span class="n">idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">build_prologue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="n">build_body</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+	<span class="n">build_epilogue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+
+	<span class="n">flush_icache_range</span><span class="p">((</span><span class="n">u32</span><span class="p">)</span><span class="n">ctx</span><span class="p">.</span><span class="n">target</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)(</span><span class="n">ctx</span><span class="p">.</span><span class="n">target</span> <span class="o">+</span> <span class="n">ctx</span><span class="p">.</span><span class="n">idx</span><span class="p">));</span>
+
+<span class="cp">#if __LINUX_ARM_ARCH__ &lt; 7</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">imm_count</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">imms</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">bpf_jit_enable</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">print_hex_dump</span><span class="p">(</span><span class="n">KERN_INFO</span><span class="p">,</span> <span class="s">&quot;BPF JIT code: &quot;</span><span class="p">,</span>
+			       <span class="n">DUMP_PREFIX_ADDRESS</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="n">ctx</span><span class="p">.</span><span class="n">target</span><span class="p">,</span>
+			       <span class="n">alloc_size</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+
+	<span class="n">fp</span><span class="o">-&gt;</span><span class="n">bpf_func</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">ctx</span><span class="p">.</span><span class="n">target</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">ctx</span><span class="p">.</span><span class="n">offsets</span><span class="p">);</span>
+	<span class="k">return</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">bpf_jit_free_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">module_free</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">work</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">bpf_jit_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_filter</span> <span class="o">*</span><span class="n">fp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">fp</span><span class="o">-&gt;</span><span class="n">bpf_func</span> <span class="o">!=</span> <span class="n">sk_run_filter</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">work</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="p">)</span><span class="n">fp</span><span class="o">-&gt;</span><span class="n">bpf_func</span><span class="p">;</span>
+
+		<span class="n">INIT_WORK</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="n">bpf_jit_free_worker</span><span class="p">);</span>
+		<span class="n">schedule_work</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

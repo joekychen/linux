@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › lguest › page_tables.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>page_tables.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*P:700</span>
+<span class="cm"> * The pagetable code, on the other hand, still shows the scars of</span>
+<span class="cm"> * previous encounters.  It&#39;s functional, and as neat as it can be in the</span>
+<span class="cm"> * circumstances, but be wary, for these things are subtle and break easily.</span>
+<span class="cm"> * The Guest provides a virtual to physical mapping, but we can neither trust</span>
+<span class="cm"> * it nor use it: we verify and convert it here then point the CPU to the</span>
+<span class="cm"> * converted Guest pages when running the Guest.</span>
+<span class="cm">:*/</span>
+
+<span class="cm">/* Copyright (C) Rusty Russell IBM Corporation 2006.</span>
+<span class="cm"> * GPL v2 and any later version */</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/random.h&gt;</span>
+<span class="cp">#include &lt;linux/percpu.h&gt;</span>
+<span class="cp">#include &lt;asm/tlbflush.h&gt;</span>
+<span class="cp">#include &lt;asm/uaccess.h&gt;</span>
+<span class="cp">#include &quot;lg.h&quot;</span>
+
+<span class="cm">/*M:008</span>
+<span class="cm"> * We hold reference to pages, which prevents them from being swapped.</span>
+<span class="cm"> * It&#39;d be nice to have a callback in the &quot;struct mm_struct&quot; when Linux wants</span>
+<span class="cm"> * to swap out.  If we had this, and a shrinker callback to trim PTE pages, we</span>
+<span class="cm"> * could probably consider launching Guests as non-root.</span>
+<span class="cm">:*/</span>
+
+<span class="cm">/*H:300</span>
+<span class="cm"> * The Page Table Code</span>
+<span class="cm"> *</span>
+<span class="cm"> * We use two-level page tables for the Guest, or three-level with PAE.  If</span>
+<span class="cm"> * you&#39;re not entirely comfortable with virtual addresses, physical addresses</span>
+<span class="cm"> * and page tables then I recommend you review arch/x86/lguest/boot.c&#39;s &quot;Page</span>
+<span class="cm"> * Table Handling&quot; (with diagrams!).</span>
+<span class="cm"> *</span>
+<span class="cm"> * The Guest keeps page tables, but we maintain the actual ones here: these are</span>
+<span class="cm"> * called &quot;shadow&quot; page tables.  Which is a very Guest-centric name: these are</span>
+<span class="cm"> * the real page tables the CPU uses, although we keep them up to date to</span>
+<span class="cm"> * reflect the Guest&#39;s.  (See what I mean about weird naming?  Since when do</span>
+<span class="cm"> * shadows reflect anything?)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Anyway, this is the most complicated part of the Host code.  There are seven</span>
+<span class="cm"> * parts to this:</span>
+<span class="cm"> *  (i) Looking up a page table entry when the Guest faults,</span>
+<span class="cm"> *  (ii) Making sure the Guest stack is mapped,</span>
+<span class="cm"> *  (iii) Setting up a page table entry when the Guest tells us one has changed,</span>
+<span class="cm"> *  (iv) Switching page tables,</span>
+<span class="cm"> *  (v) Flushing (throwing away) page tables,</span>
+<span class="cm"> *  (vi) Mapping the Switcher when the Guest is about to run,</span>
+<span class="cm"> *  (vii) Setting up the page tables initially.</span>
+<span class="cm">:*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The Switcher uses the complete top PTE page.  That&#39;s 1024 PTE entries (4MB)</span>
+<span class="cm"> * or 512 PTE entries with PAE (2MB).</span>
+<span class="cm"> */</span>
+<span class="cp">#define SWITCHER_PGD_INDEX (PTRS_PER_PGD - 1)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * For PAE we need the PMD index as well. We use the last 2MB, so we</span>
+<span class="cm"> * will need the last pmd entry of the last pmd page.</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="cp">#define SWITCHER_PMD_INDEX 	(PTRS_PER_PMD - 1)</span>
+<span class="cp">#define RESERVE_MEM 		2U</span>
+<span class="cp">#define CHECK_GPGD_MASK		_PAGE_PRESENT</span>
+<span class="cp">#else</span>
+<span class="cp">#define RESERVE_MEM 		4U</span>
+<span class="cp">#define CHECK_GPGD_MASK		_PAGE_TABLE</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We actually need a separate PTE page for each CPU.  Remember that after the</span>
+<span class="cm"> * Switcher code itself comes two pages for each CPU, and we don&#39;t want this</span>
+<span class="cm"> * CPU&#39;s guest to see the pages of any other CPU.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="n">pte_t</span> <span class="o">*</span><span class="p">,</span> <span class="n">switcher_pte_pages</span><span class="p">);</span>
+<span class="cp">#define switcher_pte_page(cpu) per_cpu(switcher_pte_pages, cpu)</span>
+
+<span class="cm">/*H:320</span>
+<span class="cm"> * The page table code is curly enough to need helper functions to keep it</span>
+<span class="cm"> * clear and clean.  The kernel itself provides many of them; one advantage</span>
+<span class="cm"> * of insisting that the Guest and Host use the same CONFIG_PAE setting.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There are two functions which return pointers to the shadow (aka &quot;real&quot;)</span>
+<span class="cm"> * page tables.</span>
+<span class="cm"> *</span>
+<span class="cm"> * spgd_addr() takes the virtual address and returns a pointer to the top-level</span>
+<span class="cm"> * page directory entry (PGD) for that address.  Since we keep track of several</span>
+<span class="cm"> * page tables, the &quot;i&quot; argument tells us which one we&#39;re interested in (it&#39;s</span>
+<span class="cm"> * usually the current one).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">pgd_t</span> <span class="o">*</span><span class="nf">spgd_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">u32</span> <span class="n">i</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="n">pgd_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">);</span>
+
+<span class="cp">#ifndef CONFIG_X86_PAE</span>
+	<span class="cm">/* We kill any Guest trying to touch the Switcher addresses. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">SWITCHER_PGD_INDEX</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;attempt to access switcher pages&quot;</span><span class="p">);</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="cp">#endif</span>
+	<span class="cm">/* Return a pointer index&#39;th pgd entry for the i&#39;th page table. */</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span><span class="p">[</span><span class="n">index</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="cm">/*</span>
+<span class="cm"> * This routine then takes the PGD entry given above, which contains the</span>
+<span class="cm"> * address of the PMD page.  It then returns a pointer to the PMD entry for the</span>
+<span class="cm"> * given address.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">pmd_t</span> <span class="o">*</span><span class="nf">spmd_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pgd_t</span> <span class="n">spgd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="n">pmd_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">);</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="cm">/* We kill any Guest trying to touch the Switcher addresses. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">)</span> <span class="o">==</span> <span class="n">SWITCHER_PGD_INDEX</span> <span class="o">&amp;&amp;</span>
+					<span class="n">index</span> <span class="o">&gt;=</span> <span class="n">SWITCHER_PMD_INDEX</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;attempt to access switcher pages&quot;</span><span class="p">);</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* You should never call this if the PGD entry wasn&#39;t valid */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">page</span><span class="p">[</span><span class="n">index</span><span class="p">];</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This routine then takes the page directory entry returned above, which</span>
+<span class="cm"> * contains the address of the page table entry (PTE) page.  It then returns a</span>
+<span class="cm"> * pointer to the PTE entry for the given address.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">pte_t</span> <span class="o">*</span><span class="nf">spte_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pgd_t</span> <span class="n">spgd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmd</span> <span class="o">=</span> <span class="n">spmd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pmd_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">pmd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+	<span class="cm">/* You should never call this if the PMD entry wasn&#39;t valid */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">pmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+<span class="cp">#else</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+	<span class="cm">/* You should never call this if the PGD entry wasn&#39;t valid */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+<span class="cp">#endif</span>
+
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">page</span><span class="p">[</span><span class="n">pte_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">)];</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * These functions are just like the above, except they access the Guest</span>
+<span class="cm"> * page tables.  Hence they return a Guest address.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">gpgd_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="n">vaddr</span> <span class="o">&gt;&gt;</span> <span class="p">(</span><span class="n">PGDIR_SHIFT</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">].</span><span class="n">gpgdir</span> <span class="o">+</span> <span class="n">index</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">pgd_t</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="cm">/* Follow the PGD to the PMD. */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">gpmd_addr</span><span class="p">(</span><span class="n">pgd_t</span> <span class="n">gpgd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpage</span> <span class="o">=</span> <span class="n">pgd_pfn</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+	<span class="k">return</span> <span class="n">gpage</span> <span class="o">+</span> <span class="n">pmd_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">pmd_t</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Follow the PMD to the PTE. */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">gpte_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span>
+			       <span class="n">pmd_t</span> <span class="n">gpmd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpage</span> <span class="o">=</span> <span class="n">pmd_pfn</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+	<span class="k">return</span> <span class="n">gpage</span> <span class="o">+</span> <span class="n">pte_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">pte_t</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#else</span>
+<span class="cm">/* Follow the PGD to the PTE (no mid-level for !PAE). */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">gpte_addr</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span>
+				<span class="n">pgd_t</span> <span class="n">gpgd</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpage</span> <span class="o">=</span> <span class="n">pgd_pfn</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+	<span class="k">return</span> <span class="n">gpage</span> <span class="o">+</span> <span class="n">pte_index</span><span class="p">(</span><span class="n">vaddr</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">pte_t</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+<span class="cm">/*:*/</span>
+
+<span class="cm">/*M:007</span>
+<span class="cm"> * get_pfn is slow: we could probably try to grab batches of pages here as</span>
+<span class="cm"> * an optimization (ie. pre-faulting).</span>
+<span class="cm">:*/</span>
+
+<span class="cm">/*H:350</span>
+<span class="cm"> * This routine takes a page number given by the Guest and converts it to</span>
+<span class="cm"> * an actual, physical page number.  It can fail for several reasons: the</span>
+<span class="cm"> * virtual address might not be mapped by the Launcher, the write flag is set</span>
+<span class="cm"> * and the page is read-only, or the write flag was set and the page was</span>
+<span class="cm"> * shared so had to be copied, but we ran out of memory.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This holds a reference to the page, so release_pte() is careful to put that</span>
+<span class="cm"> * back.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">get_pfn</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">virtpfn</span><span class="p">,</span> <span class="kt">int</span> <span class="n">write</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="cm">/* gup me one page at this address please! */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">get_user_pages_fast</span><span class="p">(</span><span class="n">virtpfn</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">write</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">page</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">page_to_pfn</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="cm">/* This value indicates failure. */</span>
+	<span class="k">return</span> <span class="o">-</span><span class="mi">1UL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:340</span>
+<span class="cm"> * Converting a Guest page table entry to a shadow (ie. real) page table</span>
+<span class="cm"> * entry can be a little tricky.  The flags are (almost) the same, but the</span>
+<span class="cm"> * Guest PTE contains a virtual page number: the CPU needs the real page</span>
+<span class="cm"> * number.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">pte_t</span> <span class="nf">gpte_to_spte</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pte_t</span> <span class="n">gpte</span><span class="p">,</span> <span class="kt">int</span> <span class="n">write</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The Guest sets the global flag, because it thinks that it is using</span>
+<span class="cm">	 * PGE.  We only told it to use PGE so it would tell us whether it was</span>
+<span class="cm">	 * flushing a kernel mapping or a userspace mapping.  We don&#39;t actually</span>
+<span class="cm">	 * use the global bit, so throw it away.</span>
+<span class="cm">	 */</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">_PAGE_GLOBAL</span><span class="p">);</span>
+
+	<span class="cm">/* The Guest&#39;s pages are offset inside the Launcher. */</span>
+	<span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">mem_base</span> <span class="o">/</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We need a temporary &quot;unsigned long&quot; variable to hold the answer from</span>
+<span class="cm">	 * get_pfn(), because it returns 0xFFFFFFFF on failure, which wouldn&#39;t</span>
+<span class="cm">	 * fit in spte.pfn.  get_pfn() finds the real physical number of the</span>
+<span class="cm">	 * page, given the virtual number.</span>
+<span class="cm">	 */</span>
+	<span class="n">pfn</span> <span class="o">=</span> <span class="n">get_pfn</span><span class="p">(</span><span class="n">base</span> <span class="o">+</span> <span class="n">pte_pfn</span><span class="p">(</span><span class="n">gpte</span><span class="p">),</span> <span class="n">write</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pfn</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1UL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;failed to get page %lu&quot;</span><span class="p">,</span> <span class="n">pte_pfn</span><span class="p">(</span><span class="n">gpte</span><span class="p">));</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * When we destroy the Guest, we&#39;ll go through the shadow page</span>
+<span class="cm">		 * tables and release_pte() them.  Make sure we don&#39;t think</span>
+<span class="cm">		 * this one is valid!</span>
+<span class="cm">		 */</span>
+		<span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* Now we assemble our shadow PTE from the page number and flags. */</span>
+	<span class="k">return</span> <span class="n">pfn_pte</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="n">__pgprot</span><span class="p">(</span><span class="n">flags</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:460 And to complete the chain, release_pte() looks like this: */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">release_pte</span><span class="p">(</span><span class="n">pte_t</span> <span class="n">pte</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Remember that get_user_pages_fast() took a reference to the page, in</span>
+<span class="cm">	 * get_pfn()?  We have to put it back now.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">pte_page</span><span class="p">(</span><span class="n">pte</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_gpte</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pte_t</span> <span class="n">gpte</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PSE</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="n">pte_pfn</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pfn_limit</span><span class="p">)</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad page table entry&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_gpgd</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pgd_t</span> <span class="n">gpgd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">CHECK_GPGD_MASK</span><span class="p">)</span> <span class="o">||</span>
+	   <span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pfn_limit</span><span class="p">))</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad page directory entry&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">check_gpmd</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pmd_t</span> <span class="n">gpmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">pmd_flags</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">_PAGE_TABLE</span><span class="p">)</span> <span class="o">||</span>
+	   <span class="p">(</span><span class="n">pmd_pfn</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pfn_limit</span><span class="p">))</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad page middle directory entry&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*H:330</span>
+<span class="cm"> * (i) Looking up a page table entry when the Guest faults.</span>
+<span class="cm"> *</span>
+<span class="cm"> * We saw this call in run_guest(): when we see a page fault in the Guest, we</span>
+<span class="cm"> * come here.  That&#39;s because we only set up the shadow page tables lazily as</span>
+<span class="cm"> * they&#39;re needed, so we get page faults all the time and quietly fix them up</span>
+<span class="cm"> * and return to the Guest without it knowing.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we fixed up the fault (ie. we mapped the address), this routine returns</span>
+<span class="cm"> * true.  Otherwise, it was a real fault and we need to tell the Guest.</span>
+<span class="cm"> */</span>
+<span class="n">bool</span> <span class="nf">demand_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="kt">int</span> <span class="n">errcode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pgd_t</span> <span class="n">gpgd</span><span class="p">;</span>
+	<span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpte_ptr</span><span class="p">;</span>
+	<span class="n">pte_t</span> <span class="n">gpte</span><span class="p">;</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">spte</span><span class="p">;</span>
+
+	<span class="cm">/* Mid level for PAE. */</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">spmd</span><span class="p">;</span>
+	<span class="n">pmd_t</span> <span class="n">gpmd</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* First step: get the top-level Guest page table entry. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Faking up a linear mapping. */</span>
+		<span class="n">gpgd</span> <span class="o">=</span> <span class="n">__pgd</span><span class="p">(</span><span class="n">CHECK_GPGD_MASK</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">gpgd</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpgd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pgd_t</span><span class="p">);</span>
+		<span class="cm">/* Toplevel not present?  We can&#39;t map it in. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+			<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Now look at the matching shadow entry. */</span>
+	<span class="n">spgd</span> <span class="o">=</span> <span class="n">spgd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* No shadow entry: allocate a new shadow PTE page. */</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ptepage</span> <span class="o">=</span> <span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * This is not really the Guest&#39;s fault, but killing it is</span>
+<span class="cm">		 * simple for this corner case.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ptepage</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;out of memory allocating pte page&quot;</span><span class="p">);</span>
+			<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="cm">/* We check that the Guest pgd is OK. */</span>
+		<span class="n">check_gpgd</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpgd</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * And we copy the flags to the shadow PGD entry.  The page</span>
+<span class="cm">		 * number in the shadow PGD is the page we just allocated.</span>
+<span class="cm">		 */</span>
+		<span class="n">set_pgd</span><span class="p">(</span><span class="n">spgd</span><span class="p">,</span> <span class="n">__pgd</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">ptepage</span><span class="p">)</span> <span class="o">|</span> <span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)));</span>
+	<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Faking up a linear mapping. */</span>
+		<span class="n">gpmd</span> <span class="o">=</span> <span class="n">__pmd</span><span class="p">(</span><span class="n">_PAGE_TABLE</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">gpmd</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpmd_addr</span><span class="p">(</span><span class="n">gpgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pmd_t</span><span class="p">);</span>
+		<span class="cm">/* Middle level not present?  We can&#39;t map it in. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+			<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Now look at the matching shadow entry. */</span>
+	<span class="n">spmd</span> <span class="o">=</span> <span class="n">spmd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* No shadow entry: allocate a new shadow PTE page. */</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ptepage</span> <span class="o">=</span> <span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * This is not really the Guest&#39;s fault, but killing it is</span>
+<span class="cm">		 * simple for this corner case.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ptepage</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;out of memory allocating pte page&quot;</span><span class="p">);</span>
+			<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* We check that the Guest pmd is OK. */</span>
+		<span class="n">check_gpmd</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpmd</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * And we copy the flags to the shadow PMD entry.  The page</span>
+<span class="cm">		 * number in the shadow PMD is the page we just allocated.</span>
+<span class="cm">		 */</span>
+		<span class="n">set_pmd</span><span class="p">(</span><span class="n">spmd</span><span class="p">,</span> <span class="n">__pmd</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">ptepage</span><span class="p">)</span> <span class="o">|</span> <span class="n">pmd_flags</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)));</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * OK, now we look at the lower level in the Guest page table: keep its</span>
+<span class="cm">	 * address, because we might update it later.</span>
+<span class="cm">	 */</span>
+	<span class="n">gpte_ptr</span> <span class="o">=</span> <span class="n">gpte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpmd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * OK, now we look at the lower level in the Guest page table: keep its</span>
+<span class="cm">	 * address, because we might update it later.</span>
+<span class="cm">	 */</span>
+	<span class="n">gpte_ptr</span> <span class="o">=</span> <span class="n">gpte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* Linear?  Make up a PTE which points to same page. */</span>
+		<span class="n">gpte</span> <span class="o">=</span> <span class="n">__pte</span><span class="p">((</span><span class="n">vaddr</span> <span class="o">&amp;</span> <span class="n">PAGE_MASK</span><span class="p">)</span> <span class="o">|</span> <span class="n">_PAGE_RW</span> <span class="o">|</span> <span class="n">_PAGE_PRESENT</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Read the actual PTE value. */</span>
+		<span class="n">gpte</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte_ptr</span><span class="p">,</span> <span class="n">pte_t</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* If this page isn&#39;t in the Guest page tables, we can&#39;t page it in. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check they&#39;re not trying to write to a page the Guest wants</span>
+<span class="cm">	 * read-only (bit 2 of errcode == write).</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">errcode</span> <span class="o">&amp;</span> <span class="mi">2</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_RW</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/* User access to a kernel-only page? (bit 3 == user access) */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">errcode</span> <span class="o">&amp;</span> <span class="mi">4</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_USER</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check that the Guest PTE flags are OK, and the page number is below</span>
+<span class="cm">	 * the pfn_limit (ie. not mapping the Launcher binary).</span>
+<span class="cm">	 */</span>
+	<span class="n">check_gpte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte</span><span class="p">);</span>
+
+	<span class="cm">/* Add the _PAGE_ACCESSED and (for a write) _PAGE_DIRTY flag */</span>
+	<span class="n">gpte</span> <span class="o">=</span> <span class="n">pte_mkyoung</span><span class="p">(</span><span class="n">gpte</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">errcode</span> <span class="o">&amp;</span> <span class="mi">2</span><span class="p">)</span>
+		<span class="n">gpte</span> <span class="o">=</span> <span class="n">pte_mkdirty</span><span class="p">(</span><span class="n">gpte</span><span class="p">);</span>
+
+	<span class="cm">/* Get the pointer to the shadow PTE entry we&#39;re going to set. */</span>
+	<span class="n">spte</span> <span class="o">=</span> <span class="n">spte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If there was a valid shadow PTE entry here before, we release it.</span>
+<span class="cm">	 * This can happen with a write to a previously read-only entry.</span>
+<span class="cm">	 */</span>
+	<span class="n">release_pte</span><span class="p">(</span><span class="o">*</span><span class="n">spte</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If this is a write, we insist that the Guest page is writable (the</span>
+<span class="cm">	 * final arg to gpte_to_spte()).</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pte_dirty</span><span class="p">(</span><span class="n">gpte</span><span class="p">))</span>
+		<span class="o">*</span><span class="n">spte</span> <span class="o">=</span> <span class="n">gpte_to_spte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * If this is a read, don&#39;t set the &quot;writable&quot; bit in the page</span>
+<span class="cm">		 * table entry, even if the Guest says it&#39;s writable.  That way</span>
+<span class="cm">		 * we will come back here when a write does actually occur, so</span>
+<span class="cm">		 * we can update the Guest&#39;s _PAGE_DIRTY flag.</span>
+<span class="cm">		 */</span>
+		<span class="n">set_pte</span><span class="p">(</span><span class="n">spte</span><span class="p">,</span> <span class="n">gpte_to_spte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pte_wrprotect</span><span class="p">(</span><span class="n">gpte</span><span class="p">),</span> <span class="mi">0</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Finally, we write the Guest PTE entry back: we&#39;ve set the</span>
+<span class="cm">	 * _PAGE_ACCESSED and maybe the _PAGE_DIRTY flags.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="o">!</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span>
+		<span class="n">lgwrite</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte_ptr</span><span class="p">,</span> <span class="n">pte_t</span><span class="p">,</span> <span class="n">gpte</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The fault is fixed, the page table is populated, the mapping</span>
+<span class="cm">	 * manipulated, the result returned and the code complete.  A small</span>
+<span class="cm">	 * delay and a trace of alliteration are the only indications the Guest</span>
+<span class="cm">	 * has that a page fault occurred at all.</span>
+<span class="cm">	 */</span>
+	<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:360</span>
+<span class="cm"> * (ii) Making sure the Guest stack is mapped.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Remember that direct traps into the Guest need a mapped Guest kernel stack.</span>
+<span class="cm"> * pin_stack_pages() calls us here: we could simply call demand_page(), but as</span>
+<span class="cm"> * we&#39;ve seen that logic is quite long, and usually the stack pages are already</span>
+<span class="cm"> * mapped, so it&#39;s overkill.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is a quick version which answers the question: is this virtual address</span>
+<span class="cm"> * mapped by the shadow page tables, and is it writable?</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">page_writable</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">spmd</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="cm">/* Look at the current top level entry: is it present? */</span>
+	<span class="n">spgd</span> <span class="o">=</span> <span class="n">spgd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">spmd</span> <span class="o">=</span> <span class="n">spmd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Check the flags on the pte entry itself: it must be present and</span>
+<span class="cm">	 * writable.</span>
+<span class="cm">	 */</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">pte_flags</span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="n">spte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">)));</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">_PAGE_PRESENT</span><span class="o">|</span><span class="n">_PAGE_RW</span><span class="p">))</span> <span class="o">==</span> <span class="p">(</span><span class="n">_PAGE_PRESENT</span><span class="o">|</span><span class="n">_PAGE_RW</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * So, when pin_stack_pages() asks us to pin a page, we check if it&#39;s already</span>
+<span class="cm"> * in the page tables, and if not, we call demand_page() with error code 2</span>
+<span class="cm"> * (meaning &quot;write&quot;).</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">pin_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page_writable</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">demand_page</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad stack page %#lx&quot;</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">release_pmd</span><span class="p">(</span><span class="n">pmd_t</span> <span class="o">*</span><span class="n">spmd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* If the entry&#39;s not present, there&#39;s nothing to release. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+		<span class="n">pte_t</span> <span class="o">*</span><span class="n">ptepage</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pmd_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">spmd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+		<span class="cm">/* For each entry in the page, we might need to release it. */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">PTRS_PER_PTE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">release_pte</span><span class="p">(</span><span class="n">ptepage</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="cm">/* Now we can free the page of PTEs */</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">ptepage</span><span class="p">);</span>
+		<span class="cm">/* And zero out the PMD entry so we never release it twice. */</span>
+		<span class="n">set_pmd</span><span class="p">(</span><span class="n">spmd</span><span class="p">,</span> <span class="n">__pmd</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">release_pgd</span><span class="p">(</span><span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* If the entry&#39;s not present, there&#39;s nothing to release. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+		<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmdpage</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">PTRS_PER_PMD</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">release_pmd</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmdpage</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+
+		<span class="cm">/* Now we can free the page of PMDs */</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">pmdpage</span><span class="p">);</span>
+		<span class="cm">/* And zero out the PGD entry so we never release it twice. */</span>
+		<span class="n">set_pgd</span><span class="p">(</span><span class="n">spgd</span><span class="p">,</span> <span class="n">__pgd</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cp">#else </span><span class="cm">/* !CONFIG_X86_PAE */</span><span class="cp"></span>
+<span class="cm">/*H:450</span>
+<span class="cm"> * If we chase down the release_pgd() code, the non-PAE version looks like</span>
+<span class="cm"> * this.  The PAE version is almost identical, but instead of calling</span>
+<span class="cm"> * release_pte it calls release_pmd(), which looks much like this.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">release_pgd</span><span class="p">(</span><span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* If the entry&#39;s not present, there&#39;s nothing to release. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Converting the pfn to find the actual PTE page is easy: turn</span>
+<span class="cm">		 * the page number into a physical address, then convert to a</span>
+<span class="cm">		 * virtual address (easy for kernel pages like this one).</span>
+<span class="cm">		 */</span>
+		<span class="n">pte_t</span> <span class="o">*</span><span class="n">ptepage</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+		<span class="cm">/* For each entry in the page, we might need to release it. */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">PTRS_PER_PTE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="n">release_pte</span><span class="p">(</span><span class="n">ptepage</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="cm">/* Now we can free the page of PTEs */</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">ptepage</span><span class="p">);</span>
+		<span class="cm">/* And zero out the PGD entry so we never release it twice. */</span>
+		<span class="o">*</span><span class="n">spgd</span> <span class="o">=</span> <span class="n">__pgd</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*H:445</span>
+<span class="cm"> * We saw flush_user_mappings() twice: once from the flush_user_mappings()</span>
+<span class="cm"> * hypercall and once in new_pgdir() when we re-used a top-level pgdir page.</span>
+<span class="cm"> * It simply releases every PTE page from 0 up to the Guest&#39;s kernel address.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">flush_user_mappings</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">idx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="cm">/* Release every pgd entry up to the kernel&#39;s address. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pgd_index</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">release_pgd</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">idx</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:440</span>
+<span class="cm"> * (v) Flushing (throwing away) page tables,</span>
+<span class="cm"> *</span>
+<span class="cm"> * The Guest has a hypercall to throw away the page tables: it&#39;s used when a</span>
+<span class="cm"> * large number of mappings have been changed.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">guest_pagetable_flush_user</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Drop the userspace part of the current page table. */</span>
+	<span class="n">flush_user_mappings</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">,</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="cm">/* We walk down the guest page tables to get a guest-physical address */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">guest_pa</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pgd_t</span> <span class="n">gpgd</span><span class="p">;</span>
+	<span class="n">pte_t</span> <span class="n">gpte</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="n">gpmd</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* Still not set up?  Just map 1:1. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">vaddr</span><span class="p">;</span>
+
+	<span class="cm">/* First step: get the top-level Guest page table entry. */</span>
+	<span class="n">gpgd</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpgd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pgd_t</span><span class="p">);</span>
+	<span class="cm">/* Toplevel not present?  We can&#39;t map it in. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="n">gpgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;Bad address %#lx&quot;</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1UL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">gpmd</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpmd_addr</span><span class="p">(</span><span class="n">gpgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pmd_t</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="n">gpmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;Bad address %#lx&quot;</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+	<span class="n">gpte</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpmd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pte_t</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="n">gpte</span> <span class="o">=</span> <span class="n">lgread</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">),</span> <span class="n">pte_t</span><span class="p">);</span>
+<span class="cp">#endif</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">))</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;Bad address %#lx&quot;</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">pte_pfn</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span> <span class="o">|</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We keep several page tables.  This is a simple routine to find the page</span>
+<span class="cm"> * table (if any) corresponding to this top-level address the Guest has given</span>
+<span class="cm"> * us.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">find_pgdir</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pgtable</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">&amp;&amp;</span> <span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">gpgdir</span> <span class="o">==</span> <span class="n">pgtable</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:435</span>
+<span class="cm"> * And this is us, creating the new page directory.  If we really do</span>
+<span class="cm"> * allocate a new one (and so the kernel parts are not there), we set</span>
+<span class="cm"> * blank_pgdir.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">new_pgdir</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span>
+			      <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpgdir</span><span class="p">,</span>
+			      <span class="kt">int</span> <span class="o">*</span><span class="n">blank_pgdir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">next</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmd_table</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We pick one entry at random to throw out.  Choosing the Least</span>
+<span class="cm">	 * Recently Used might be better, but this is easy.</span>
+<span class="cm">	 */</span>
+	<span class="n">next</span> <span class="o">=</span> <span class="n">random32</span><span class="p">()</span> <span class="o">%</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span>
+	<span class="cm">/* If it&#39;s never been allocated at all before, try now. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">=</span>
+					<span class="p">(</span><span class="n">pgd_t</span> <span class="o">*</span><span class="p">)</span><span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="cm">/* If the allocation fails, just keep using the one we have */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span><span class="p">)</span>
+			<span class="n">next</span> <span class="o">=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * In PAE mode, allocate a pmd page and populate the</span>
+<span class="cm">			 * last pgd entry.</span>
+<span class="cm">			 */</span>
+			<span class="n">pmd_table</span> <span class="o">=</span> <span class="p">(</span><span class="n">pmd_t</span> <span class="o">*</span><span class="p">)</span><span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pmd_table</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span><span class="p">);</span>
+				<span class="n">set_pgd</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span><span class="p">,</span> <span class="n">__pgd</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+				<span class="n">next</span> <span class="o">=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">set_pgd</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">+</span>
+					<span class="n">SWITCHER_PGD_INDEX</span><span class="p">,</span>
+					<span class="n">__pgd</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">pmd_table</span><span class="p">)</span> <span class="o">|</span> <span class="n">_PAGE_PRESENT</span><span class="p">));</span>
+				<span class="cm">/*</span>
+<span class="cm">				 * This is a blank page, so there are no kernel</span>
+<span class="cm">				 * mappings: caller must map the stack!</span>
+<span class="cm">				 */</span>
+				<span class="o">*</span><span class="n">blank_pgdir</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="p">}</span>
+<span class="cp">#else</span>
+			<span class="o">*</span><span class="n">blank_pgdir</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+<span class="cp">#endif</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="cm">/* Record which Guest toplevel this shadows. */</span>
+	<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">next</span><span class="p">].</span><span class="n">gpgdir</span> <span class="o">=</span> <span class="n">gpgdir</span><span class="p">;</span>
+	<span class="cm">/* Release all the non-kernel mappings. */</span>
+	<span class="n">flush_user_mappings</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">,</span> <span class="n">next</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">next</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:470</span>
+<span class="cm"> * Finally, a routine which throws away everything: all PGD entries in all</span>
+<span class="cm"> * the shadow page tables, including the Guest&#39;s kernel mappings.  This is used</span>
+<span class="cm"> * when we destroy the Guest.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">release_all_pagetables</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">;</span>
+
+	<span class="cm">/* Every shadow pagetable this Guest has */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+			<span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span><span class="p">;</span>
+			<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmdpage</span><span class="p">;</span>
+			<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">k</span><span class="p">;</span>
+
+			<span class="cm">/* Get the last pmd page. */</span>
+			<span class="n">spgd</span> <span class="o">=</span> <span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">+</span> <span class="n">SWITCHER_PGD_INDEX</span><span class="p">;</span>
+			<span class="n">pmdpage</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * And release the pmd entries of that pmd page,</span>
+<span class="cm">			 * except for the switcher pmd.</span>
+<span class="cm">			 */</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">k</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">k</span> <span class="o">&lt;</span> <span class="n">SWITCHER_PMD_INDEX</span><span class="p">;</span> <span class="n">k</span><span class="o">++</span><span class="p">)</span>
+				<span class="n">release_pmd</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmdpage</span><span class="p">[</span><span class="n">k</span><span class="p">]);</span>
+<span class="cp">#endif</span>
+			<span class="cm">/* Every PGD entry except the Switcher at the top */</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">SWITCHER_PGD_INDEX</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span>
+				<span class="n">release_pgd</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">+</span> <span class="n">j</span><span class="p">);</span>
+		<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We also throw away everything when a Guest tells us it&#39;s changed a kernel</span>
+<span class="cm"> * mapping.  Since kernel mappings are in every page table, it&#39;s easiest to</span>
+<span class="cm"> * throw them all away.  This traps the Guest in amber for a while as</span>
+<span class="cm"> * everything faults back in, but it&#39;s rare.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">guest_pagetable_clear_all</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">release_all_pagetables</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">);</span>
+	<span class="cm">/* We need the Guest kernel stack mapped again. */</span>
+	<span class="n">pin_stack_pages</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:430</span>
+<span class="cm"> * (iv) Switching page tables</span>
+<span class="cm"> *</span>
+<span class="cm"> * Now we&#39;ve seen all the page table setting and manipulation, let&#39;s see</span>
+<span class="cm"> * what happens when the Guest changes page tables (ie. changes the top-level</span>
+<span class="cm"> * pgdir).  This occurs on almost every context switch.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">guest_new_pagetable</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pgtable</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">newpgdir</span><span class="p">,</span> <span class="n">repin</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The very first time they call this, we&#39;re actually running without</span>
+<span class="cm">	 * any page tables; we&#39;ve been making it up.  Throw them away now.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">release_all_pagetables</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">);</span>
+		<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="cm">/* Force allocation of a new pgdir. */</span>
+		<span class="n">newpgdir</span> <span class="o">=</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Look to see if we have this one already. */</span>
+		<span class="n">newpgdir</span> <span class="o">=</span> <span class="n">find_pgdir</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">,</span> <span class="n">pgtable</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * If not, we allocate or mug an existing one: if it&#39;s a fresh one,</span>
+<span class="cm">	 * repin gets set to 1.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">newpgdir</span> <span class="o">==</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">))</span>
+		<span class="n">newpgdir</span> <span class="o">=</span> <span class="n">new_pgdir</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pgtable</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">repin</span><span class="p">);</span>
+	<span class="cm">/* Change the current pgd index to the new one. */</span>
+	<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span> <span class="o">=</span> <span class="n">newpgdir</span><span class="p">;</span>
+	<span class="cm">/* If it was completely blank, we map in the Guest kernel stack */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">repin</span><span class="p">)</span>
+		<span class="n">pin_stack_pages</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="cm">/*M:009</span>
+<span class="cm"> * Since we throw away all mappings when a kernel mapping changes, our</span>
+<span class="cm"> * performance sucks for guests using highmem.  In fact, a guest with</span>
+<span class="cm"> * PAGE_OFFSET 0xc0000000 (the default) and more than about 700MB of RAM is</span>
+<span class="cm"> * usually slower than a Guest with less memory.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This, of course, cannot be fixed.  It would take some kind of... well, I</span>
+<span class="cm"> * don&#39;t know, but the term &quot;puissant code-fu&quot; comes to mind.</span>
+<span class="cm">:*/</span>
+
+<span class="cm">/*H:420</span>
+<span class="cm"> * This is the routine which actually sets the page table entry for then</span>
+<span class="cm"> * &quot;idx&quot;&#39;th shadow page table.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Normally, we can just throw out the old entry and replace it with 0: if they</span>
+<span class="cm"> * use it demand_page() will put the new entry in.  We need to do this anyway:</span>
+<span class="cm"> * The Guest expects _PAGE_ACCESSED to be set on its PTE the first time a page</span>
+<span class="cm"> * is read from, and _PAGE_DIRTY when it&#39;s written to.</span>
+<span class="cm"> *</span>
+<span class="cm"> * But Avi Kivity pointed out that most Operating Systems (Linux included) set</span>
+<span class="cm"> * these bits on PTEs immediately anyway.  This is done to save the CPU from</span>
+<span class="cm"> * having to update them, but it helps us the same way: if they set</span>
+<span class="cm"> * _PAGE_ACCESSED then we can put a read-only PTE entry in immediately, and if</span>
+<span class="cm"> * they set _PAGE_DIRTY then we can put a writable PTE entry in immediately.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">do_set_pte</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="kt">int</span> <span class="n">idx</span><span class="p">,</span>
+		       <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">pte_t</span> <span class="n">gpte</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Look up the matching shadow page directory entry. */</span>
+	<span class="n">pgd_t</span> <span class="o">*</span><span class="n">spgd</span> <span class="o">=</span> <span class="n">spgd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">spmd</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* If the top level isn&#39;t present, there&#39;s no entry to update. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spgd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+		<span class="n">spmd</span> <span class="o">=</span> <span class="n">spmd_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pmd_flags</span><span class="p">(</span><span class="o">*</span><span class="n">spmd</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_PRESENT</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#endif</span>
+			<span class="cm">/* Otherwise, start by releasing the existing entry. */</span>
+			<span class="n">pte_t</span> <span class="o">*</span><span class="n">spte</span> <span class="o">=</span> <span class="n">spte_addr</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">*</span><span class="n">spgd</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">);</span>
+			<span class="n">release_pte</span><span class="p">(</span><span class="o">*</span><span class="n">spte</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * If they&#39;re setting this entry as dirty or accessed,</span>
+<span class="cm">			 * we might as well put that entry they&#39;ve given us in</span>
+<span class="cm">			 * now.  This shaves 10% off a copy-on-write</span>
+<span class="cm">			 * micro-benchmark.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">_PAGE_DIRTY</span> <span class="o">|</span> <span class="n">_PAGE_ACCESSED</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">check_gpte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte</span><span class="p">);</span>
+				<span class="n">set_pte</span><span class="p">(</span><span class="n">spte</span><span class="p">,</span>
+					<span class="n">gpte_to_spte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">gpte</span><span class="p">,</span>
+						<span class="n">pte_flags</span><span class="p">(</span><span class="n">gpte</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_PAGE_DIRTY</span><span class="p">));</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="cm">/*</span>
+<span class="cm">				 * Otherwise kill it and we can demand_page()</span>
+<span class="cm">				 * it in later.</span>
+<span class="cm">				 */</span>
+				<span class="n">set_pte</span><span class="p">(</span><span class="n">spte</span><span class="p">,</span> <span class="n">__pte</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+			<span class="p">}</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+		<span class="p">}</span>
+<span class="cp">#endif</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:410</span>
+<span class="cm"> * Updating a PTE entry is a little trickier.</span>
+<span class="cm"> *</span>
+<span class="cm"> * We keep track of several different page tables (the Guest uses one for each</span>
+<span class="cm"> * process, so it makes sense to cache at least a few).  Each of these have</span>
+<span class="cm"> * identical kernel parts: ie. every mapping above PAGE_OFFSET is the same for</span>
+<span class="cm"> * all processes.  So when the page table above that address changes, we update</span>
+<span class="cm"> * all the page tables, not just the current one.  This is rare.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The benefit is that when we have to track a new page table, we can keep all</span>
+<span class="cm"> * the kernel mappings.  This speeds up context switch immensely.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">guest_set_pte</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span>
+		   <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpgdir</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">pte_t</span> <span class="n">gpte</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Kernel mappings must be changed on all top levels.  Slow, but doesn&#39;t</span>
+<span class="cm">	 * happen often.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">vaddr</span> <span class="o">&gt;=</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span><span class="p">)</span>
+				<span class="n">do_set_pte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">gpte</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Is this page table one we have a shadow for? */</span>
+		<span class="kt">int</span> <span class="n">pgdir</span> <span class="o">=</span> <span class="n">find_pgdir</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="p">,</span> <span class="n">gpgdir</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pgdir</span> <span class="o">!=</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">))</span>
+			<span class="cm">/* If so, do the update. */</span>
+			<span class="n">do_set_pte</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">pgdir</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">gpte</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:400</span>
+<span class="cm"> * (iii) Setting up a page table entry when the Guest tells us one has changed.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Just like we did in interrupts_and_traps.c, it makes sense for us to deal</span>
+<span class="cm"> * with the other side of page tables while we&#39;re here: what happens when the</span>
+<span class="cm"> * Guest asks for a page table to be updated?</span>
+<span class="cm"> *</span>
+<span class="cm"> * We already saw that demand_page() will fill in the shadow page tables when</span>
+<span class="cm"> * needed, so we can simply remove shadow page table entries whenever the Guest</span>
+<span class="cm"> * tells us they&#39;ve changed.  When the Guest tries to use the new entry it will</span>
+<span class="cm"> * fault and demand_page() will fix it up.</span>
+<span class="cm"> *</span>
+<span class="cm"> * So with that in mind here&#39;s our code to update a (top-level) PGD entry:</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">guest_set_pgd</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">gpgdir</span><span class="p">,</span> <span class="n">u32</span> <span class="n">idx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">pgdir</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">idx</span> <span class="o">&gt;=</span> <span class="n">SWITCHER_PGD_INDEX</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* If they&#39;re talking about a page table we have a shadow for... */</span>
+	<span class="n">pgdir</span> <span class="o">=</span> <span class="n">find_pgdir</span><span class="p">(</span><span class="n">lg</span><span class="p">,</span> <span class="n">gpgdir</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgdir</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">))</span>
+		<span class="cm">/* ... throw it away. */</span>
+		<span class="n">release_pgd</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">pgdir</span><span class="p">].</span><span class="n">pgdir</span> <span class="o">+</span> <span class="n">idx</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+<span class="cm">/* For setting a mid-level, we just throw everything away.  It&#39;s easy. */</span>
+<span class="kt">void</span> <span class="nf">guest_set_pmd</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pmdp</span><span class="p">,</span> <span class="n">u32</span> <span class="n">idx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">guest_pagetable_clear_all</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">cpus</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*H:500</span>
+<span class="cm"> * (vii) Setting up the page tables initially.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When a Guest is first created, set initialize a shadow page table which</span>
+<span class="cm"> * we will populate on future faults.  The Guest doesn&#39;t have any actual</span>
+<span class="cm"> * pagetables yet, so we set linear_pages to tell demand_page() to fake it</span>
+<span class="cm"> * for the moment.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">init_guest_pagetable</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">cpus</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">allocated</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* lg (and lg-&gt;cpus[]) starts zeroed: this allocates a new pgdir */</span>
+	<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span> <span class="o">=</span> <span class="n">new_pgdir</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">allocated</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">allocated</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="cm">/* We start with a linear mapping until the initialize. */</span>
+	<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">linear_pages</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:508 When the Guest calls LHCALL_LGUEST_INIT we do more setup. */</span>
+<span class="kt">void</span> <span class="nf">page_table_guest_data_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* We get the kernel address: above this is all kernel memory. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">get_user</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">,</span>
+		<span class="o">&amp;</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">lguest_data</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">)</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * We tell the Guest that it can&#39;t use the top 2 or 4 MB</span>
+<span class="cm">		 * of virtual addresses used by the Switcher.</span>
+<span class="cm">		 */</span>
+		<span class="o">||</span> <span class="n">put_user</span><span class="p">(</span><span class="n">RESERVE_MEM</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">,</span>
+			    <span class="o">&amp;</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">lguest_data</span><span class="o">-&gt;</span><span class="n">reserve_mem</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad guest page %p&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">lguest_data</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * In flush_user_mappings() we loop from 0 to</span>
+<span class="cm">	 * &quot;pgd_index(lg-&gt;kernel_address)&quot;.  This assumes it won&#39;t hit the</span>
+<span class="cm">	 * Switcher mappings, so check that now.</span>
+<span class="cm">	 */</span>
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_index</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">)</span> <span class="o">==</span> <span class="n">SWITCHER_PGD_INDEX</span> <span class="o">&amp;&amp;</span>
+		<span class="n">pmd_index</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">)</span> <span class="o">==</span> <span class="n">SWITCHER_PMD_INDEX</span><span class="p">)</span>
+<span class="cp">#else</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pgd_index</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">SWITCHER_PGD_INDEX</span><span class="p">)</span>
+<span class="cp">#endif</span>
+		<span class="n">kill_guest</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="s">&quot;bad kernel address %#lx&quot;</span><span class="p">,</span>
+				 <span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">kernel_address</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* When a Guest dies, our cleanup is fairly simple. */</span>
+<span class="kt">void</span> <span class="nf">free_guest_pagetable</span><span class="p">(</span><span class="k">struct</span> <span class="n">lguest</span> <span class="o">*</span><span class="n">lg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/* Throw away all page table pages. */</span>
+	<span class="n">release_all_pagetables</span><span class="p">(</span><span class="n">lg</span><span class="p">);</span>
+	<span class="cm">/* Now free the top levels: free_page() can handle 0 just fine. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">pgdir</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:480</span>
+<span class="cm"> * (vi) Mapping the Switcher when the Guest is about to run.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The Switcher and the two pages for this CPU need to be visible in the</span>
+<span class="cm"> * Guest (and not the pages for other CPUs).  We have the appropriate PTE pages</span>
+<span class="cm"> * for each CPU already set up, we just need to hook them in now we know which</span>
+<span class="cm"> * Guest is about to run on this CPU.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">map_switcher_in_guest</span><span class="p">(</span><span class="k">struct</span> <span class="n">lg_cpu</span> <span class="o">*</span><span class="n">cpu</span><span class="p">,</span> <span class="k">struct</span> <span class="n">lguest_pages</span> <span class="o">*</span><span class="n">pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">switcher_pte_page</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">switcher_pte_pages</span><span class="p">);</span>
+	<span class="n">pte_t</span> <span class="n">regs_pte</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_X86_PAE</span>
+	<span class="n">pmd_t</span> <span class="n">switcher_pmd</span><span class="p">;</span>
+	<span class="n">pmd_t</span> <span class="o">*</span><span class="n">pmd_table</span><span class="p">;</span>
+
+	<span class="n">switcher_pmd</span> <span class="o">=</span> <span class="n">pfn_pmd</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">switcher_pte_page</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span>
+			       <span class="n">PAGE_KERNEL_EXEC</span><span class="p">);</span>
+
+	<span class="cm">/* Figure out where the pmd page is, by reading the PGD, and converting</span>
+<span class="cm">	 * it to a virtual address. */</span>
+	<span class="n">pmd_table</span> <span class="o">=</span> <span class="n">__va</span><span class="p">(</span><span class="n">pgd_pfn</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span>
+			<span class="n">pgdirs</span><span class="p">[</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">].</span><span class="n">pgdir</span><span class="p">[</span><span class="n">SWITCHER_PGD_INDEX</span><span class="p">])</span>
+								<span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+	<span class="cm">/* Now write it into the shadow page table. */</span>
+	<span class="n">set_pmd</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pmd_table</span><span class="p">[</span><span class="n">SWITCHER_PMD_INDEX</span><span class="p">],</span> <span class="n">switcher_pmd</span><span class="p">);</span>
+<span class="cp">#else</span>
+	<span class="n">pgd_t</span> <span class="n">switcher_pgd</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Make the last PGD entry for this Guest point to the Switcher&#39;s PTE</span>
+<span class="cm">	 * page for this CPU (with appropriate flags).</span>
+<span class="cm">	 */</span>
+	<span class="n">switcher_pgd</span> <span class="o">=</span> <span class="n">__pgd</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">switcher_pte_page</span><span class="p">)</span> <span class="o">|</span> <span class="n">__PAGE_KERNEL_EXEC</span><span class="p">);</span>
+
+	<span class="n">cpu</span><span class="o">-&gt;</span><span class="n">lg</span><span class="o">-&gt;</span><span class="n">pgdirs</span><span class="p">[</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">cpu_pgd</span><span class="p">].</span><span class="n">pgdir</span><span class="p">[</span><span class="n">SWITCHER_PGD_INDEX</span><span class="p">]</span> <span class="o">=</span> <span class="n">switcher_pgd</span><span class="p">;</span>
+
+<span class="cp">#endif</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * We also change the Switcher PTE page.  When we&#39;re running the Guest,</span>
+<span class="cm">	 * we want the Guest&#39;s &quot;regs&quot; page to appear where the first Switcher</span>
+<span class="cm">	 * page for this CPU is.  This is an optimization: when the Switcher</span>
+<span class="cm">	 * saves the Guest registers, it saves them into the first page of this</span>
+<span class="cm">	 * CPU&#39;s &quot;struct lguest_pages&quot;: if we make sure the Guest&#39;s register</span>
+<span class="cm">	 * page is already mapped there, we don&#39;t have to copy them out</span>
+<span class="cm">	 * again.</span>
+<span class="cm">	 */</span>
+	<span class="n">regs_pte</span> <span class="o">=</span> <span class="n">pfn_pte</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">cpu</span><span class="o">-&gt;</span><span class="n">regs_page</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="n">PAGE_KERNEL</span><span class="p">);</span>
+	<span class="n">set_pte</span><span class="p">(</span><span class="o">&amp;</span><span class="n">switcher_pte_page</span><span class="p">[</span><span class="n">pte_index</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">pages</span><span class="p">)],</span> <span class="n">regs_pte</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_switcher_pte_pages</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+		<span class="n">free_page</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">switcher_pte_page</span><span class="p">(</span><span class="n">i</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="cm">/*H:520</span>
+<span class="cm"> * Setting up the Switcher PTE page for given CPU is fairly easy, given</span>
+<span class="cm"> * the CPU number and the &quot;struct page&quot;s for the Switcher code itself.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Currently the Switcher is less than a page long, so &quot;pages&quot; is always 1.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">__init</span> <span class="kt">void</span> <span class="nf">populate_switcher_pte_page</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cpu</span><span class="p">,</span>
+					      <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">switcher_page</span><span class="p">[],</span>
+					      <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="n">pte_t</span> <span class="o">*</span><span class="n">pte</span> <span class="o">=</span> <span class="n">switcher_pte_page</span><span class="p">(</span><span class="n">cpu</span><span class="p">);</span>
+
+	<span class="cm">/* The first entries are easy: they map the Switcher code. */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">set_pte</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pte</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">mk_pte</span><span class="p">(</span><span class="n">switcher_page</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+				<span class="n">__pgprot</span><span class="p">(</span><span class="n">_PAGE_PRESENT</span><span class="o">|</span><span class="n">_PAGE_ACCESSED</span><span class="p">)));</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* The only other thing we map is this CPU&#39;s pair of pages. */</span>
+	<span class="n">i</span> <span class="o">=</span> <span class="n">pages</span> <span class="o">+</span> <span class="n">cpu</span><span class="o">*</span><span class="mi">2</span><span class="p">;</span>
+
+	<span class="cm">/* First page (Guest registers) is writable from the Guest */</span>
+	<span class="n">set_pte</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pte</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">pfn_pte</span><span class="p">(</span><span class="n">page_to_pfn</span><span class="p">(</span><span class="n">switcher_page</span><span class="p">[</span><span class="n">i</span><span class="p">]),</span>
+			 <span class="n">__pgprot</span><span class="p">(</span><span class="n">_PAGE_PRESENT</span><span class="o">|</span><span class="n">_PAGE_ACCESSED</span><span class="o">|</span><span class="n">_PAGE_RW</span><span class="p">)));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The second page contains the &quot;struct lguest_ro_state&quot;, and is</span>
+<span class="cm">	 * read-only.</span>
+<span class="cm">	 */</span>
+	<span class="n">set_pte</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pte</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">],</span> <span class="n">pfn_pte</span><span class="p">(</span><span class="n">page_to_pfn</span><span class="p">(</span><span class="n">switcher_page</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">]),</span>
+			   <span class="n">__pgprot</span><span class="p">(</span><span class="n">_PAGE_PRESENT</span><span class="o">|</span><span class="n">_PAGE_ACCESSED</span><span class="p">)));</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We&#39;ve made it through the page table code.  Perhaps our tired brains are</span>
+<span class="cm"> * still processing the details, or perhaps we&#39;re simply glad it&#39;s over.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If nothing else, note that all this complexity in juggling shadow page tables</span>
+<span class="cm"> * in sync with the Guest&#39;s page tables is for one reason: for most Guests this</span>
+<span class="cm"> * page table dance determines how bad performance will be.  This is why Xen</span>
+<span class="cm"> * uses exotic direct Guest pagetable manipulation, and why both Intel and AMD</span>
+<span class="cm"> * have implemented shadow page table support directly into hardware.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There is just one file remaining in the Host.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*H:510</span>
+<span class="cm"> * At boot or module load time, init_pagetables() allocates and populates</span>
+<span class="cm"> * the Switcher PTE page for each CPU.</span>
+<span class="cm"> */</span>
+<span class="n">__init</span> <span class="kt">int</span> <span class="nf">init_pagetables</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">switcher_page</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">switcher_pte_page</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="o">=</span> <span class="p">(</span><span class="n">pte_t</span> <span class="o">*</span><span class="p">)</span><span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">switcher_pte_page</span><span class="p">(</span><span class="n">i</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">free_switcher_pte_pages</span><span class="p">();</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">populate_switcher_pte_page</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">switcher_page</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cm">/*:*/</span>
+
+<span class="cm">/* Cleaning up simply involves freeing the PTE page for each CPU. */</span>
+<span class="kt">void</span> <span class="nf">free_pagetables</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">free_switcher_pte_pages</span><span class="p">();</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

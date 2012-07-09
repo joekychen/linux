@@ -1,0 +1,1268 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › ceph › addr.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>addr.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cp">#include &lt;linux/ceph/ceph_debug.h&gt;</span>
+
+<span class="cp">#include &lt;linux/backing-dev.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/writeback.h&gt;	</span><span class="cm">/* generic_writepages */</span><span class="cp"></span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/pagevec.h&gt;</span>
+<span class="cp">#include &lt;linux/task_io_accounting_ops.h&gt;</span>
+
+<span class="cp">#include &quot;super.h&quot;</span>
+<span class="cp">#include &quot;mds_client.h&quot;</span>
+<span class="cp">#include &lt;linux/ceph/osd_client.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Ceph address space ops.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There are a few funny things going on here.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The page-&gt;private field is used to reference a struct</span>
+<span class="cm"> * ceph_snap_context for _every_ dirty page.  This indicates which</span>
+<span class="cm"> * snapshot the page was logically dirtied in, and thus which snap</span>
+<span class="cm"> * context needs to be associated with the osd write during writeback.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Similarly, struct ceph_inode_info maintains a set of counters to</span>
+<span class="cm"> * count dirty pages on the inode.  In the absence of snapshots,</span>
+<span class="cm"> * i_wrbuffer_ref == i_wrbuffer_ref_head == the dirty page count.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When a snapshot is taken (that is, when the client receives</span>
+<span class="cm"> * notification that a snapshot was taken), each inode with caps and</span>
+<span class="cm"> * with dirty pages (dirty pages implies there is a cap) gets a new</span>
+<span class="cm"> * ceph_cap_snap in the i_cap_snaps list (which is sorted in ascending</span>
+<span class="cm"> * order, new snaps go to the tail).  The i_wrbuffer_ref_head count is</span>
+<span class="cm"> * moved to capsnap-&gt;dirty. (Unless a sync write is currently in</span>
+<span class="cm"> * progress.  In that case, the capsnap is said to be &quot;pending&quot;, new</span>
+<span class="cm"> * writes cannot start, and the capsnap isn&#39;t &quot;finalized&quot; until the</span>
+<span class="cm"> * write completes (or fails) and a final size/mtime for the inode for</span>
+<span class="cm"> * that snap can be settled upon.)  i_wrbuffer_ref_head is reset to 0.</span>
+<span class="cm"> *</span>
+<span class="cm"> * On writeback, we must submit writes to the osd IN SNAP ORDER.  So,</span>
+<span class="cm"> * we look for the first capsnap in i_cap_snaps and write out pages in</span>
+<span class="cm"> * that snap context _only_.  Then we move on to the next capsnap,</span>
+<span class="cm"> * eventually reaching the &quot;live&quot; or &quot;head&quot; context (i.e., pages that</span>
+<span class="cm"> * are not yet snapped) and are writing the most recently dirtied</span>
+<span class="cm"> * pages.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Invalidate and so forth must take care to ensure the dirty page</span>
+<span class="cm"> * accounting is preserved.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define CONGESTION_ON_THRESH(congestion_kb) (congestion_kb &gt;&gt; (PAGE_SHIFT-10))</span>
+<span class="cp">#define CONGESTION_OFF_THRESH(congestion_kb)				\</span>
+<span class="cp">	(CONGESTION_ON_THRESH(congestion_kb) -				\</span>
+<span class="cp">	 (CONGESTION_ON_THRESH(congestion_kb) &gt;&gt; 2))</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="nf">page_snap_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="k">return</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span><span class="p">;</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Dirty a page.  Optimistically adjust accounting, on the assumption</span>
+<span class="cm"> * that we won&#39;t race with invalidate.  If we do, readjust.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_set_page_dirty</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">undo</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">mapping</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">!</span><span class="n">TestSetPageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">TestSetPageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p set_page_dirty %p idx %lu -- already dirty</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">inode</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Note that we&#39;re grabbing a snapc ref here without holding</span>
+<span class="cm">	 * any locks!</span>
+<span class="cm">	 */</span>
+	<span class="n">snapc</span> <span class="o">=</span> <span class="n">ceph_get_snap_context</span><span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_snap_realm</span><span class="o">-&gt;</span><span class="n">cached_context</span><span class="p">);</span>
+
+	<span class="cm">/* dirty the head */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_head_snapc</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_head_snapc</span> <span class="o">=</span> <span class="n">ceph_get_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+	<span class="o">++</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref_head</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ihold</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="o">++</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p set_page_dirty %p idx %lu head %d/%d -&gt; %d/%d &quot;</span>
+	     <span class="s">&quot;snapc %p seq %lld (%d snaps)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span>
+	     <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref_head</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+	     <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref_head</span><span class="p">,</span>
+	     <span class="n">snapc</span><span class="p">,</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">,</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">num_snaps</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+
+	<span class="cm">/* now adjust page */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">tree_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">)</span> <span class="p">{</span>	<span class="cm">/* Race with truncate? */</span>
+		<span class="n">WARN_ON_ONCE</span><span class="p">(</span><span class="o">!</span><span class="n">PageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+		<span class="n">account_page_dirtied</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">);</span>
+		<span class="n">radix_tree_tag_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">page_tree</span><span class="p">,</span>
+				<span class="n">page_index</span><span class="p">(</span><span class="n">page</span><span class="p">),</span> <span class="n">PAGECACHE_TAG_DIRTY</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Reference snap context in page-&gt;private.  Also set</span>
+<span class="cm">		 * PagePrivate so that we get invalidatepage callback.</span>
+<span class="cm">		 */</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">snapc</span><span class="p">;</span>
+		<span class="n">SetPagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;ANON set_page_dirty %p (raced truncate?)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="n">undo</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">tree_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">undo</span><span class="p">)</span>
+		<span class="cm">/* whoops, we failed to dirty the page */</span>
+		<span class="n">ceph_put_wrbuffer_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+
+	<span class="n">__mark_inode_dirty</span><span class="p">(</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">,</span> <span class="n">I_DIRTY_PAGES</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If we are truncating the full page (i.e. offset == 0), adjust the</span>
+<span class="cm"> * dirty page counters appropriately.  Only called if there is private</span>
+<span class="cm"> * data on the page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ceph_invalidatepage</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span> <span class="o">=</span> <span class="n">page_snap_context</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">PageLocked</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">PagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">);</span>
+
+	<span class="n">inode</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We can get non-dirty pages here due to races between</span>
+<span class="cm">	 * set_page_dirty and truncate_complete_page; just spit out a</span>
+<span class="cm">	 * warning, in case we end up with accounting problems later.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;%p invalidatepage %p page not dirty</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">ClearPageChecked</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p invalidatepage %p idx %lu full dirty page %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span> <span class="n">offset</span><span class="p">);</span>
+		<span class="n">ceph_put_wrbuffer_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+		<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ClearPagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p invalidatepage %p idx %lu partial dirty page</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* just a sanity check */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_releasepage</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">g</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">?</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p releasepage %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">PagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * read a single page, without unlocking it.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">readpage_nounlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_client</span> <span class="o">*</span><span class="n">osdc</span> <span class="o">=</span> 
+		<span class="o">&amp;</span><span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">len</span> <span class="o">=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;readpage inode %p file %p page %p index %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_osdc_readpages</span><span class="p">(</span><span class="n">osdc</span><span class="p">,</span> <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span>
+				  <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">len</span><span class="p">,</span>
+				  <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+				  <span class="o">&amp;</span><span class="n">page</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">)</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">SetPageError</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* zero fill remainder of page */</span>
+		<span class="n">zero_user_segment</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">err</span><span class="p">,</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">SetPageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">?</span> <span class="n">err</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_readpage</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span> <span class="o">=</span> <span class="n">readpage_nounlock</span><span class="p">(</span><span class="n">filp</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Finish an async read(ahead) op.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">finish_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ceph_msg</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_reply_head</span> <span class="o">*</span><span class="n">replyhead</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">,</span> <span class="n">bytes</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/* parse reply */</span>
+	<span class="n">replyhead</span> <span class="o">=</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">front</span><span class="p">.</span><span class="n">iov_base</span><span class="p">;</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">replyhead</span><span class="o">-&gt;</span><span class="n">num_ops</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">replyhead</span><span class="o">-&gt;</span><span class="n">result</span><span class="p">);</span>
+	<span class="n">bytes</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">msg</span><span class="o">-&gt;</span><span class="n">hdr</span><span class="p">.</span><span class="n">data_len</span><span class="p">);</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;finish_read %p req %p rc %d bytes %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">rc</span><span class="p">,</span> <span class="n">bytes</span><span class="p">);</span>
+
+	<span class="cm">/* unlock all pages, zeroing any data we didn&#39;t read */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">,</span> <span class="n">bytes</span> <span class="o">-=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">bytes</span> <span class="o">&lt;</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* zero (remainder of) page */</span>
+			<span class="kt">int</span> <span class="n">s</span> <span class="o">=</span> <span class="n">bytes</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="n">bytes</span><span class="p">;</span>
+			<span class="n">zero_user_segment</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">);</span>
+		<span class="p">}</span>
+ 		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;finish_read %p uptodate %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span>
+		     <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+		<span class="n">flush_dcache_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">SetPageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * start an async read(ahead) operation.  return nr_pages we submitted</span>
+<span class="cm"> * a read for on success, or negative error code.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">start_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">page_list</span><span class="p">,</span> <span class="kt">int</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_client</span> <span class="o">*</span><span class="n">osdc</span> <span class="o">=</span>
+		<span class="o">&amp;</span><span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">page_list</span><span class="o">-&gt;</span><span class="n">prev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span><span class="p">,</span> <span class="n">lru</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">off</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">;</span>
+	<span class="n">pgoff_t</span> <span class="n">next_index</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nr_pages</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">off</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+	<span class="cm">/* count pages */</span>
+	<span class="n">next_index</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">;</span>
+	<span class="n">list_for_each_entry_reverse</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">page_list</span><span class="p">,</span> <span class="n">lru</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">!=</span> <span class="n">next_index</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">nr_pages</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">next_index</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">max</span> <span class="o">&amp;&amp;</span> <span class="n">nr_pages</span> <span class="o">==</span> <span class="n">max</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">len</span> <span class="o">=</span> <span class="n">nr_pages</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;start_read %p nr_pages %d is %lld~%lld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">nr_pages</span><span class="p">,</span>
+	     <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+
+	<span class="n">req</span> <span class="o">=</span> <span class="n">ceph_osdc_new_request</span><span class="p">(</span><span class="n">osdc</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span> <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span>
+				    <span class="n">off</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">len</span><span class="p">,</span>
+				    <span class="n">CEPH_OSD_OP_READ</span><span class="p">,</span> <span class="n">CEPH_OSD_FLAG_READ</span><span class="p">,</span>
+				    <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+				    <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+				    <span class="nb">NULL</span><span class="p">,</span> <span class="nb">false</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="cm">/* build page vector */</span>
+	<span class="n">nr_pages</span> <span class="o">=</span> <span class="n">len</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="n">pages</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">pages</span><span class="p">)</span> <span class="o">*</span> <span class="n">nr_pages</span><span class="p">,</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pages</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nr_pages</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">page_list</span><span class="o">-&gt;</span><span class="n">prev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span><span class="p">,</span> <span class="n">lru</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">PageLocked</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">);</span>
+		
+ 		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;start_read %p adding %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span>
+		     <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">add_to_page_cache_lru</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_data</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span>
+					  <span class="n">GFP_NOFS</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot;start_read %p add_to_page_cache failed %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+			<span class="n">nr_pages</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out_pages</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span> <span class="o">=</span> <span class="n">pages</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span> <span class="o">=</span> <span class="n">nr_pages</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_callback</span> <span class="o">=</span> <span class="n">finish_read</span><span class="p">;</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;start_read %p starting %p %lld~%lld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_osdc_start_request</span><span class="p">(</span><span class="n">osdc</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_pages</span><span class="p">;</span>
+	<span class="n">ceph_osdc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">nr_pages</span><span class="p">;</span>
+
+<span class="nl">out_pages:</span>
+	<span class="n">ceph_release_page_vector</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">nr_pages</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">ceph_osdc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Read multiple pages.  Leave pages we don&#39;t read + unlock in page_list;</span>
+<span class="cm"> * the caller (VM) cleans them up.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_readpages</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">page_list</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">nr_pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">max</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">rsize</span> <span class="o">&gt;=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span>
+		<span class="n">max</span> <span class="o">=</span> <span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">rsize</span> <span class="o">+</span> <span class="n">PAGE_CACHE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+			<span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;readpages %p file %p nr_pages %d max %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">nr_pages</span><span class="p">,</span>
+	     <span class="n">max</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">page_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">start_read</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">page_list</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;readpages %p file %p ret %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Get ref for the oldest snapc for an inode with dirty data... that is, the</span>
+<span class="cm"> * only snap context we are allowed to write back.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="nf">get_oldest_context</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span>
+						    <span class="n">u64</span> <span class="o">*</span><span class="n">snap_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_cap_snap</span> <span class="o">*</span><span class="n">capsnap</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">capsnap</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_cap_snaps</span><span class="p">,</span> <span class="n">ci_item</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; cap_snap %p snapc %p has %d dirty pages</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">capsnap</span><span class="p">,</span>
+		     <span class="n">capsnap</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">,</span> <span class="n">capsnap</span><span class="o">-&gt;</span><span class="n">dirty_pages</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">capsnap</span><span class="o">-&gt;</span><span class="n">dirty_pages</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">snapc</span> <span class="o">=</span> <span class="n">ceph_get_snap_context</span><span class="p">(</span><span class="n">capsnap</span><span class="o">-&gt;</span><span class="n">context</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">snap_size</span><span class="p">)</span>
+				<span class="o">*</span><span class="n">snap_size</span> <span class="o">=</span> <span class="n">capsnap</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">snapc</span> <span class="o">&amp;&amp;</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref_head</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">snapc</span> <span class="o">=</span> <span class="n">ceph_get_snap_context</span><span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_head_snapc</span><span class="p">);</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; head snapc %p has %d dirty pages</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">snapc</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_wrbuffer_ref_head</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_ceph_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">snapc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Write a single page, but leave the page locked.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we get a write error, set the page error bit, but still adjust the</span>
+<span class="cm"> * dirty page accounting (i.e., page is no longer dirty).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">writepage_nounlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">writeback_control</span> <span class="o">*</span><span class="n">wbc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_client</span> <span class="o">*</span><span class="n">osdc</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">page_off</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">len</span> <span class="o">=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">i_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span><span class="p">,</span> <span class="o">*</span><span class="n">oldest</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">snap_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">long</span> <span class="n">writeback_stat</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">||</span> <span class="o">!</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage %p - no mapping</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">inode</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">osdc</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">;</span>
+
+	<span class="cm">/* verify this is a writeable snap context */</span>
+	<span class="n">snapc</span> <span class="o">=</span> <span class="n">page_snap_context</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">snapc</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage %p page %p not dirty?</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">oldest</span> <span class="o">=</span> <span class="n">get_oldest_context</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">snap_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span> <span class="o">&gt;</span> <span class="n">oldest</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage %p page %p snapc %p not writeable - noop</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+		<span class="cm">/* we should only noop if called by kswapd */</span>
+		<span class="n">WARN_ON</span><span class="p">((</span><span class="n">current</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">PF_MEMALLOC</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">oldest</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">oldest</span><span class="p">);</span>
+
+	<span class="cm">/* is this a partial page at end of file? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">snap_size</span><span class="p">)</span>
+		<span class="n">i_size</span> <span class="o">=</span> <span class="n">snap_size</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">i_size</span> <span class="o">=</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">i_size</span> <span class="o">&lt;</span> <span class="n">page_off</span> <span class="o">+</span> <span class="n">len</span><span class="p">)</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">i_size</span> <span class="o">-</span> <span class="n">page_off</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage %p page %p index %lu on %llu~%u snapc %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span> <span class="n">page_off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+
+	<span class="n">writeback_stat</span> <span class="o">=</span> <span class="n">atomic_long_inc_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">writeback_count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">writeback_stat</span> <span class="o">&gt;</span>
+	    <span class="n">CONGESTION_ON_THRESH</span><span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">congestion_kb</span><span class="p">))</span>
+		<span class="n">set_bdi_congested</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">backing_dev_info</span><span class="p">,</span> <span class="n">BLK_RW_ASYNC</span><span class="p">);</span>
+
+	<span class="n">set_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">ceph_osdc_writepages</span><span class="p">(</span><span class="n">osdc</span><span class="p">,</span> <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span>
+				   <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span> <span class="n">snapc</span><span class="p">,</span>
+				   <span class="n">page_off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span>
+				   <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+				   <span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mtime</span><span class="p">,</span>
+				   <span class="o">&amp;</span><span class="n">page</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage setting page/mapping error %d %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">err</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="n">SetPageError</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">mapping_set_error</span><span class="p">(</span><span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_data</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="p">)</span>
+			<span class="n">wbc</span><span class="o">-&gt;</span><span class="n">pages_skipped</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepage cleaned page %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>  <span class="cm">/* vfs expects us to return 0 */</span>
+	<span class="p">}</span>
+	<span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">ClearPagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">end_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">ceph_put_wrbuffer_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+	<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>  <span class="cm">/* page&#39;s reference */</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_writepage</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">writeback_control</span> <span class="o">*</span><span class="n">wbc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">ihold</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">writepage_nounlock</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">wbc</span><span class="p">);</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">iput</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * lame release_pages helper.  release_pages() isn&#39;t exported to</span>
+<span class="cm"> * modules.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ceph_release_pages</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pages</span><span class="p">,</span> <span class="kt">int</span> <span class="n">num</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pagevec</span> <span class="n">pvec</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">pagevec_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pagevec_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">,</span> <span class="n">pages</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">pagevec_release</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">pagevec_release</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * async writeback completion handler.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If we get an error, set the mapping error bit, but not the individual</span>
+<span class="cm"> * page error bits.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">writepages_finish</span><span class="p">(</span><span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">ceph_msg</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_reply_head</span> <span class="o">*</span><span class="n">replyhead</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_op</span> <span class="o">*</span><span class="n">op</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="n">wrote</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_snapc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">;</span>
+	<span class="n">__s32</span> <span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="kt">long</span> <span class="n">writeback_stat</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">issued</span> <span class="o">=</span> <span class="n">ceph_caps_issued</span><span class="p">(</span><span class="n">ci</span><span class="p">);</span>
+
+	<span class="cm">/* parse reply */</span>
+	<span class="n">replyhead</span> <span class="o">=</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">front</span><span class="p">.</span><span class="n">iov_base</span><span class="p">;</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">replyhead</span><span class="o">-&gt;</span><span class="n">num_ops</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">op</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)(</span><span class="n">replyhead</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">le32_to_cpu</span><span class="p">(</span><span class="n">replyhead</span><span class="o">-&gt;</span><span class="n">result</span><span class="p">);</span>
+	<span class="n">bytes</span> <span class="o">=</span> <span class="n">le64_to_cpu</span><span class="p">(</span><span class="n">op</span><span class="o">-&gt;</span><span class="n">extent</span><span class="p">.</span><span class="n">length</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Assume we wrote the pages we originally sent.  The</span>
+<span class="cm">		 * osd might reply with fewer pages if our writeback</span>
+<span class="cm">		 * raced with a truncation and was adjusted at the osd,</span>
+<span class="cm">		 * so don&#39;t believe the reply.</span>
+<span class="cm">		 */</span>
+		<span class="n">wrote</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">wrote</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">mapping_set_error</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepages_finish %p rc %d bytes %llu wrote %d (pages)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">rc</span><span class="p">,</span> <span class="n">bytes</span><span class="p">,</span> <span class="n">wrote</span><span class="p">);</span>
+
+	<span class="cm">/* clean all pages */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">PageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+
+		<span class="n">writeback_stat</span> <span class="o">=</span>
+			<span class="n">atomic_long_dec_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">writeback_count</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">writeback_stat</span> <span class="o">&lt;</span>
+		    <span class="n">CONGESTION_OFF_THRESH</span><span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">congestion_kb</span><span class="p">))</span>
+			<span class="n">clear_bdi_congested</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">backing_dev_info</span><span class="p">,</span>
+					    <span class="n">BLK_RW_ASYNC</span><span class="p">);</span>
+
+		<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">page_snap_context</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">private</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">ClearPagePrivate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;unlocking %d %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="n">end_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * We lost the cache cap, need to truncate the page before</span>
+<span class="cm">		 * it is unlocked, otherwise we&#39;d truncate it later in the</span>
+<span class="cm">		 * page truncation thread, possibly losing some data that</span>
+<span class="cm">		 * raced its way in</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">issued</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">CEPH_CAP_FILE_CACHE</span><span class="o">|</span><span class="n">CEPH_CAP_FILE_LAZYIO</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">generic_error_remove_page</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p wrote+cleaned %d pages</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">wrote</span><span class="p">);</span>
+	<span class="n">ceph_put_wrbuffer_cap_refs</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+
+	<span class="n">ceph_release_pages</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages_from_pool</span><span class="p">)</span>
+		<span class="n">mempool_free</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">,</span>
+			     <span class="n">ceph_sb_to_client</span><span class="p">(</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">wb_pagevec_pool</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">);</span>
+	<span class="n">ceph_osdc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * allocate a page vec, either directly, or if necessary, via a the</span>
+<span class="cm"> * mempool.  we avoid the mempool if we can because req-&gt;r_num_pages</span>
+<span class="cm"> * may be less than the maximum write size.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">alloc_page_vec</span><span class="p">(</span><span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">)</span> <span class="o">*</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">,</span>
+			       <span class="n">GFP_NOFS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span> <span class="o">=</span> <span class="n">mempool_alloc</span><span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">wb_pagevec_pool</span><span class="p">,</span> <span class="n">GFP_NOFS</span><span class="p">);</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages_from_pool</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * initiate async writeback</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_writepages_start</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">writeback_control</span> <span class="o">*</span><span class="n">wbc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span><span class="p">;</span>
+	<span class="n">pgoff_t</span> <span class="n">index</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">range_whole</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">should_loop</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">pgoff_t</span> <span class="n">max_pages</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">max_pages_ever</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">last_snapc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">pgsnapc</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pagevec</span> <span class="n">pvec</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">done</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">wsize</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_blkbits</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_osd_request</span> <span class="o">*</span><span class="n">req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">do_sync</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">snap_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Include a &#39;sync&#39; in the OSD request if this is a data</span>
+<span class="cm">	 * integrity write (e.g., O_SYNC write or fsync()), or if our</span>
+<span class="cm">	 * cap is being revoked.</span>
+<span class="cm">	 */</span>
+	<span class="n">do_sync</span> <span class="o">=</span> <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">sync_mode</span> <span class="o">==</span> <span class="n">WB_SYNC_ALL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ceph_caps_revoking</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span> <span class="n">CEPH_CAP_FILE_BUFFER</span><span class="p">))</span>
+		<span class="n">do_sync</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepages_start %p dosync=%d (mode=%s)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">do_sync</span><span class="p">,</span>
+	     <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">sync_mode</span> <span class="o">==</span> <span class="n">WB_SYNC_NONE</span> <span class="o">?</span> <span class="s">&quot;NONE&quot;</span> <span class="o">:</span>
+	     <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">sync_mode</span> <span class="o">==</span> <span class="n">WB_SYNC_ALL</span> <span class="o">?</span> <span class="s">&quot;ALL&quot;</span> <span class="o">:</span> <span class="s">&quot;HOLD&quot;</span><span class="p">));</span>
+
+	<span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_state</span> <span class="o">==</span> <span class="n">CEPH_MOUNT_SHUTDOWN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;writepage_start %p on forced umount</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span> <span class="cm">/* we&#39;re in a forced umount, don&#39;t write! */</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">wsize</span> <span class="o">&amp;&amp;</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">wsize</span> <span class="o">&lt;</span> <span class="n">wsize</span><span class="p">)</span>
+		<span class="n">wsize</span> <span class="o">=</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">wsize</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wsize</span> <span class="o">&lt;</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span>
+		<span class="n">wsize</span> <span class="o">=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">;</span>
+	<span class="n">max_pages_ever</span> <span class="o">=</span> <span class="n">wsize</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">pagevec_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="cm">/* where to start/end? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_cyclic</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">start</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">writeback_index</span><span class="p">;</span> <span class="cm">/* Start from prev offset */</span>
+		<span class="n">end</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; cyclic, start at %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">start</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">start</span> <span class="o">=</span> <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_start</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+		<span class="n">end</span> <span class="o">=</span> <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_end</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_start</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_end</span> <span class="o">==</span> <span class="n">LLONG_MAX</span><span class="p">)</span>
+			<span class="n">range_whole</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">should_loop</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; not cyclic, %lu to %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">index</span> <span class="o">=</span> <span class="n">start</span><span class="p">;</span>
+
+<span class="nl">retry:</span>
+	<span class="cm">/* find oldest snap context with dirty data */</span>
+	<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+	<span class="n">snapc</span> <span class="o">=</span> <span class="n">get_oldest_context</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">snap_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">snapc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* hmm, why does writepages get called when there</span>
+<span class="cm">		   is no dirty data? */</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; no snap context with dirty data?</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot; oldest snapc is %p seq %lld (%d snaps)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">snapc</span><span class="p">,</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">,</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">num_snaps</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">last_snapc</span> <span class="o">&amp;&amp;</span> <span class="n">snapc</span> <span class="o">!=</span> <span class="n">last_snapc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* if we switched to a newer snapc, restart our scan at the</span>
+<span class="cm">		 * start of the original file range. */</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;  snapc differs from last pass, restarting at %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">index</span><span class="p">);</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="n">start</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">last_snapc</span> <span class="o">=</span> <span class="n">snapc</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">done</span> <span class="o">&amp;&amp;</span> <span class="n">index</span> <span class="o">&lt;=</span> <span class="n">end</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">first</span><span class="p">;</span>
+		<span class="n">pgoff_t</span> <span class="n">next</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">pvec_pages</span><span class="p">,</span> <span class="n">locked_pages</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">want</span><span class="p">;</span>
+		<span class="n">u64</span> <span class="n">offset</span><span class="p">,</span> <span class="n">len</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">ceph_osd_request_head</span> <span class="o">*</span><span class="n">reqhead</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">ceph_osd_op</span> <span class="o">*</span><span class="n">op</span><span class="p">;</span>
+		<span class="kt">long</span> <span class="n">writeback_stat</span><span class="p">;</span>
+
+		<span class="n">next</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">locked_pages</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">max_pages</span> <span class="o">=</span> <span class="n">max_pages_ever</span><span class="p">;</span>
+
+<span class="nl">get_more_pages:</span>
+		<span class="n">first</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="n">want</span> <span class="o">=</span> <span class="n">min</span><span class="p">(</span><span class="n">end</span> <span class="o">-</span> <span class="n">index</span><span class="p">,</span>
+			   <span class="n">min</span><span class="p">((</span><span class="n">pgoff_t</span><span class="p">)</span><span class="n">PAGEVEC_SIZE</span><span class="p">,</span>
+			       <span class="n">max_pages</span> <span class="o">-</span> <span class="p">(</span><span class="n">pgoff_t</span><span class="p">)</span><span class="n">locked_pages</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+			<span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">pvec_pages</span> <span class="o">=</span> <span class="n">pagevec_lookup_tag</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">index</span><span class="p">,</span>
+						<span class="n">PAGECACHE_TAG_DIRTY</span><span class="p">,</span>
+						<span class="n">want</span><span class="p">);</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;pagevec_lookup_tag got %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pvec_pages</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pvec_pages</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">locked_pages</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pvec_pages</span> <span class="o">&amp;&amp;</span> <span class="n">locked_pages</span> <span class="o">&lt;</span> <span class="n">max_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">page</span> <span class="o">=</span> <span class="n">pvec</span><span class="p">.</span><span class="n">pages</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot;? %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">locked_pages</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">lock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>  <span class="cm">/* first page */</span>
+			<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">trylock_page</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+				<span class="k">break</span><span class="p">;</span>
+
+			<span class="cm">/* only dirty pages, or our accounting breaks */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="o">||</span>
+			    <span class="n">unlikely</span><span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">!=</span> <span class="n">mapping</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;!dirty or !mapping %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_cyclic</span> <span class="o">&amp;&amp;</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">end</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;end of range %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">done</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">next</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">!=</span> <span class="n">next</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;not consecutive %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">sync_mode</span> <span class="o">!=</span> <span class="n">WB_SYNC_NONE</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;waiting on writeback %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">wait_on_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">((</span><span class="n">snap_size</span> <span class="o">&amp;&amp;</span> <span class="n">page_offset</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">snap_size</span><span class="p">)</span> <span class="o">||</span>
+			    <span class="p">(</span><span class="o">!</span><span class="n">snap_size</span> <span class="o">&amp;&amp;</span>
+			     <span class="n">page_offset</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">)))</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p page eof %llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">snap_size</span> <span class="o">?</span>
+				     <span class="n">snap_size</span> <span class="o">:</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">));</span>
+				<span class="n">done</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">PageWriteback</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p under writeback</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="cm">/* only if matching snap context */</span>
+			<span class="n">pgsnapc</span> <span class="o">=</span> <span class="n">page_snap_context</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pgsnapc</span><span class="o">-&gt;</span><span class="n">seq</span> <span class="o">&gt;</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;page snapc %p %lld &gt; oldest %p %lld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				     <span class="n">pgsnapc</span><span class="p">,</span> <span class="n">pgsnapc</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">,</span> <span class="n">snapc</span><span class="p">,</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">);</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">locked_pages</span><span class="p">)</span>
+					<span class="k">continue</span><span class="p">;</span> <span class="cm">/* keep looking for snap */</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">clear_page_dirty_for_io</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p !clear_page_dirty_for_io</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+				<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="cm">/* ok */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">locked_pages</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/* prepare async write request */</span>
+				<span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span>
+					<span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+				<span class="n">len</span> <span class="o">=</span> <span class="n">wsize</span><span class="p">;</span>
+				<span class="n">req</span> <span class="o">=</span> <span class="n">ceph_osdc_new_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span>
+					    <span class="o">&amp;</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_layout</span><span class="p">,</span>
+					    <span class="n">ceph_vino</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span>
+					    <span class="n">offset</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">len</span><span class="p">,</span>
+					    <span class="n">CEPH_OSD_OP_WRITE</span><span class="p">,</span>
+					    <span class="n">CEPH_OSD_FLAG_WRITE</span> <span class="o">|</span>
+						    <span class="n">CEPH_OSD_FLAG_ONDISK</span><span class="p">,</span>
+					    <span class="n">snapc</span><span class="p">,</span> <span class="n">do_sync</span><span class="p">,</span>
+					    <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_seq</span><span class="p">,</span>
+					    <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_truncate_size</span><span class="p">,</span>
+					    <span class="o">&amp;</span><span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mtime</span><span class="p">,</span> <span class="nb">true</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+					<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+
+				<span class="n">max_pages</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span><span class="p">;</span>
+
+				<span class="n">alloc_page_vec</span><span class="p">(</span><span class="n">fsc</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+				<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_callback</span> <span class="o">=</span> <span class="n">writepages_finish</span><span class="p">;</span>
+				<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_inode</span> <span class="o">=</span> <span class="n">inode</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="cm">/* note position of first page in pvec */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">first</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">first</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot;%p will write page %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+
+			<span class="n">writeback_stat</span> <span class="o">=</span>
+			       <span class="n">atomic_long_inc_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">writeback_count</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">writeback_stat</span> <span class="o">&gt;</span> <span class="n">CONGESTION_ON_THRESH</span><span class="p">(</span>
+				    <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mount_options</span><span class="o">-&gt;</span><span class="n">congestion_kb</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">set_bdi_congested</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">backing_dev_info</span><span class="p">,</span>
+						  <span class="n">BLK_RW_ASYNC</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="n">set_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">[</span><span class="n">locked_pages</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+			<span class="n">locked_pages</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">next</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* did we get anything? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">locked_pages</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">release_pvec_pages</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">j</span><span class="p">;</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">locked_pages</span> <span class="o">||</span> <span class="n">first</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">pvec_pages</span> <span class="o">&amp;&amp;</span> <span class="n">i</span> <span class="o">==</span> <span class="n">pvec_pages</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">locked_pages</span> <span class="o">&lt;</span> <span class="n">max_pages</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot;reached end pvec, trying for more</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+				<span class="n">pagevec_reinit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">);</span>
+				<span class="k">goto</span> <span class="n">get_more_pages</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="cm">/* shift unused pages over in the pvec...  we</span>
+<span class="cm">			 * will need to release them below. */</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">j</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">pvec_pages</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">dout</span><span class="p">(</span><span class="s">&quot; pvec leftover page %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				     <span class="n">pvec</span><span class="p">.</span><span class="n">pages</span><span class="p">[</span><span class="n">j</span><span class="p">]);</span>
+				<span class="n">pvec</span><span class="p">.</span><span class="n">pages</span><span class="p">[</span><span class="n">j</span><span class="o">-</span><span class="n">i</span><span class="o">+</span><span class="n">first</span><span class="p">]</span> <span class="o">=</span> <span class="n">pvec</span><span class="p">.</span><span class="n">pages</span><span class="p">[</span><span class="n">j</span><span class="p">];</span>
+			<span class="p">}</span>
+			<span class="n">pvec</span><span class="p">.</span><span class="n">nr</span> <span class="o">-=</span> <span class="n">i</span><span class="o">-</span><span class="n">first</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* submit the write */</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_pages</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">min</span><span class="p">((</span><span class="n">snap_size</span> <span class="o">?</span> <span class="n">snap_size</span> <span class="o">:</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">))</span> <span class="o">-</span> <span class="n">offset</span><span class="p">,</span>
+			  <span class="p">(</span><span class="n">u64</span><span class="p">)</span><span class="n">locked_pages</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">);</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepages got %d pages at %llu~%llu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">locked_pages</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+
+		<span class="cm">/* revise final length, page count */</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_num_pages</span> <span class="o">=</span> <span class="n">locked_pages</span><span class="p">;</span>
+		<span class="n">reqhead</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">r_request</span><span class="o">-&gt;</span><span class="n">front</span><span class="p">.</span><span class="n">iov_base</span><span class="p">;</span>
+		<span class="n">op</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)(</span><span class="n">reqhead</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">op</span><span class="o">-&gt;</span><span class="n">extent</span><span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">cpu_to_le64</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+		<span class="n">op</span><span class="o">-&gt;</span><span class="n">payload_len</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">r_request</span><span class="o">-&gt;</span><span class="n">hdr</span><span class="p">.</span><span class="n">data_len</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+
+		<span class="n">rc</span> <span class="o">=</span> <span class="n">ceph_osdc_start_request</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fsc</span><span class="o">-&gt;</span><span class="n">client</span><span class="o">-&gt;</span><span class="n">osdc</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">rc</span><span class="p">);</span>
+		<span class="n">req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="cm">/* continue? */</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+		<span class="n">wbc</span><span class="o">-&gt;</span><span class="n">nr_to_write</span> <span class="o">-=</span> <span class="n">locked_pages</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">nr_to_write</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">done</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="nl">release_pvec_pages:</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;pagevec_release on %d pages (%p)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">pvec</span><span class="p">.</span><span class="n">nr</span><span class="p">,</span>
+		     <span class="n">pvec</span><span class="p">.</span><span class="n">nr</span> <span class="o">?</span> <span class="n">pvec</span><span class="p">.</span><span class="n">pages</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">);</span>
+		<span class="n">pagevec_release</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pvec</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">locked_pages</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">done</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">retry</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">should_loop</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">done</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* more to do; loop back to beginning of file */</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepages looping back to beginning of file</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">should_loop</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">retry</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wbc</span><span class="o">-&gt;</span><span class="n">range_cyclic</span> <span class="o">||</span> <span class="p">(</span><span class="n">range_whole</span> <span class="o">&amp;&amp;</span> <span class="n">wbc</span><span class="o">-&gt;</span><span class="n">nr_to_write</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">))</span>
+		<span class="n">mapping</span><span class="o">-&gt;</span><span class="n">writeback_index</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="p">)</span>
+		<span class="n">ceph_osdc_put_request</span><span class="p">(</span><span class="n">req</span><span class="p">);</span>
+	<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;writepages done, rc = %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+
+<span class="cm">/*</span>
+<span class="cm"> * See if a given @snapc is either writeable, or already written.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">context_is_writeable_or_written</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span>
+					   <span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">oldest</span> <span class="o">=</span> <span class="n">get_oldest_context</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">!</span><span class="n">oldest</span> <span class="o">||</span> <span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span> <span class="o">&lt;=</span> <span class="n">oldest</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">;</span>
+
+	<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">oldest</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We are only allowed to write into/dirty the page if the page is</span>
+<span class="cm"> * clean, or already dirty within the same snap context.</span>
+<span class="cm"> *</span>
+<span class="cm"> * called with page locked.</span>
+<span class="cm"> * return success with page locked,</span>
+<span class="cm"> * or any failure (incl -EAGAIN) with page unlocked.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_update_writeable_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span>
+			    <span class="n">loff_t</span> <span class="n">pos</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">len</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_inode_info</span> <span class="o">*</span><span class="n">ci</span> <span class="o">=</span> <span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">page_off</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="n">PAGE_CACHE_MASK</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">pos_in_page</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_CACHE_MASK</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">end_in_page</span> <span class="o">=</span> <span class="n">pos_in_page</span> <span class="o">+</span> <span class="n">len</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">i_size</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_snap_context</span> <span class="o">*</span><span class="n">snapc</span><span class="p">,</span> <span class="o">*</span><span class="n">oldest</span><span class="p">;</span>
+
+<span class="nl">retry_locked:</span>
+	<span class="cm">/* writepages currently holds page lock, but if we change that later, */</span>
+	<span class="n">wait_on_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="cm">/* check snap context */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_snap_realm</span><span class="p">);</span>
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_snap_realm</span><span class="o">-&gt;</span><span class="n">cached_context</span><span class="p">);</span>
+	<span class="n">snapc</span> <span class="o">=</span> <span class="n">page_snap_context</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">snapc</span> <span class="o">&amp;&amp;</span> <span class="n">snapc</span> <span class="o">!=</span> <span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_head_snapc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * this page is already dirty in another (older) snap</span>
+<span class="cm">		 * context!  is it writeable now?</span>
+<span class="cm">		 */</span>
+		<span class="n">oldest</span> <span class="o">=</span> <span class="n">get_oldest_context</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">snapc</span><span class="o">-&gt;</span><span class="n">seq</span> <span class="o">&gt;</span> <span class="n">oldest</span><span class="o">-&gt;</span><span class="n">seq</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">oldest</span><span class="p">);</span>
+			<span class="n">dout</span><span class="p">(</span><span class="s">&quot; page %p snapc %p not current or oldest</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			     <span class="n">page</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * queue for writeback, and wait for snapc to</span>
+<span class="cm">			 * be writeable or written</span>
+<span class="cm">			 */</span>
+			<span class="n">snapc</span> <span class="o">=</span> <span class="n">ceph_get_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+			<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="n">ceph_queue_writeback</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+			<span class="n">r</span> <span class="o">=</span> <span class="n">wait_event_interruptible</span><span class="p">(</span><span class="n">ci</span><span class="o">-&gt;</span><span class="n">i_cap_wq</span><span class="p">,</span>
+			       <span class="n">context_is_writeable_or_written</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">snapc</span><span class="p">));</span>
+			<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">snapc</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">==</span> <span class="o">-</span><span class="n">ERESTARTSYS</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ceph_put_snap_context</span><span class="p">(</span><span class="n">oldest</span><span class="p">);</span>
+
+		<span class="cm">/* yay, writeable, do it now (without dropping page lock) */</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; page %p snapc %p not current, but oldest</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">page</span><span class="p">,</span> <span class="n">snapc</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">clear_page_dirty_for_io</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">retry_locked</span><span class="p">;</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">writepage_nounlock</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">fail_nosnap</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">retry_locked</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; page %p already uptodate</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* full page? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pos_in_page</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">len</span> <span class="o">==</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* past end of file? */</span>
+	<span class="n">i_size</span> <span class="o">=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">;</span>   <span class="cm">/* caller holds i_mutex */</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">i_size</span> <span class="o">+</span> <span class="n">len</span> <span class="o">&gt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_maxbytes</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* file is too big */</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">page_off</span> <span class="o">&gt;=</span> <span class="n">i_size</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">pos_in_page</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">pos</span><span class="o">+</span><span class="n">len</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">i_size</span> <span class="o">&amp;&amp;</span>
+	     <span class="n">end_in_page</span> <span class="o">-</span> <span class="n">pos_in_page</span> <span class="o">!=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot; zeroing %p 0 - %d and %d - %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">page</span><span class="p">,</span> <span class="n">pos_in_page</span><span class="p">,</span> <span class="n">end_in_page</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">PAGE_CACHE_SIZE</span><span class="p">);</span>
+		<span class="n">zero_user_segments</span><span class="p">(</span><span class="n">page</span><span class="p">,</span>
+				   <span class="mi">0</span><span class="p">,</span> <span class="n">pos_in_page</span><span class="p">,</span>
+				   <span class="n">end_in_page</span><span class="p">,</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* we need to read it. */</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">readpage_nounlock</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail_nosnap</span><span class="p">;</span>
+	<span class="k">goto</span> <span class="n">retry_locked</span><span class="p">;</span>
+
+<span class="nl">fail:</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+<span class="nl">fail_nosnap:</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We are only allowed to write into/dirty the page if the page is</span>
+<span class="cm"> * clean, or already dirty within the same snap context.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_write_begin</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+			    <span class="n">loff_t</span> <span class="n">pos</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">len</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">flags</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">page</span> <span class="o">**</span><span class="n">pagep</span><span class="p">,</span> <span class="kt">void</span> <span class="o">**</span><span class="n">fsdata</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="n">pgoff_t</span> <span class="n">index</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="cm">/* get a page */</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">grab_cache_page_write_begin</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">pagep</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+
+		<span class="n">dout</span><span class="p">(</span><span class="s">&quot;write_begin file %p inode %p page %p %d~%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span>
+		     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">len</span><span class="p">);</span>
+
+		<span class="n">r</span> <span class="o">=</span> <span class="n">ceph_update_writeable_page</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">r</span> <span class="o">==</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * we don&#39;t do anything in here that simple_write_end doesn&#39;t do</span>
+<span class="cm"> * except adjust dirty page accounting and drop read lock on</span>
+<span class="cm"> * mdsc-&gt;snap_rwsem.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_write_end</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+			  <span class="n">loff_t</span> <span class="n">pos</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">len</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">copied</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">fsdata</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_fs_client</span> <span class="o">*</span><span class="n">fsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">fsc</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">from</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">PAGE_CACHE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">check_cap</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;write_end file %p inode %p page %p %d~%d (%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span>
+	     <span class="n">inode</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">pos</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">copied</span><span class="p">,</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="cm">/* zero the stale part of the page if we did a short copy */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">copied</span> <span class="o">&lt;</span> <span class="n">len</span><span class="p">)</span>
+		<span class="n">zero_user_segment</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">from</span><span class="o">+</span><span class="n">copied</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+
+	<span class="cm">/* did file size increase? */</span>
+	<span class="cm">/* (no need for i_size_read(); we caller holds i_mutex */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pos</span><span class="o">+</span><span class="n">copied</span> <span class="o">&gt;</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_size</span><span class="p">)</span>
+		<span class="n">check_cap</span> <span class="o">=</span> <span class="n">ceph_inode_set_size</span><span class="p">(</span><span class="n">inode</span><span class="p">,</span> <span class="n">pos</span><span class="o">+</span><span class="n">copied</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="n">SetPageUptodate</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">set_page_dirty</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+	<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">check_cap</span><span class="p">)</span>
+		<span class="n">ceph_check_caps</span><span class="p">(</span><span class="n">ceph_inode</span><span class="p">(</span><span class="n">inode</span><span class="p">),</span> <span class="n">CHECK_CAPS_AUTHONLY</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">copied</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * we set .direct_IO to indicate direct io is supported, but since we</span>
+<span class="cm"> * intercept O_DIRECT reads and writes early, this function should</span>
+<span class="cm"> * never get called.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">ceph_direct_io</span><span class="p">(</span><span class="kt">int</span> <span class="n">rw</span><span class="p">,</span> <span class="k">struct</span> <span class="n">kiocb</span> <span class="o">*</span><span class="n">iocb</span><span class="p">,</span>
+			      <span class="k">const</span> <span class="k">struct</span> <span class="n">iovec</span> <span class="o">*</span><span class="n">iov</span><span class="p">,</span>
+			      <span class="n">loff_t</span> <span class="n">pos</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_segs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">const</span> <span class="k">struct</span> <span class="n">address_space_operations</span> <span class="n">ceph_aops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">readpage</span> <span class="o">=</span> <span class="n">ceph_readpage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">readpages</span> <span class="o">=</span> <span class="n">ceph_readpages</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">writepage</span> <span class="o">=</span> <span class="n">ceph_writepage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">writepages</span> <span class="o">=</span> <span class="n">ceph_writepages_start</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write_begin</span> <span class="o">=</span> <span class="n">ceph_write_begin</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write_end</span> <span class="o">=</span> <span class="n">ceph_write_end</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">set_page_dirty</span> <span class="o">=</span> <span class="n">ceph_set_page_dirty</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">invalidatepage</span> <span class="o">=</span> <span class="n">ceph_invalidatepage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">releasepage</span> <span class="o">=</span> <span class="n">ceph_releasepage</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">direct_IO</span> <span class="o">=</span> <span class="n">ceph_direct_io</span><span class="p">,</span>
+<span class="p">};</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * vm ops</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Reuse write_begin here for simplicity.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ceph_page_mkwrite</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_fault</span> <span class="o">*</span><span class="n">vmf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="o">-&gt;</span><span class="n">f_dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">vmf</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ceph_mds_client</span> <span class="o">*</span><span class="n">mdsc</span> <span class="o">=</span> <span class="n">ceph_inode_to_client</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">mdsc</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">off</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">len</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">off</span> <span class="o">+</span> <span class="n">PAGE_CACHE_SIZE</span> <span class="o">&lt;=</span> <span class="n">size</span><span class="p">)</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">size</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_CACHE_MASK</span><span class="p">;</span>
+
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;page_mkwrite %p %llu~%llu page %p idx %lu</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span>
+	     <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">);</span>
+
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">VM_FAULT_NOPAGE</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">off</span> <span class="o">&gt;</span> <span class="n">size</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">!=</span> <span class="n">inode</span><span class="o">-&gt;</span><span class="n">i_mapping</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ceph_update_writeable_page</span><span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_file</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* success.  we&#39;ll keep the page locked. */</span>
+		<span class="n">set_page_dirty</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mdsc</span><span class="o">-&gt;</span><span class="n">snap_rwsem</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">VM_FAULT_LOCKED</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">)</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">VM_FAULT_OOM</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">VM_FAULT_SIGBUS</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">dout</span><span class="p">(</span><span class="s">&quot;page_mkwrite %p %llu~%llu = %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">inode</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="n">VM_FAULT_LOCKED</span><span class="p">)</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">vm_operations_struct</span> <span class="n">ceph_vmops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">fault</span>		<span class="o">=</span> <span class="n">filemap_fault</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">page_mkwrite</span>	<span class="o">=</span> <span class="n">ceph_page_mkwrite</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="kt">int</span> <span class="nf">ceph_mmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpage</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOEXEC</span><span class="p">;</span>
+	<span class="n">file_accessed</span><span class="p">(</span><span class="n">file</span><span class="p">);</span>
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">ceph_vmops</span><span class="p">;</span>
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_flags</span> <span class="o">|=</span> <span class="n">VM_CAN_NONLINEAR</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

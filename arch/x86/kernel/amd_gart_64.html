@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › x86 › kernel › amd_gart_64.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>amd_gart_64.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Dynamic DMA mapping support for AMD Hammer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Use the integrated AGP GART in the Hammer northbridge as an IOMMU for PCI.</span>
+<span class="cm"> * This allows to use PCI devices that only support 32bit addresses on systems</span>
+<span class="cm"> * with more than 4GB.</span>
+<span class="cm"> *</span>
+<span class="cm"> * See Documentation/DMA-API-HOWTO.txt for the interface specification.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright 2002 Andi Kleen, SuSE Labs.</span>
+<span class="cm"> * Subject to the GNU General Public License v2 only.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/ctype.h&gt;</span>
+<span class="cp">#include &lt;linux/agp_backend.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/pci.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/topology.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/bitmap.h&gt;</span>
+<span class="cp">#include &lt;linux/kdebug.h&gt;</span>
+<span class="cp">#include &lt;linux/scatterlist.h&gt;</span>
+<span class="cp">#include &lt;linux/iommu-helper.h&gt;</span>
+<span class="cp">#include &lt;linux/syscore_ops.h&gt;</span>
+<span class="cp">#include &lt;linux/io.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+<span class="cp">#include &lt;asm/mtrr.h&gt;</span>
+<span class="cp">#include &lt;asm/pgtable.h&gt;</span>
+<span class="cp">#include &lt;asm/proto.h&gt;</span>
+<span class="cp">#include &lt;asm/iommu.h&gt;</span>
+<span class="cp">#include &lt;asm/gart.h&gt;</span>
+<span class="cp">#include &lt;asm/cacheflush.h&gt;</span>
+<span class="cp">#include &lt;asm/swiotlb.h&gt;</span>
+<span class="cp">#include &lt;asm/dma.h&gt;</span>
+<span class="cp">#include &lt;asm/amd_nb.h&gt;</span>
+<span class="cp">#include &lt;asm/x86_init.h&gt;</span>
+<span class="cp">#include &lt;asm/iommu_table.h&gt;</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_bus_base</span><span class="p">;</span>	<span class="cm">/* GART remapping area (physical) */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_size</span><span class="p">;</span>	<span class="cm">/* size of remapping area bytes */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_pages</span><span class="p">;</span>	<span class="cm">/* .. and in pages */</span>
+
+<span class="k">static</span> <span class="n">u32</span> <span class="o">*</span><span class="n">iommu_gatt_base</span><span class="p">;</span>		<span class="cm">/* Remapping table */</span>
+
+<span class="k">static</span> <span class="n">dma_addr_t</span> <span class="n">bad_dma_addr</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If this is disabled the IOMMU will use an optimized flushing strategy</span>
+<span class="cm"> * of only flushing when an mapping is reused. With it true the GART is</span>
+<span class="cm"> * flushed for every mapping. Problem is that doing the lazy flush seems</span>
+<span class="cm"> * to trigger bugs with some popular PCI cards, in particular 3ware (but</span>
+<span class="cm"> * has been also also seen with Qlogic at least).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">iommu_fullflush</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="cm">/* Allocation bitmap for the remapping area: */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">iommu_bitmap_lock</span><span class="p">);</span>
+<span class="cm">/* Guarded by iommu_bitmap_lock: */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">iommu_gart_bitmap</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">u32</span> <span class="n">gart_unmapped_entry</span><span class="p">;</span>
+
+<span class="cp">#define GPTE_VALID    1</span>
+<span class="cp">#define GPTE_COHERENT 2</span>
+<span class="cp">#define GPTE_ENCODE(x) \</span>
+<span class="cp">	(((x) &amp; 0xfffff000) | (((x) &gt;&gt; 32) &lt;&lt; 4) | GPTE_VALID | GPTE_COHERENT)</span>
+<span class="cp">#define GPTE_DECODE(x) (((x) &amp; 0xfffff000) | (((u64)(x) &amp; 0xff0) &lt;&lt; 28))</span>
+
+<span class="cp">#define EMERGENCY_PAGES 32 </span><span class="cm">/* = 128KB */</span><span class="cp"></span>
+
+<span class="cp">#ifdef CONFIG_AGP</span>
+<span class="cp">#define AGPEXTERN extern</span>
+<span class="cp">#else</span>
+<span class="cp">#define AGPEXTERN</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/* GART can only remap to physical addresses &lt; 1TB */</span>
+<span class="cp">#define GART_MAX_PHYS_ADDR	(1ULL &lt;&lt; 40)</span>
+
+<span class="cm">/* backdoor interface to AGP driver */</span>
+<span class="n">AGPEXTERN</span> <span class="kt">int</span> <span class="n">agp_memory_reserved</span><span class="p">;</span>
+<span class="n">AGPEXTERN</span> <span class="n">__u32</span> <span class="o">*</span><span class="n">agp_gatt_table</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">next_bit</span><span class="p">;</span>  <span class="cm">/* protected by iommu_bitmap_lock */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="n">need_flush</span><span class="p">;</span>		<span class="cm">/* global flush state. set for each gart wrap */</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">alloc_iommu</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">int</span> <span class="n">size</span><span class="p">,</span>
+				 <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">align_mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">,</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">boundary_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">base_index</span><span class="p">;</span>
+
+	<span class="n">base_index</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">iommu_bus_base</span> <span class="o">&amp;</span> <span class="n">dma_get_seg_boundary</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span>
+			   <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="n">boundary_size</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">((</span><span class="n">u64</span><span class="p">)</span><span class="n">dma_get_seg_boundary</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+			      <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">offset</span> <span class="o">=</span> <span class="n">iommu_area_alloc</span><span class="p">(</span><span class="n">iommu_gart_bitmap</span><span class="p">,</span> <span class="n">iommu_pages</span><span class="p">,</span> <span class="n">next_bit</span><span class="p">,</span>
+				  <span class="n">size</span><span class="p">,</span> <span class="n">base_index</span><span class="p">,</span> <span class="n">boundary_size</span><span class="p">,</span> <span class="n">align_mask</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">need_flush</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="n">iommu_area_alloc</span><span class="p">(</span><span class="n">iommu_gart_bitmap</span><span class="p">,</span> <span class="n">iommu_pages</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+					  <span class="n">size</span><span class="p">,</span> <span class="n">base_index</span><span class="p">,</span> <span class="n">boundary_size</span><span class="p">,</span>
+					  <span class="n">align_mask</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">next_bit</span> <span class="o">=</span> <span class="n">offset</span><span class="o">+</span><span class="n">size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">next_bit</span> <span class="o">&gt;=</span> <span class="n">iommu_pages</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">next_bit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">need_flush</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">iommu_fullflush</span><span class="p">)</span>
+		<span class="n">need_flush</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">free_iommu</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">int</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">bitmap_clear</span><span class="p">(</span><span class="n">iommu_gart_bitmap</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="n">next_bit</span><span class="p">)</span>
+		<span class="n">next_bit</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">+</span> <span class="n">size</span><span class="p">;</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Use global flush state to avoid races with multiple flushers.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">flush_gart</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">need_flush</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">amd_flush_garts</span><span class="p">();</span>
+		<span class="n">need_flush</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">iommu_bitmap_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_IOMMU_LEAK</span>
+<span class="cm">/* Debugging aid for drivers that don&#39;t free their IOMMU tables */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">leak_trace</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">iommu_leak_pages</span> <span class="o">=</span> <span class="mi">20</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dump_leak</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">static</span> <span class="kt">int</span> <span class="n">dump</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dump</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">dump</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">show_stack</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">debug_dma_dump_mappings</span><span class="p">(</span><span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">iommu_full</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Ran out of IOMMU space for this operation. This is very bad.</span>
+<span class="cm">	 * Unfortunately the drivers cannot handle this operation properly.</span>
+<span class="cm">	 * Return some non mapped prereserved space in the aperture and</span>
+<span class="cm">	 * let the Northbridge deal with it. This will result in garbage</span>
+<span class="cm">	 * in the IO operation. When the size exceeds the prereserved space</span>
+<span class="cm">	 * memory corruption will occur or random memory will be DMAed</span>
+<span class="cm">	 * out. Hopefully no network devices use single mappings that big.</span>
+<span class="cm">	 */</span>
+
+	<span class="n">dev_err</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="s">&quot;PCI-DMA: Out of IOMMU space for %lu bytes</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="o">*</span><span class="n">EMERGENCY_PAGES</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">PCI_DMA_FROMDEVICE</span> <span class="o">||</span> <span class="n">dir</span> <span class="o">==</span> <span class="n">PCI_DMA_BIDIRECTIONAL</span><span class="p">)</span>
+			<span class="n">panic</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Memory would be corrupted</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">PCI_DMA_TODEVICE</span> <span class="o">||</span> <span class="n">dir</span> <span class="o">==</span> <span class="n">PCI_DMA_BIDIRECTIONAL</span><span class="p">)</span>
+			<span class="n">panic</span><span class="p">(</span><span class="n">KERN_ERR</span>
+				<span class="s">&quot;PCI-DMA: Random memory would be DMAed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="cp">#ifdef CONFIG_IOMMU_LEAK</span>
+	<span class="n">dump_leak</span><span class="p">();</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span>
+<span class="nf">need_iommu</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">force_iommu</span> <span class="o">||</span> <span class="o">!</span><span class="n">dma_capable</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span>
+<span class="nf">nonforced_iommu</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="o">!</span><span class="n">dma_capable</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Map a single continuous physical area into the IOMMU.</span>
+<span class="cm"> * Caller needs to check if the iommu is needed and flush.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">dma_addr_t</span> <span class="nf">dma_map_area</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">phys_mem</span><span class="p">,</span>
+				<span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dir</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">align_mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">npages</span> <span class="o">=</span> <span class="n">iommu_num_pages</span><span class="p">(</span><span class="n">phys_mem</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_page</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">phys_mem</span> <span class="o">+</span> <span class="n">size</span> <span class="o">&gt;</span> <span class="n">GART_MAX_PHYS_ADDR</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">bad_dma_addr</span><span class="p">;</span>
+
+	<span class="n">iommu_page</span> <span class="o">=</span> <span class="n">alloc_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">npages</span><span class="p">,</span> <span class="n">align_mask</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">iommu_page</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">nonforced_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">phys_mem</span><span class="p">,</span> <span class="n">size</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">phys_mem</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">panic_on_overflow</span><span class="p">)</span>
+			<span class="n">panic</span><span class="p">(</span><span class="s">&quot;dma_map_area overflow %lu bytes</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+		<span class="n">iommu_full</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">bad_dma_addr</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">npages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">iommu_gatt_base</span><span class="p">[</span><span class="n">iommu_page</span> <span class="o">+</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">GPTE_ENCODE</span><span class="p">(</span><span class="n">phys_mem</span><span class="p">);</span>
+		<span class="n">phys_mem</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">iommu_bus_base</span> <span class="o">+</span> <span class="n">iommu_page</span><span class="o">*</span><span class="n">PAGE_SIZE</span> <span class="o">+</span> <span class="p">(</span><span class="n">phys_mem</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Map a single area into the IOMMU */</span>
+<span class="k">static</span> <span class="n">dma_addr_t</span> <span class="nf">gart_map_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span>
+				<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+				<span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">bus</span><span class="p">;</span>
+	<span class="n">phys_addr_t</span> <span class="n">paddr</span> <span class="o">=</span> <span class="n">page_to_phys</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">+</span> <span class="n">offset</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span><span class="p">)</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">x86_dma_fallback_dev</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">need_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">paddr</span><span class="p">,</span> <span class="n">size</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">paddr</span><span class="p">;</span>
+
+	<span class="n">bus</span> <span class="o">=</span> <span class="n">dma_map_area</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">paddr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">flush_gart</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="n">bus</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Free a DMA mapping.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gart_unmap_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dma_addr</span><span class="p">,</span>
+			    <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_page</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">npages</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">&lt;</span> <span class="n">iommu_bus_base</span> <span class="o">+</span> <span class="n">EMERGENCY_PAGES</span><span class="o">*</span><span class="n">PAGE_SIZE</span> <span class="o">||</span>
+	    <span class="n">dma_addr</span> <span class="o">&gt;=</span> <span class="n">iommu_bus_base</span> <span class="o">+</span> <span class="n">iommu_size</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">iommu_page</span> <span class="o">=</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">-</span> <span class="n">iommu_bus_base</span><span class="p">)</span><span class="o">&gt;&gt;</span><span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="n">npages</span> <span class="o">=</span> <span class="n">iommu_num_pages</span><span class="p">(</span><span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">npages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">iommu_gatt_base</span><span class="p">[</span><span class="n">iommu_page</span> <span class="o">+</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">gart_unmapped_entry</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">free_iommu</span><span class="p">(</span><span class="n">iommu_page</span><span class="p">,</span> <span class="n">npages</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Wrapper for pci_unmap_single working with scatterlists.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gart_unmap_sg</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nents</span><span class="p">,</span>
+			  <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">s</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sg</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">nents</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">||</span> <span class="o">!</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">gart_unmap_page</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_address</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_length</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* Fallback for dma_map_sg in case of overflow */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dma_map_sg_nonforce</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">,</span>
+			       <span class="kt">int</span> <span class="n">nents</span><span class="p">,</span> <span class="kt">int</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">s</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_IOMMU_DEBUG</span>
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;dma_map_sg overflow</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sg</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">nents</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span> <span class="o">=</span> <span class="n">sg_phys</span><span class="p">(</span><span class="n">s</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">nonforced_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">addr</span> <span class="o">=</span> <span class="n">dma_map_area</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">addr</span> <span class="o">==</span> <span class="n">bad_dma_addr</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+					<span class="n">gart_unmap_sg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+				<span class="n">nents</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">sg</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">dma_length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">addr</span><span class="p">;</span>
+		<span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">flush_gart</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="n">nents</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Map multiple scatterlist entries continuous into the first. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__dma_map_cont</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">start</span><span class="p">,</span>
+			  <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sout</span><span class="p">,</span>
+			  <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_start</span> <span class="o">=</span> <span class="n">alloc_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_page</span> <span class="o">=</span> <span class="n">iommu_start</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">s</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">iommu_start</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pages</span><span class="p">,</span> <span class="n">addr</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">phys_addr</span> <span class="o">=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_address</span><span class="p">;</span>
+
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">s</span> <span class="o">!=</span> <span class="n">start</span> <span class="o">&amp;&amp;</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">s</span> <span class="o">==</span> <span class="n">start</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">iommu_bus_base</span><span class="p">;</span>
+			<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">+=</span> <span class="n">iommu_page</span><span class="o">*</span><span class="n">PAGE_SIZE</span> <span class="o">+</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">;</span>
+			<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">+=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">addr</span> <span class="o">=</span> <span class="n">phys_addr</span><span class="p">;</span>
+		<span class="n">pages</span> <span class="o">=</span> <span class="n">iommu_num_pages</span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">pages</span><span class="o">--</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">iommu_gatt_base</span><span class="p">[</span><span class="n">iommu_page</span><span class="p">]</span> <span class="o">=</span> <span class="n">GPTE_ENCODE</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+			<span class="n">addr</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="n">iommu_page</span><span class="o">++</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">iommu_page</span> <span class="o">-</span> <span class="n">iommu_start</span> <span class="o">!=</span> <span class="n">pages</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span>
+<span class="nf">dma_map_cont</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">start</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span>
+	     <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sout</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pages</span><span class="p">,</span> <span class="kt">int</span> <span class="n">need</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">need</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">nelems</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">start</span><span class="o">-&gt;</span><span class="n">dma_address</span><span class="p">;</span>
+		<span class="n">sout</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">=</span> <span class="n">start</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">__dma_map_cont</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">sout</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * DMA map all entries in a scatterlist.</span>
+<span class="cm"> * Merge chunks that have page aligned sizes into a continuous mapping.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gart_map_sg</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nents</span><span class="p">,</span>
+		       <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">s</span><span class="p">,</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="o">*</span><span class="n">start_sg</span><span class="p">,</span> <span class="o">*</span><span class="n">sgmap</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">need</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">nextneed</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">out</span><span class="p">,</span> <span class="n">start</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pages</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">seg_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max_seg_size</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nents</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span><span class="p">)</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">x86_dma_fallback_dev</span><span class="p">;</span>
+
+	<span class="n">out</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">start</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">start_sg</span>	<span class="o">=</span> <span class="n">sg</span><span class="p">;</span>
+	<span class="n">sgmap</span>		<span class="o">=</span> <span class="n">sg</span><span class="p">;</span>
+	<span class="n">seg_size</span>	<span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">max_seg_size</span>	<span class="o">=</span> <span class="n">dma_get_max_seg_size</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">ps</span>		<span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span> <span class="cm">/* shut up gcc */</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sg</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">nents</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dma_addr_t</span> <span class="n">addr</span> <span class="o">=</span> <span class="n">sg_phys</span><span class="p">(</span><span class="n">s</span><span class="p">);</span>
+
+		<span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">addr</span><span class="p">;</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+
+		<span class="n">nextneed</span> <span class="o">=</span> <span class="n">need_iommu</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">);</span>
+
+		<span class="cm">/* Handle the previous not yet processed entries */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">&gt;</span> <span class="n">start</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Can only merge when the last chunk ends on a</span>
+<span class="cm">			 * page boundary and the new one doesn&#39;t have an</span>
+<span class="cm">			 * offset.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">iommu_merge</span> <span class="o">||</span> <span class="o">!</span><span class="n">nextneed</span> <span class="o">||</span> <span class="o">!</span><span class="n">need</span> <span class="o">||</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">||</span>
+			    <span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">+</span> <span class="n">seg_size</span> <span class="o">&gt;</span> <span class="n">max_seg_size</span><span class="p">)</span> <span class="o">||</span>
+			    <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">+</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">)</span> <span class="o">%</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">dma_map_cont</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">start_sg</span><span class="p">,</span> <span class="n">i</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span>
+						 <span class="n">sgmap</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">need</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+					<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+				<span class="n">out</span><span class="o">++</span><span class="p">;</span>
+
+				<span class="n">seg_size</span>	<span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">sgmap</span>		<span class="o">=</span> <span class="n">sg_next</span><span class="p">(</span><span class="n">sgmap</span><span class="p">);</span>
+				<span class="n">pages</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">start</span>		<span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+				<span class="n">start_sg</span>	<span class="o">=</span> <span class="n">s</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+
+		<span class="n">seg_size</span> <span class="o">+=</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+		<span class="n">need</span> <span class="o">=</span> <span class="n">nextneed</span><span class="p">;</span>
+		<span class="n">pages</span> <span class="o">+=</span> <span class="n">iommu_num_pages</span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">,</span> <span class="n">s</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+		<span class="n">ps</span> <span class="o">=</span> <span class="n">s</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dma_map_cont</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">start_sg</span><span class="p">,</span> <span class="n">i</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span> <span class="n">sgmap</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">need</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">error</span><span class="p">;</span>
+	<span class="n">out</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">flush_gart</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">out</span> <span class="o">&lt;</span> <span class="n">nents</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">sgmap</span> <span class="o">=</span> <span class="n">sg_next</span><span class="p">(</span><span class="n">sgmap</span><span class="p">);</span>
+		<span class="n">sgmap</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">out</span><span class="p">;</span>
+
+<span class="nl">error:</span>
+	<span class="n">flush_gart</span><span class="p">();</span>
+	<span class="n">gart_unmap_sg</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">out</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="cm">/* When it was forced or merged try again in a dumb way */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">force_iommu</span> <span class="o">||</span> <span class="n">iommu_merge</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">out</span> <span class="o">=</span> <span class="n">dma_map_sg_nonforce</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nents</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">out</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">panic_on_overflow</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;dma_map_sg: overflow on %lu pages</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+
+	<span class="n">iommu_full</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">pages</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sg</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">nents</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+		<span class="n">s</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">bad_dma_addr</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* allocate and map a coherent mapping */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span>
+<span class="nf">gart_alloc_coherent</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="o">*</span><span class="n">dma_addr</span><span class="p">,</span>
+		    <span class="n">gfp_t</span> <span class="n">flag</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dma_addr_t</span> <span class="n">paddr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">align_mask</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">force_iommu</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="p">(</span><span class="n">flag</span> <span class="o">&amp;</span> <span class="n">GFP_DMA</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">flag</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="p">(</span><span class="n">__GFP_DMA</span> <span class="o">|</span> <span class="n">__GFP_HIGHMEM</span> <span class="o">|</span> <span class="n">__GFP_DMA32</span><span class="p">);</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages</span><span class="p">(</span><span class="n">flag</span> <span class="o">|</span> <span class="n">__GFP_ZERO</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="n">align_mask</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1UL</span> <span class="o">&lt;&lt;</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">))</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">paddr</span> <span class="o">=</span> <span class="n">dma_map_area</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">page_to_phys</span><span class="p">(</span><span class="n">page</span><span class="p">),</span> <span class="n">size</span><span class="p">,</span>
+				     <span class="n">DMA_BIDIRECTIONAL</span><span class="p">,</span> <span class="n">align_mask</span><span class="p">);</span>
+
+		<span class="n">flush_gart</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">paddr</span> <span class="o">!=</span> <span class="n">bad_dma_addr</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">*</span><span class="n">dma_addr</span> <span class="o">=</span> <span class="n">paddr</span><span class="p">;</span>
+			<span class="k">return</span> <span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">__free_pages</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="k">return</span> <span class="n">dma_generic_alloc_coherent</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">flag</span><span class="p">,</span>
+						  <span class="n">attrs</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* free a coherent mapping */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">gart_free_coherent</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">,</span>
+		   <span class="n">dma_addr_t</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">gart_unmap_page</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gart_mapping_error</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dma_addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">==</span> <span class="n">bad_dma_addr</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">no_agp</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">__init</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">check_iommu_size</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">aper</span><span class="p">,</span> <span class="n">u64</span> <span class="n">aper_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">a</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">iommu_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">iommu_size</span> <span class="o">=</span> <span class="n">aper_size</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">no_agp</span><span class="p">)</span>
+			<span class="n">iommu_size</span> <span class="o">/=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">a</span> <span class="o">=</span> <span class="n">aper</span> <span class="o">+</span> <span class="n">iommu_size</span><span class="p">;</span>
+	<span class="n">iommu_size</span> <span class="o">-=</span> <span class="n">round_up</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">PMD_PAGE_SIZE</span><span class="p">)</span> <span class="o">-</span> <span class="n">a</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">iommu_size</span> <span class="o">&lt;</span> <span class="mi">64</span><span class="o">*</span><span class="mi">1024</span><span class="o">*</span><span class="mi">1024</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_warning</span><span class="p">(</span>
+			<span class="s">&quot;PCI-DMA: Warning: Small IOMMU %luMB.&quot;</span>
+			<span class="s">&quot; Consider increasing the AGP aperture in BIOS</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">iommu_size</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">iommu_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">__init</span> <span class="kt">unsigned</span> <span class="nf">read_aperture</span><span class="p">(</span><span class="k">struct</span> <span class="n">pci_dev</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="n">u32</span> <span class="o">*</span><span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">aper_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">aper_base_32</span><span class="p">,</span> <span class="n">aper_order</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">aper_base</span><span class="p">;</span>
+
+	<span class="n">pci_read_config_dword</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AMD64_GARTAPERTUREBASE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">aper_base_32</span><span class="p">);</span>
+	<span class="n">pci_read_config_dword</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AMD64_GARTAPERTURECTL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">aper_order</span><span class="p">);</span>
+	<span class="n">aper_order</span> <span class="o">=</span> <span class="p">(</span><span class="n">aper_order</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mi">7</span><span class="p">;</span>
+
+	<span class="n">aper_base</span> <span class="o">=</span> <span class="n">aper_base_32</span> <span class="o">&amp;</span> <span class="mh">0x7fff</span><span class="p">;</span>
+	<span class="n">aper_base</span> <span class="o">&lt;&lt;=</span> <span class="mi">25</span><span class="p">;</span>
+
+	<span class="n">aper_size</span> <span class="o">=</span> <span class="p">(</span><span class="mi">32</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="n">aper_order</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">aper_base</span> <span class="o">+</span> <span class="n">aper_size</span> <span class="o">&gt;</span> <span class="mh">0x100000000UL</span> <span class="o">||</span> <span class="o">!</span><span class="n">aper_size</span><span class="p">)</span>
+		<span class="n">aper_base</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="o">*</span><span class="n">size</span> <span class="o">=</span> <span class="n">aper_size</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">aper_base</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">enable_gart_translations</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">amd_nb_has_feature</span><span class="p">(</span><span class="n">AMD_NB_GART</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">amd_nb_num</span><span class="p">();</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">pci_dev</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">node_to_amd_nb</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">misc</span><span class="p">;</span>
+
+		<span class="n">enable_gart_translation</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">__pa</span><span class="p">(</span><span class="n">agp_gatt_table</span><span class="p">));</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Flush the GART-TLB to remove stale entries */</span>
+	<span class="n">amd_flush_garts</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If fix_up_north_bridges is set, the north bridges have to be fixed up on</span>
+<span class="cm"> * resume in the same way as they are handled in gart_iommu_hole_init().</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="n">fix_up_north_bridges</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">u32</span> <span class="n">aperture_order</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">u32</span> <span class="n">aperture_alloc</span><span class="p">;</span>
+
+<span class="kt">void</span> <span class="nf">set_up_gart_resume</span><span class="p">(</span><span class="n">u32</span> <span class="n">aper_order</span><span class="p">,</span> <span class="n">u32</span> <span class="n">aper_alloc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">fix_up_north_bridges</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">aperture_order</span> <span class="o">=</span> <span class="n">aper_order</span><span class="p">;</span>
+	<span class="n">aperture_alloc</span> <span class="o">=</span> <span class="n">aper_alloc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gart_fixup_northbridges</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">fix_up_north_bridges</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">amd_nb_has_feature</span><span class="p">(</span><span class="n">AMD_NB_GART</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Restoring GART aperture settings</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">amd_nb_num</span><span class="p">();</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">pci_dev</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">node_to_amd_nb</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">misc</span><span class="p">;</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Don&#39;t enable translations just yet.  That is the next</span>
+<span class="cm">		 * step.  Restore the pre-suspend aperture settings.</span>
+<span class="cm">		 */</span>
+		<span class="n">gart_set_size_and_enable</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">aperture_order</span><span class="p">);</span>
+		<span class="n">pci_write_config_dword</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AMD64_GARTAPERTUREBASE</span><span class="p">,</span> <span class="n">aperture_alloc</span> <span class="o">&gt;&gt;</span> <span class="mi">25</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gart_resume</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Resuming GART IOMMU</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="n">gart_fixup_northbridges</span><span class="p">();</span>
+
+	<span class="n">enable_gart_translations</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">syscore_ops</span> <span class="n">gart_syscore_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">resume</span>		<span class="o">=</span> <span class="n">gart_resume</span><span class="p">,</span>
+
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Private Northbridge GATT initialization in case we cannot use the</span>
+<span class="cm"> * AGP driver for some reason.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">__init</span> <span class="kt">int</span> <span class="nf">init_amd_gatt</span><span class="p">(</span><span class="k">struct</span> <span class="n">agp_kern_info</span> <span class="o">*</span><span class="n">info</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">aper_size</span><span class="p">,</span> <span class="n">gatt_size</span><span class="p">,</span> <span class="n">new_aper_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">aper_base</span><span class="p">,</span> <span class="n">new_aper_base</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">pci_dev</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">gatt</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Disabling AGP.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="n">aper_size</span> <span class="o">=</span> <span class="n">aper_base</span> <span class="o">=</span> <span class="n">info</span><span class="o">-&gt;</span><span class="n">aper_size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">amd_nb_num</span><span class="p">();</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">node_to_amd_nb</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">misc</span><span class="p">;</span>
+		<span class="n">new_aper_base</span> <span class="o">=</span> <span class="n">read_aperture</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">new_aper_size</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">new_aper_base</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">nommu</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">aper_base</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">aper_size</span> <span class="o">=</span> <span class="n">new_aper_size</span><span class="p">;</span>
+			<span class="n">aper_base</span> <span class="o">=</span> <span class="n">new_aper_base</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">aper_size</span> <span class="o">!=</span> <span class="n">new_aper_size</span> <span class="o">||</span> <span class="n">aper_base</span> <span class="o">!=</span> <span class="n">new_aper_base</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">nommu</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">aper_base</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">nommu</span><span class="p">;</span>
+
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">aper_base</span> <span class="o">=</span> <span class="n">aper_base</span><span class="p">;</span>
+	<span class="n">info</span><span class="o">-&gt;</span><span class="n">aper_size</span> <span class="o">=</span> <span class="n">aper_size</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">;</span>
+
+	<span class="n">gatt_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">aper_size</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">u32</span><span class="p">);</span>
+	<span class="n">gatt</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_KERNEL</span> <span class="o">|</span> <span class="n">__GFP_ZERO</span><span class="p">,</span>
+					<span class="n">get_order</span><span class="p">(</span><span class="n">gatt_size</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gatt</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot allocate GATT table&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">set_memory_uc</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">gatt</span><span class="p">,</span> <span class="n">gatt_size</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">))</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Could not set GART PTEs to uncacheable pages&quot;</span><span class="p">);</span>
+
+	<span class="n">agp_gatt_table</span> <span class="o">=</span> <span class="n">gatt</span><span class="p">;</span>
+
+	<span class="n">register_syscore_ops</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gart_syscore_ops</span><span class="p">);</span>
+
+	<span class="n">flush_gart</span><span class="p">();</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: aperture base @ %x size %u KB</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	       <span class="n">aper_base</span><span class="p">,</span> <span class="n">aper_size</span><span class="o">&gt;&gt;</span><span class="mi">10</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">nommu:</span>
+	<span class="cm">/* Should not happen anymore */</span>
+	<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;PCI-DMA: More than 4GB of RAM and no IOMMU</span><span class="se">\n</span><span class="s">&quot;</span>
+	       <span class="s">&quot;falling back to iommu=soft.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dma_map_ops</span> <span class="n">gart_dma_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">map_sg</span>				<span class="o">=</span> <span class="n">gart_map_sg</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unmap_sg</span>			<span class="o">=</span> <span class="n">gart_unmap_sg</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">map_page</span>			<span class="o">=</span> <span class="n">gart_map_page</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unmap_page</span>			<span class="o">=</span> <span class="n">gart_unmap_page</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">alloc</span>				<span class="o">=</span> <span class="n">gart_alloc_coherent</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">free</span>				<span class="o">=</span> <span class="n">gart_free_coherent</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mapping_error</span>			<span class="o">=</span> <span class="n">gart_mapping_error</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gart_iommu_shutdown</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">pci_dev</span> <span class="o">*</span><span class="n">dev</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="cm">/* don&#39;t shutdown it if there is AGP installed */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">no_agp</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">amd_nb_has_feature</span><span class="p">(</span><span class="n">AMD_NB_GART</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">amd_nb_num</span><span class="p">();</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">u32</span> <span class="n">ctl</span><span class="p">;</span>
+
+		<span class="n">dev</span> <span class="o">=</span> <span class="n">node_to_amd_nb</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">misc</span><span class="p">;</span>
+		<span class="n">pci_read_config_dword</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AMD64_GARTAPERTURECTL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ctl</span><span class="p">);</span>
+
+		<span class="n">ctl</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">GARTEN</span><span class="p">;</span>
+
+		<span class="n">pci_write_config_dword</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">AMD64_GARTAPERTURECTL</span><span class="p">,</span> <span class="n">ctl</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="n">__init</span> <span class="nf">gart_iommu_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">agp_kern_info</span> <span class="n">info</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">iommu_start</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">aper_base</span><span class="p">,</span> <span class="n">aper_size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">start_pfn</span><span class="p">,</span> <span class="n">end_pfn</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">scratch</span><span class="p">;</span>
+	<span class="kt">long</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">amd_nb_has_feature</span><span class="p">(</span><span class="n">AMD_NB_GART</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="cp">#ifndef CONFIG_AGP_AMD64</span>
+	<span class="n">no_agp</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+<span class="cp">#else</span>
+	<span class="cm">/* Makefile puts PCI initialization via subsys_initcall first. */</span>
+	<span class="cm">/* Add other AMD AGP bridge drivers here */</span>
+	<span class="n">no_agp</span> <span class="o">=</span> <span class="n">no_agp</span> <span class="o">||</span>
+		<span class="p">(</span><span class="n">agp_amd64_init</span><span class="p">()</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="o">||</span>
+		<span class="p">(</span><span class="n">agp_copy_info</span><span class="p">(</span><span class="n">agp_bridge</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">info</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">no_iommu</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="o">!</span><span class="n">force_iommu</span> <span class="o">&amp;&amp;</span> <span class="n">max_pfn</span> <span class="o">&lt;=</span> <span class="n">MAX_DMA32_PFN</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="o">!</span><span class="n">gart_iommu_aperture</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">no_agp</span> <span class="o">&amp;&amp;</span> <span class="n">init_amd_gatt</span><span class="p">(</span><span class="o">&amp;</span><span class="n">info</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">max_pfn</span> <span class="o">&gt;</span> <span class="n">MAX_DMA32_PFN</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;More than 4GB of memory but GART IOMMU not available.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;falling back to iommu=soft.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* need to map that range */</span>
+	<span class="n">aper_size</span>	<span class="o">=</span> <span class="n">info</span><span class="p">.</span><span class="n">aper_size</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">;</span>
+	<span class="n">aper_base</span>	<span class="o">=</span> <span class="n">info</span><span class="p">.</span><span class="n">aper_base</span><span class="p">;</span>
+	<span class="n">end_pfn</span>		<span class="o">=</span> <span class="p">(</span><span class="n">aper_base</span><span class="o">&gt;&gt;</span><span class="n">PAGE_SHIFT</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">aper_size</span><span class="o">&gt;&gt;</span><span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">end_pfn</span> <span class="o">&gt;</span> <span class="n">max_low_pfn_mapped</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">start_pfn</span> <span class="o">=</span> <span class="p">(</span><span class="n">aper_base</span><span class="o">&gt;&gt;</span><span class="n">PAGE_SHIFT</span><span class="p">);</span>
+		<span class="n">init_memory_mapping</span><span class="p">(</span><span class="n">start_pfn</span><span class="o">&lt;&lt;</span><span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="n">end_pfn</span><span class="o">&lt;&lt;</span><span class="n">PAGE_SHIFT</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: using GART IOMMU.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="n">iommu_size</span> <span class="o">=</span> <span class="n">check_iommu_size</span><span class="p">(</span><span class="n">info</span><span class="p">.</span><span class="n">aper_base</span><span class="p">,</span> <span class="n">aper_size</span><span class="p">);</span>
+	<span class="n">iommu_pages</span> <span class="o">=</span> <span class="n">iommu_size</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="n">iommu_gart_bitmap</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span> <span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_KERNEL</span> <span class="o">|</span> <span class="n">__GFP_ZERO</span><span class="p">,</span>
+						      <span class="n">get_order</span><span class="p">(</span><span class="n">iommu_pages</span><span class="o">/</span><span class="mi">8</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">iommu_gart_bitmap</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot allocate iommu bitmap</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+<span class="cp">#ifdef CONFIG_IOMMU_LEAK</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">leak_trace</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">dma_debug_resize_entries</span><span class="p">(</span><span class="n">iommu_pages</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Cannot trace all the entries</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Out of IOMMU space handling.</span>
+<span class="cm">	 * Reserve some invalid pages at the beginning of the GART.</span>
+<span class="cm">	 */</span>
+	<span class="n">bitmap_set</span><span class="p">(</span><span class="n">iommu_gart_bitmap</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">EMERGENCY_PAGES</span><span class="p">);</span>
+
+	<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;PCI-DMA: Reserving %luMB of IOMMU area in the AGP aperture</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	       <span class="n">iommu_size</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">);</span>
+
+	<span class="n">agp_memory_reserved</span>	<span class="o">=</span> <span class="n">iommu_size</span><span class="p">;</span>
+	<span class="n">iommu_start</span>		<span class="o">=</span> <span class="n">aper_size</span> <span class="o">-</span> <span class="n">iommu_size</span><span class="p">;</span>
+	<span class="n">iommu_bus_base</span>		<span class="o">=</span> <span class="n">info</span><span class="p">.</span><span class="n">aper_base</span> <span class="o">+</span> <span class="n">iommu_start</span><span class="p">;</span>
+	<span class="n">bad_dma_addr</span>		<span class="o">=</span> <span class="n">iommu_bus_base</span><span class="p">;</span>
+	<span class="n">iommu_gatt_base</span>		<span class="o">=</span> <span class="n">agp_gatt_table</span> <span class="o">+</span> <span class="p">(</span><span class="n">iommu_start</span><span class="o">&gt;&gt;</span><span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Unmap the IOMMU part of the GART. The alias of the page is</span>
+<span class="cm">	 * always mapped with cache enabled and there is no full cache</span>
+<span class="cm">	 * coherency across the GART remapping. The unmapping avoids</span>
+<span class="cm">	 * automatic prefetches from the CPU allocating cache lines in</span>
+<span class="cm">	 * there. All CPU accesses are done via the direct mapping to</span>
+<span class="cm">	 * the backing memory. The GART address is only used by PCI</span>
+<span class="cm">	 * devices.</span>
+<span class="cm">	 */</span>
+	<span class="n">set_memory_np</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">__va</span><span class="p">(</span><span class="n">iommu_bus_base</span><span class="p">),</span>
+				<span class="n">iommu_size</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Tricky. The GART table remaps the physical memory range,</span>
+<span class="cm">	 * so the CPU wont notice potential aliases and if the memory</span>
+<span class="cm">	 * is remapped to UC later on, we might surprise the PCI devices</span>
+<span class="cm">	 * with a stray writeout of a cacheline. So play it sure and</span>
+<span class="cm">	 * do an explicit, full-scale wbinvd() _after_ having marked all</span>
+<span class="cm">	 * the pages as Not-Present:</span>
+<span class="cm">	 */</span>
+	<span class="n">wbinvd</span><span class="p">();</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now all caches are flushed and we can safely enable</span>
+<span class="cm">	 * GART hardware.  Doing it early leaves the possibility</span>
+<span class="cm">	 * of stale cache entries that can lead to GART PTE</span>
+<span class="cm">	 * errors.</span>
+<span class="cm">	 */</span>
+	<span class="n">enable_gart_translations</span><span class="p">();</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Try to workaround a bug (thanks to BenH):</span>
+<span class="cm">	 * Set unmapped entries to a scratch page instead of 0.</span>
+<span class="cm">	 * Any prefetches that hit unmapped entries won&#39;t get an bus abort</span>
+<span class="cm">	 * then. (P2P bridge may be prefetching on DMA reads).</span>
+<span class="cm">	 */</span>
+	<span class="n">scratch</span> <span class="o">=</span> <span class="n">get_zeroed_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">scratch</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot allocate iommu scratch page&quot;</span><span class="p">);</span>
+	<span class="n">gart_unmapped_entry</span> <span class="o">=</span> <span class="n">GPTE_ENCODE</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">scratch</span><span class="p">));</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">EMERGENCY_PAGES</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">iommu_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">iommu_gatt_base</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">gart_unmapped_entry</span><span class="p">;</span>
+
+	<span class="n">flush_gart</span><span class="p">();</span>
+	<span class="n">dma_ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">gart_dma_ops</span><span class="p">;</span>
+	<span class="n">x86_platform</span><span class="p">.</span><span class="n">iommu_shutdown</span> <span class="o">=</span> <span class="n">gart_iommu_shutdown</span><span class="p">;</span>
+	<span class="n">swiotlb</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">gart_parse_options</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">arg</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_IOMMU_LEAK</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;leak&quot;</span><span class="p">,</span> <span class="mi">4</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">leak_trace</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">p</span> <span class="o">+=</span> <span class="mi">4</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span> <span class="o">==</span> <span class="sc">&#39;=&#39;</span><span class="p">)</span>
+			<span class="o">++</span><span class="n">p</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">isdigit</span><span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">get_option</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">arg</span><span class="p">))</span>
+			<span class="n">iommu_leak_pages</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="cp">#endif</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">isdigit</span><span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">get_option</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">arg</span><span class="p">))</span>
+		<span class="n">iommu_size</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;fullflush&quot;</span><span class="p">,</span> <span class="mi">9</span><span class="p">))</span>
+		<span class="n">iommu_fullflush</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;nofullflush&quot;</span><span class="p">,</span> <span class="mi">11</span><span class="p">))</span>
+		<span class="n">iommu_fullflush</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;noagp&quot;</span><span class="p">,</span> <span class="mi">5</span><span class="p">))</span>
+		<span class="n">no_agp</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;noaperture&quot;</span><span class="p">,</span> <span class="mi">10</span><span class="p">))</span>
+		<span class="n">fix_aperture</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/* duplicated from pci-dma.c */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;force&quot;</span><span class="p">,</span> <span class="mi">5</span><span class="p">))</span>
+		<span class="n">gart_iommu_aperture_allowed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;allowed&quot;</span><span class="p">,</span> <span class="mi">7</span><span class="p">))</span>
+		<span class="n">gart_iommu_aperture_allowed</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strncmp</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;memaper&quot;</span><span class="p">,</span> <span class="mi">7</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">fallback_aper_force</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">p</span> <span class="o">+=</span> <span class="mi">7</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span> <span class="o">==</span> <span class="sc">&#39;=&#39;</span><span class="p">)</span> <span class="p">{</span>
+			<span class="o">++</span><span class="n">p</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">get_option</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">arg</span><span class="p">))</span>
+				<span class="n">fallback_aper_order</span> <span class="o">=</span> <span class="n">arg</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">IOMMU_INIT_POST</span><span class="p">(</span><span class="n">gart_iommu_hole_init</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › tile › mm › homecache.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>homecache.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright 2010 Tilera Corporation. All Rights Reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   This program is free software; you can redistribute it and/or</span>
+<span class="cm"> *   modify it under the terms of the GNU General Public License</span>
+<span class="cm"> *   as published by the Free Software Foundation, version 2.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   This program is distributed in the hope that it will be useful, but</span>
+<span class="cm"> *   WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> *   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or</span>
+<span class="cm"> *   NON INFRINGEMENT.  See the GNU General Public License for</span>
+<span class="cm"> *   more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This code maintains the &quot;home&quot; for each page in the system.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/bootmem.h&gt;</span>
+<span class="cp">#include &lt;linux/rmap.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/mutex.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/sysctl.h&gt;</span>
+<span class="cp">#include &lt;linux/pagevec.h&gt;</span>
+<span class="cp">#include &lt;linux/ptrace.h&gt;</span>
+<span class="cp">#include &lt;linux/timex.h&gt;</span>
+<span class="cp">#include &lt;linux/cache.h&gt;</span>
+<span class="cp">#include &lt;linux/smp.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/hugetlb.h&gt;</span>
+
+<span class="cp">#include &lt;asm/page.h&gt;</span>
+<span class="cp">#include &lt;asm/sections.h&gt;</span>
+<span class="cp">#include &lt;asm/tlbflush.h&gt;</span>
+<span class="cp">#include &lt;asm/pgalloc.h&gt;</span>
+<span class="cp">#include &lt;asm/homecache.h&gt;</span>
+
+<span class="cp">#include &lt;arch/sim.h&gt;</span>
+
+<span class="cp">#include &quot;migrate.h&quot;</span>
+
+
+<span class="cp">#if CHIP_HAS_COHERENT_LOCAL_CACHE()</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The noallocl2 option suppresses all use of the L2 cache to cache</span>
+<span class="cm"> * locally from a remote home.  There&#39;s no point in using it if we</span>
+<span class="cm"> * don&#39;t have coherent local caching, though.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__write_once</span> <span class="n">noallocl2</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">set_noallocl2</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">str</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">noallocl2</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">early_param</span><span class="p">(</span><span class="s">&quot;noallocl2&quot;</span><span class="p">,</span> <span class="n">set_noallocl2</span><span class="p">);</span>
+
+<span class="cp">#else</span>
+
+<span class="cp">#define noallocl2 0</span>
+
+<span class="cp">#endif</span>
+
+<span class="cm">/* Provide no-op versions of these routines to keep flush_remote() cleaner. */</span>
+<span class="cp">#define mark_caches_evicted_start() 0</span>
+<span class="cp">#define mark_caches_evicted_finish(mask, timestamp) do {} while (0)</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * Update the irq_stat for cpus that we are going to interrupt</span>
+<span class="cm"> * with TLB or cache flushes.  Also handle removing dataplane cpus</span>
+<span class="cm"> * from the TLB flush set, and setting dataplane_tlb_state instead.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">hv_flush_update</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">cache_cpumask</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">tlb_cpumask</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tlb_va</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tlb_length</span><span class="p">,</span>
+			    <span class="n">HV_Remote_ASID</span> <span class="o">*</span><span class="n">asids</span><span class="p">,</span> <span class="kt">int</span> <span class="n">asidcount</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">cpumask</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">cpumask_clear</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mask</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cache_cpumask</span><span class="p">)</span>
+		<span class="n">cpumask_or</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mask</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mask</span><span class="p">,</span> <span class="n">cache_cpumask</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tlb_cpumask</span> <span class="o">&amp;&amp;</span> <span class="n">tlb_length</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cpumask_or</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mask</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mask</span><span class="p">,</span> <span class="n">tlb_cpumask</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">asidcount</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+		<span class="n">cpumask_set_cpu</span><span class="p">(</span><span class="n">asids</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">y</span> <span class="o">*</span> <span class="n">smp_width</span> <span class="o">+</span> <span class="n">asids</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">x</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mask</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Don&#39;t bother to update atomically; losing a count</span>
+<span class="cm">	 * here is not that critical.</span>
+<span class="cm">	 */</span>
+	<span class="n">for_each_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mask</span><span class="p">)</span>
+		<span class="o">++</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">irq_stat</span><span class="p">,</span> <span class="n">cpu</span><span class="p">).</span><span class="n">irq_hv_flush_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This wrapper function around hv_flush_remote() does several things:</span>
+<span class="cm"> *</span>
+<span class="cm"> *  - Provides a return value error-checking panic path, since</span>
+<span class="cm"> *    there&#39;s never any good reason for hv_flush_remote() to fail.</span>
+<span class="cm"> *  - Accepts a 32-bit PFN rather than a 64-bit PA, which generally</span>
+<span class="cm"> *    is the type that Linux wants to pass around anyway.</span>
+<span class="cm"> *  - Centralizes the mark_caches_evicted() handling.</span>
+<span class="cm"> *  - Canonicalizes that lengths of zero make cpumasks NULL.</span>
+<span class="cm"> *  - Handles deferring TLB flushes for dataplane tiles.</span>
+<span class="cm"> *  - Tracks remote interrupts in the per-cpu irq_cpustat_t.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that we have to wait until the cache flush completes before</span>
+<span class="cm"> * updating the per-cpu last_cache_flush word, since otherwise another</span>
+<span class="cm"> * concurrent flush can race, conclude the flush has already</span>
+<span class="cm"> * completed, and start to use the page while it&#39;s still dirty</span>
+<span class="cm"> * remotely (running concurrently with the actual evict, presumably).</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">flush_remote</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cache_pfn</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cache_control</span><span class="p">,</span>
+		  <span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">cache_cpumask_orig</span><span class="p">,</span>
+		  <span class="n">HV_VirtAddr</span> <span class="n">tlb_va</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tlb_length</span><span class="p">,</span>
+		  <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tlb_pgsize</span><span class="p">,</span>
+		  <span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">tlb_cpumask_orig</span><span class="p">,</span>
+		  <span class="n">HV_Remote_ASID</span> <span class="o">*</span><span class="n">asids</span><span class="p">,</span> <span class="kt">int</span> <span class="n">asidcount</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">timestamp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>  <span class="cm">/* happy compiler */</span>
+	<span class="k">struct</span> <span class="n">cpumask</span> <span class="n">cache_cpumask_copy</span><span class="p">,</span> <span class="n">tlb_cpumask_copy</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">cache_cpumask</span><span class="p">,</span> <span class="o">*</span><span class="n">tlb_cpumask</span><span class="p">;</span>
+	<span class="n">HV_PhysAddr</span> <span class="n">cache_pa</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">cache_buf</span><span class="p">[</span><span class="n">NR_CPUS</span><span class="o">*</span><span class="mi">5</span><span class="p">],</span> <span class="n">tlb_buf</span><span class="p">[</span><span class="n">NR_CPUS</span><span class="o">*</span><span class="mi">5</span><span class="p">];</span>
+
+	<span class="n">mb</span><span class="p">();</span>   <span class="cm">/* provided just to simplify &quot;magic hypervisor&quot; mode */</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Canonicalize and copy the cpumasks.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cache_cpumask_orig</span> <span class="o">&amp;&amp;</span> <span class="n">cache_control</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cpumask_copy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cache_cpumask_copy</span><span class="p">,</span> <span class="n">cache_cpumask_orig</span><span class="p">);</span>
+		<span class="n">cache_cpumask</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cache_cpumask_copy</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">cpumask_clear</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cache_cpumask_copy</span><span class="p">);</span>
+		<span class="n">cache_cpumask</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cache_cpumask</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">cache_control</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tlb_cpumask_orig</span> <span class="o">&amp;&amp;</span> <span class="n">tlb_length</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">cpumask_copy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tlb_cpumask_copy</span><span class="p">,</span> <span class="n">tlb_cpumask_orig</span><span class="p">);</span>
+		<span class="n">tlb_cpumask</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">tlb_cpumask_copy</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">cpumask_clear</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tlb_cpumask_copy</span><span class="p">);</span>
+		<span class="n">tlb_cpumask</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">hv_flush_update</span><span class="p">(</span><span class="n">cache_cpumask</span><span class="p">,</span> <span class="n">tlb_cpumask</span><span class="p">,</span> <span class="n">tlb_va</span><span class="p">,</span> <span class="n">tlb_length</span><span class="p">,</span>
+			<span class="n">asids</span><span class="p">,</span> <span class="n">asidcount</span><span class="p">);</span>
+	<span class="n">cache_pa</span> <span class="o">=</span> <span class="p">(</span><span class="n">HV_PhysAddr</span><span class="p">)</span><span class="n">cache_pfn</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cache_control</span> <span class="o">&amp;</span> <span class="n">HV_FLUSH_EVICT_L2</span><span class="p">)</span>
+		<span class="n">timestamp</span> <span class="o">=</span> <span class="n">mark_caches_evicted_start</span><span class="p">();</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">hv_flush_remote</span><span class="p">(</span><span class="n">cache_pa</span><span class="p">,</span> <span class="n">cache_control</span><span class="p">,</span>
+			     <span class="n">cpumask_bits</span><span class="p">(</span><span class="n">cache_cpumask</span><span class="p">),</span>
+			     <span class="n">tlb_va</span><span class="p">,</span> <span class="n">tlb_length</span><span class="p">,</span> <span class="n">tlb_pgsize</span><span class="p">,</span>
+			     <span class="n">cpumask_bits</span><span class="p">(</span><span class="n">tlb_cpumask</span><span class="p">),</span>
+			     <span class="n">asids</span><span class="p">,</span> <span class="n">asidcount</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">cache_control</span> <span class="o">&amp;</span> <span class="n">HV_FLUSH_EVICT_L2</span><span class="p">)</span>
+		<span class="n">mark_caches_evicted_finish</span><span class="p">(</span><span class="n">cache_cpumask</span><span class="p">,</span> <span class="n">timestamp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="n">cpumask_scnprintf</span><span class="p">(</span><span class="n">cache_buf</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">cache_buf</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">cache_cpumask_copy</span><span class="p">);</span>
+	<span class="n">cpumask_scnprintf</span><span class="p">(</span><span class="n">tlb_buf</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">tlb_buf</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">tlb_cpumask_copy</span><span class="p">);</span>
+
+	<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;hv_flush_remote(%#llx, %#lx, %p [%s],&quot;</span>
+	       <span class="s">&quot; %#lx, %#lx, %#lx, %p [%s], %p, %d) = %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	       <span class="n">cache_pa</span><span class="p">,</span> <span class="n">cache_control</span><span class="p">,</span> <span class="n">cache_cpumask</span><span class="p">,</span> <span class="n">cache_buf</span><span class="p">,</span>
+	       <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">tlb_va</span><span class="p">,</span> <span class="n">tlb_length</span><span class="p">,</span> <span class="n">tlb_pgsize</span><span class="p">,</span>
+	       <span class="n">tlb_cpumask</span><span class="p">,</span> <span class="n">tlb_buf</span><span class="p">,</span>
+	       <span class="n">asids</span><span class="p">,</span> <span class="n">asidcount</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+	<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Unsafe to continue.&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">flush_remote_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">order</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">pages</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">,</span> <span class="o">++</span><span class="n">page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">void</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="kt">int</span> <span class="n">hfh</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="kt">int</span> <span class="n">home</span> <span class="o">=</span> <span class="n">page_home</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">home</span> <span class="o">==</span> <span class="n">PAGE_HOME_HASH</span><span class="p">)</span>
+			<span class="n">hfh</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">else</span>
+<span class="cp">#endif</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">home</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">home</span> <span class="o">&gt;=</span> <span class="n">NR_CPUS</span><span class="p">);</span>
+		<span class="n">finv_buffer_remote</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="n">hfh</span><span class="p">);</span>
+		<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">homecache_evict</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">flush_remote</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">HV_FLUSH_EVICT_L2</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return a mask of the cpus whose caches currently own these pages.</span>
+<span class="cm"> * The return value is whether the pages are all coherently cached</span>
+<span class="cm"> * (i.e. none are immutable, incoherent, or uncached).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">homecache_mask</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">pages</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">cpumask</span> <span class="o">*</span><span class="n">home_mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cached_coherently</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">cpumask_clear</span><span class="p">(</span><span class="n">home_mask</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">home</span> <span class="o">=</span> <span class="n">page_home</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">home</span> <span class="o">==</span> <span class="n">PAGE_HOME_IMMUTABLE</span> <span class="o">||</span>
+		    <span class="n">home</span> <span class="o">==</span> <span class="n">PAGE_HOME_INCOHERENT</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">cpumask_copy</span><span class="p">(</span><span class="n">home_mask</span><span class="p">,</span> <span class="n">cpu_possible_mask</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">home</span> <span class="o">==</span> <span class="n">PAGE_HOME_HASH</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">cpumask_or</span><span class="p">(</span><span class="n">home_mask</span><span class="p">,</span> <span class="n">home_mask</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hash_for_home_map</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="cp">#endif</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">home</span> <span class="o">==</span> <span class="n">PAGE_HOME_UNCACHED</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">cached_coherently</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">home</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">home</span> <span class="o">&gt;=</span> <span class="n">NR_CPUS</span><span class="p">);</span>
+		<span class="n">cpumask_set_cpu</span><span class="p">(</span><span class="n">home</span><span class="p">,</span> <span class="n">home_mask</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">cached_coherently</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return the passed length, or zero if it&#39;s long enough that we</span>
+<span class="cm"> * believe we should evict the whole L2 cache.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">cache_flush_length</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">length</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">length</span> <span class="o">&gt;=</span> <span class="n">CHIP_L2_CACHE_SIZE</span><span class="p">())</span> <span class="o">?</span> <span class="n">HV_FLUSH_EVICT_L2</span> <span class="o">:</span> <span class="n">length</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Flush a page out of whatever cache(s) it is in. */</span>
+<span class="kt">void</span> <span class="nf">homecache_flush_cache</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">order</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">pages</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">length</span> <span class="o">=</span> <span class="n">cache_flush_length</span><span class="p">(</span><span class="n">pages</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span> <span class="o">=</span> <span class="n">page_to_pfn</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">cpumask</span> <span class="n">home_mask</span><span class="p">;</span>
+
+	<span class="n">homecache_mask</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">home_mask</span><span class="p">);</span>
+	<span class="n">flush_remote</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">home_mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">sim_validate_lines_evicted</span><span class="p">(</span><span class="n">PFN_PHYS</span><span class="p">(</span><span class="n">pfn</span><span class="p">),</span> <span class="n">pages</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">);</span>
+<span class="p">}</span>
+
+
+<span class="cm">/* Report the home corresponding to a given PTE. */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">pte_to_home</span><span class="p">(</span><span class="n">pte_t</span> <span class="n">pte</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hv_pte_get_nc</span><span class="p">(</span><span class="n">pte</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">PAGE_HOME_IMMUTABLE</span><span class="p">;</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">hv_pte_get_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">))</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">HV_PTE_MODE_CACHE_TILE_L3</span>:
+		<span class="k">return</span> <span class="n">get_remote_cache_cpu</span><span class="p">(</span><span class="n">pte</span><span class="p">);</span>
+	<span class="k">case</span> <span class="n">HV_PTE_MODE_CACHE_NO_L3</span>:
+		<span class="k">return</span> <span class="n">PAGE_HOME_INCOHERENT</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">HV_PTE_MODE_UNCACHED</span>:
+		<span class="k">return</span> <span class="n">PAGE_HOME_UNCACHED</span><span class="p">;</span>
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+	<span class="k">case</span> <span class="n">HV_PTE_MODE_CACHE_HASH_L3</span>:
+		<span class="k">return</span> <span class="n">PAGE_HOME_HASH</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="p">}</span>
+	<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Bad PTE %#llx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pte</span><span class="p">.</span><span class="n">val</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Update the home of a PTE if necessary (can also be used for a pgprot_t). */</span>
+<span class="n">pte_t</span> <span class="nf">pte_set_home</span><span class="p">(</span><span class="n">pte_t</span> <span class="n">pte</span><span class="p">,</span> <span class="kt">int</span> <span class="n">home</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Check for non-linear file mapping &quot;PTEs&quot; and pass them through. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pte_file</span><span class="p">(</span><span class="n">pte</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">pte</span><span class="p">;</span>
+
+<span class="cp">#if CHIP_HAS_MMIO()</span>
+	<span class="cm">/* Check for MMIO mappings and pass them through. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hv_pte_get_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">==</span> <span class="n">HV_PTE_MODE_MMIO</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">pte</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Only immutable pages get NC mappings.  If we have a</span>
+<span class="cm">	 * non-coherent PTE, but the underlying page is not</span>
+<span class="cm">	 * immutable, it&#39;s likely the result of a forced</span>
+<span class="cm">	 * caching setting running up against ptrace setting</span>
+<span class="cm">	 * the page to be writable underneath.  In this case,</span>
+<span class="cm">	 * just keep the PTE coherent.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hv_pte_get_nc</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">home</span> <span class="o">!=</span> <span class="n">PAGE_HOME_IMMUTABLE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_clear_nc</span><span class="p">(</span><span class="n">pte</span><span class="p">);</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;non-immutable page incoherently referenced: %#llx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">pte</span><span class="p">.</span><span class="n">val</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">home</span><span class="p">)</span> <span class="p">{</span>
+
+	<span class="k">case</span> <span class="n">PAGE_HOME_UNCACHED</span>:
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_UNCACHED</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">PAGE_HOME_INCOHERENT</span>:
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_CACHE_NO_L3</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="n">PAGE_HOME_IMMUTABLE</span>:
+		<span class="cm">/*</span>
+<span class="cm">		 * We could home this page anywhere, since it&#39;s immutable,</span>
+<span class="cm">		 * but by default just home it to follow &quot;hash_default&quot;.</span>
+<span class="cm">		 */</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">hv_pte_get_writable</span><span class="p">(</span><span class="n">pte</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pte_get_forcecache</span><span class="p">(</span><span class="n">pte</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/* Upgrade &quot;force any cpu&quot; to &quot;No L3&quot; for immutable. */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">hv_pte_get_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">==</span> <span class="n">HV_PTE_MODE_CACHE_TILE_L3</span>
+			    <span class="o">&amp;&amp;</span> <span class="n">pte_get_anyhome</span><span class="p">(</span><span class="n">pte</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span>
+						      <span class="n">HV_PTE_MODE_CACHE_NO_L3</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span> <span class="k">else</span>
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">hash_default</span><span class="p">)</span>
+			<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_CACHE_HASH_L3</span><span class="p">);</span>
+		<span class="k">else</span>
+<span class="cp">#endif</span>
+			<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_CACHE_NO_L3</span><span class="p">);</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_nc</span><span class="p">(</span><span class="n">pte</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+	<span class="k">case</span> <span class="n">PAGE_HOME_HASH</span>:
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_CACHE_HASH_L3</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="nl">default:</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">home</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">home</span> <span class="o">&gt;=</span> <span class="n">NR_CPUS</span> <span class="o">||</span>
+		       <span class="o">!</span><span class="n">cpu_is_valid_lotar</span><span class="p">(</span><span class="n">home</span><span class="p">));</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_CACHE_TILE_L3</span><span class="p">);</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">set_remote_cache_cpu</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">home</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="cp">#if CHIP_HAS_NC_AND_NOALLOC_BITS()</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">noallocl2</span><span class="p">)</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_no_alloc_l2</span><span class="p">(</span><span class="n">pte</span><span class="p">);</span>
+
+	<span class="cm">/* Simplify &quot;no local and no l3&quot; to &quot;uncached&quot; */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hv_pte_get_no_alloc_l2</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">hv_pte_get_no_alloc_l1</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">hv_pte_get_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">==</span> <span class="n">HV_PTE_MODE_CACHE_NO_L3</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pte</span> <span class="o">=</span> <span class="n">hv_pte_set_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">,</span> <span class="n">HV_PTE_MODE_UNCACHED</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="cp">#endif</span>
+
+	<span class="cm">/* Checking this case here gives a better panic than from the hv. */</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">hv_pte_get_mode</span><span class="p">(</span><span class="n">pte</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">pte</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">pte_set_home</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The routines in this section are the &quot;static&quot; versions of the normal</span>
+<span class="cm"> * dynamic homecaching routines; they just set the home cache</span>
+<span class="cm"> * of a kernel page once, and require a full-chip cache/TLB flush,</span>
+<span class="cm"> * so they&#39;re not suitable for anything but infrequent use.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#if CHIP_HAS_CBOX_HOME_MAP()</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">initial_page_home</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="n">PAGE_HOME_HASH</span><span class="p">;</span> <span class="p">}</span>
+<span class="cp">#else</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">initial_page_home</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="mi">0</span><span class="p">;</span> <span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="kt">int</span> <span class="nf">page_home</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHighMem</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">return</span> <span class="n">initial_page_home</span><span class="p">();</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">kva</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">pte_to_home</span><span class="p">(</span><span class="o">*</span><span class="n">virt_to_pte</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">kva</span><span class="p">));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">page_home</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">homecache_change_page_home</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">order</span><span class="p">,</span> <span class="kt">int</span> <span class="n">home</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">pages</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">kva</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">PageHighMem</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">page_count</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">page_mapcount</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">kva</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">flush_remote</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">HV_FLUSH_EVICT_L2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cpu_cacheable_map</span><span class="p">,</span>
+		     <span class="n">kva</span><span class="p">,</span> <span class="n">pages</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="n">cpu_online_mask</span><span class="p">,</span>
+		     <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">pages</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">,</span> <span class="n">kva</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pte_t</span> <span class="o">*</span><span class="n">ptep</span> <span class="o">=</span> <span class="n">virt_to_pte</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">kva</span><span class="p">);</span>
+		<span class="n">pte_t</span> <span class="n">pteval</span> <span class="o">=</span> <span class="o">*</span><span class="n">ptep</span><span class="p">;</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">pte_present</span><span class="p">(</span><span class="n">pteval</span><span class="p">)</span> <span class="o">||</span> <span class="n">pte_huge</span><span class="p">(</span><span class="n">pteval</span><span class="p">));</span>
+		<span class="n">__set_pte</span><span class="p">(</span><span class="n">ptep</span><span class="p">,</span> <span class="n">pte_set_home</span><span class="p">(</span><span class="n">pteval</span><span class="p">,</span> <span class="n">home</span><span class="p">));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="nf">homecache_alloc_pages</span><span class="p">(</span><span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">,</span>
+				   <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">order</span><span class="p">,</span> <span class="kt">int</span> <span class="n">home</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">gfp_mask</span> <span class="o">&amp;</span> <span class="n">__GFP_HIGHMEM</span><span class="p">);</span>   <span class="cm">/* must be lowmem */</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages</span><span class="p">(</span><span class="n">gfp_mask</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="p">)</span>
+		<span class="n">homecache_change_page_home</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">home</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">page</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">homecache_alloc_pages</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="nf">homecache_alloc_pages_node</span><span class="p">(</span><span class="kt">int</span> <span class="n">nid</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">gfp_mask</span><span class="p">,</span>
+					<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">order</span><span class="p">,</span> <span class="kt">int</span> <span class="n">home</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">gfp_mask</span> <span class="o">&amp;</span> <span class="n">__GFP_HIGHMEM</span><span class="p">);</span>   <span class="cm">/* must be lowmem */</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages_node</span><span class="p">(</span><span class="n">nid</span><span class="p">,</span> <span class="n">gfp_mask</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="p">)</span>
+		<span class="n">homecache_change_page_home</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">home</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">page</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">homecache_free_pages</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">order</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">addr</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">VM_BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">virt_addr_valid</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">addr</span><span class="p">));</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">virt_to_page</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">put_page_testzero</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">homecache_change_page_home</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">initial_page_home</span><span class="p">());</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">order</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">free_hot_cold_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">init_page_count</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="n">__free_pages</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

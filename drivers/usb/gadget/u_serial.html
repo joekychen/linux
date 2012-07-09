@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › usb › gadget › u_serial.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>u_serial.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * u_serial.c - utilities for USB gadget &quot;serial port&quot;/TTY support</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2003 Al Borchers (alborchers@steinerpoint.com)</span>
+<span class="cm"> * Copyright (C) 2008 David Brownell</span>
+<span class="cm"> * Copyright (C) 2008 by Nokia Corporation</span>
+<span class="cm"> *</span>
+<span class="cm"> * This code also borrows from usbserial.c, which is</span>
+<span class="cm"> * Copyright (C) 1999 - 2002 Greg Kroah-Hartman (greg@kroah.com)</span>
+<span class="cm"> * Copyright (C) 2000 Peter Berger (pberger@brimson.com)</span>
+<span class="cm"> * Copyright (C) 2000 Al Borchers (alborchers@steinerpoint.com)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This software is distributed under the terms of the GNU General</span>
+<span class="cm"> * Public License (&quot;GPL&quot;) as published by the Free Software Foundation,</span>
+<span class="cm"> * either version 2 of that License or (at your option) any later version.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/* #define VERBOSE_DEBUG */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+<span class="cp">#include &lt;linux/tty.h&gt;</span>
+<span class="cp">#include &lt;linux/tty_flip.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+
+<span class="cp">#include &quot;u_serial.h&quot;</span>
+
+
+<span class="cm">/*</span>
+<span class="cm"> * This component encapsulates the TTY layer glue needed to provide basic</span>
+<span class="cm"> * &quot;serial port&quot; functionality through the USB gadget stack.  Each such</span>
+<span class="cm"> * port is exposed through a /dev/ttyGS* node.</span>
+<span class="cm"> *</span>
+<span class="cm"> * After initialization (gserial_setup), these TTY port devices stay</span>
+<span class="cm"> * available until they are removed (gserial_cleanup).  Each one may be</span>
+<span class="cm"> * connected to a USB function (gserial_connect), or disconnected (with</span>
+<span class="cm"> * gserial_disconnect) when the USB host issues a config change event.</span>
+<span class="cm"> * Data can only flow when the port is connected to the host.</span>
+<span class="cm"> *</span>
+<span class="cm"> * A given TTY port can be made available in multiple configurations.</span>
+<span class="cm"> * For example, each one might expose a ttyGS0 node which provides a</span>
+<span class="cm"> * login application.  In one case that might use CDC ACM interface 0,</span>
+<span class="cm"> * while another configuration might use interface 3 for that.  The</span>
+<span class="cm"> * work to handle that (including descriptor management) is not part</span>
+<span class="cm"> * of this component.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Configurations may expose more than one TTY port.  For example, if</span>
+<span class="cm"> * ttyGS0 provides login service, then ttyGS1 might provide dialer access</span>
+<span class="cm"> * for a telephone or fax link.  And ttyGS2 might be something that just</span>
+<span class="cm"> * needs a simple byte stream interface for some messaging protocol that</span>
+<span class="cm"> * is managed in userspace ... OBEX, PTP, and MTP have been mentioned.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define PREFIX	&quot;ttyGS&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gserial is the lifecycle interface, used by USB functions</span>
+<span class="cm"> * gs_port is the I/O nexus, used by the tty driver</span>
+<span class="cm"> * tty_struct links to the tty/filesystem framework</span>
+<span class="cm"> *</span>
+<span class="cm"> * gserial &lt;---&gt; gs_port ... links will be null when the USB link is</span>
+<span class="cm"> * inactive; managed by gserial_{connect,disconnect}().  each gserial</span>
+<span class="cm"> * instance can wrap its own USB control protocol.</span>
+<span class="cm"> *	gserial-&gt;ioport == usb_ep-&gt;driver_data ... gs_port</span>
+<span class="cm"> *	gs_port-&gt;port_usb ... gserial</span>
+<span class="cm"> *</span>
+<span class="cm"> * gs_port &lt;---&gt; tty_struct ... links will be null when the TTY file</span>
+<span class="cm"> * isn&#39;t opened; managed by gs_open()/gs_close()</span>
+<span class="cm"> *	gserial-&gt;port_tty ... tty_struct</span>
+<span class="cm"> *	tty_struct-&gt;driver_data ... gserial</span>
+<span class="cm"> */</span>
+
+<span class="cm">/* RX and TX queues can buffer QUEUE_SIZE packets before they hit the</span>
+<span class="cm"> * next layer of buffering.  For TX that&#39;s a circular buffer; for RX</span>
+<span class="cm"> * consider it a NOP.  A third layer is provided by the TTY code.</span>
+<span class="cm"> */</span>
+<span class="cp">#define QUEUE_SIZE		16</span>
+<span class="cp">#define WRITE_BUF_SIZE		8192		</span><span class="cm">/* TX only */</span><span class="cp"></span>
+
+<span class="cm">/* circular buffer */</span>
+<span class="k">struct</span> <span class="n">gs_buf</span> <span class="p">{</span>
+	<span class="kt">unsigned</span>		<span class="n">buf_size</span><span class="p">;</span>
+	<span class="kt">char</span>			<span class="o">*</span><span class="n">buf_buf</span><span class="p">;</span>
+	<span class="kt">char</span>			<span class="o">*</span><span class="n">buf_get</span><span class="p">;</span>
+	<span class="kt">char</span>			<span class="o">*</span><span class="n">buf_put</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The port structure holds info for each port, one for each minor number</span>
+<span class="cm"> * (and thus for each /dev/ node).</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">gs_port</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tty_port</span>		<span class="n">port</span><span class="p">;</span>
+	<span class="n">spinlock_t</span>		<span class="n">port_lock</span><span class="p">;</span>	<span class="cm">/* guard port_* access */</span>
+
+	<span class="k">struct</span> <span class="n">gserial</span>		<span class="o">*</span><span class="n">port_usb</span><span class="p">;</span>
+
+	<span class="n">bool</span>			<span class="n">openclose</span><span class="p">;</span>	<span class="cm">/* open/close in progress */</span>
+	<span class="n">u8</span>			<span class="n">port_num</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">read_pool</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">read_started</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">read_allocated</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">read_queue</span><span class="p">;</span>
+	<span class="kt">unsigned</span>		<span class="n">n_read</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tasklet_struct</span>	<span class="n">push</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="n">write_pool</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">write_started</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">write_allocated</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gs_buf</span>		<span class="n">port_write_buf</span><span class="p">;</span>
+	<span class="n">wait_queue_head_t</span>	<span class="n">drain_wait</span><span class="p">;</span>	<span class="cm">/* wait while writes drain */</span>
+
+	<span class="cm">/* REVISIT this state ... */</span>
+	<span class="k">struct</span> <span class="n">usb_cdc_line_coding</span> <span class="n">port_line_coding</span><span class="p">;</span>	<span class="cm">/* 8-N-1 etc */</span>
+<span class="p">};</span>
+
+<span class="cm">/* increase N_PORTS if you need more */</span>
+<span class="cp">#define N_PORTS		4</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">portmaster</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mutex</span>	<span class="n">lock</span><span class="p">;</span>			<span class="cm">/* protect open/close */</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">ports</span><span class="p">[</span><span class="n">N_PORTS</span><span class="p">];</span>
+<span class="k">static</span> <span class="kt">unsigned</span>	<span class="n">n_ports</span><span class="p">;</span>
+
+<span class="cp">#define GS_CLOSE_TIMEOUT		15		</span><span class="cm">/* seconds */</span><span class="cp"></span>
+
+
+
+<span class="cp">#ifdef VERBOSE_DEBUG</span>
+<span class="cp">#define pr_vdebug(fmt, arg...) \</span>
+<span class="cp">	pr_debug(fmt, ##arg)</span>
+<span class="cp">#else</span>
+<span class="cp">#define pr_vdebug(fmt, arg...) \</span>
+<span class="cp">	({ if (0) pr_debug(fmt, ##arg); })</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*-------------------------------------------------------------------------*/</span>
+
+<span class="cm">/* Circular Buffer */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_alloc</span>
+<span class="cm"> *</span>
+<span class="cm"> * Allocate a circular buffer and all associated memory.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gs_buf_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span> <span class="o">=</span> <span class="n">size</span><span class="p">;</span>
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">;</span>
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_free</span>
+<span class="cm"> *</span>
+<span class="cm"> * Free the buffer and all associated memory.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gs_buf_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">);</span>
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_clear</span>
+<span class="cm"> *</span>
+<span class="cm"> * Clear out all data in the circular buffer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gs_buf_clear</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span><span class="p">;</span>
+	<span class="cm">/* equivalent to a get of all data available */</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_data_avail</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return the number of bytes of data written into the circular</span>
+<span class="cm"> * buffer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">gs_buf_data_avail</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span> <span class="o">+</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">-</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span><span class="p">)</span> <span class="o">%</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_space_avail</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return the number of bytes of space available in the circular</span>
+<span class="cm"> * buffer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">gs_buf_space_avail</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span> <span class="o">+</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">-</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_put</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copy data data from a user buffer and put it into the circular buffer.</span>
+<span class="cm"> * Restrict to the amount of space available.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return the number of bytes copied.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span>
+<span class="nf">gs_buf_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span>  <span class="o">=</span> <span class="n">gs_buf_space_avail</span><span class="p">(</span><span class="n">gb</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">len</span><span class="p">)</span>
+		<span class="n">count</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">+</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span> <span class="o">-</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">len</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">,</span> <span class="n">buf</span><span class="o">+</span><span class="n">len</span><span class="p">,</span> <span class="n">count</span> <span class="o">-</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">+</span> <span class="n">count</span> <span class="o">-</span> <span class="n">len</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&lt;</span> <span class="n">len</span><span class="p">)</span>
+			<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">+=</span> <span class="n">count</span><span class="p">;</span>
+		<span class="k">else</span> <span class="cm">/* count == len */</span>
+			<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_put</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_buf_get</span>
+<span class="cm"> *</span>
+<span class="cm"> * Get data from the circular buffer and copy to the given buffer.</span>
+<span class="cm"> * Restrict to the amount of data available.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Return the number of bytes copied.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span>
+<span class="nf">gs_buf_get</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_buf</span> <span class="o">*</span><span class="n">gb</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="n">gb</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">len</span><span class="p">)</span>
+		<span class="n">count</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">+</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_size</span> <span class="o">-</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">len</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="o">+</span><span class="n">len</span><span class="p">,</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">,</span> <span class="n">count</span> <span class="o">-</span> <span class="n">len</span><span class="p">);</span>
+		<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span> <span class="o">+</span> <span class="n">count</span> <span class="o">-</span> <span class="n">len</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">&lt;</span> <span class="n">len</span><span class="p">)</span>
+			<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">+=</span> <span class="n">count</span><span class="p">;</span>
+		<span class="k">else</span> <span class="cm">/* count == len */</span>
+			<span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_get</span> <span class="o">=</span> <span class="n">gb</span><span class="o">-&gt;</span><span class="n">buf_buf</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*-------------------------------------------------------------------------*/</span>
+
+<span class="cm">/* I/O glue between TTY (upper) and USB function (lower) driver layers */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_alloc_req</span>
+<span class="cm"> *</span>
+<span class="cm"> * Allocate a usb_request and its buffer.  Returns a pointer to the</span>
+<span class="cm"> * usb_request or NULL if there is an error.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span>
+<span class="nf">gs_alloc_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">len</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">kmalloc_flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span><span class="n">req</span><span class="p">;</span>
+
+	<span class="n">req</span> <span class="o">=</span> <span class="n">usb_ep_alloc_request</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">kmalloc_flags</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">req</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">len</span><span class="p">,</span> <span class="n">kmalloc_flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">usb_ep_free_request</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">req</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_free_req</span>
+<span class="cm"> *</span>
+<span class="cm"> * Free a usb_request and its buffer.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">gs_free_req</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">);</span>
+	<span class="n">usb_ep_free_request</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_send_packet</span>
+<span class="cm"> *</span>
+<span class="cm"> * If there is data to send, a packet is built in the given</span>
+<span class="cm"> * buffer and the size is returned.  If there is no data to</span>
+<span class="cm"> * send, 0 is returned.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Called with port_lock held.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span>
+<span class="nf">gs_send_packet</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">packet</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span> <span class="n">size</span><span class="p">)</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">size</span> <span class="o">=</span> <span class="n">gs_buf_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">,</span> <span class="n">packet</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_start_tx</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function finds available write requests, calls</span>
+<span class="cm"> * gs_send_packet to fill these packets with data, and</span>
+<span class="cm"> * continues until either there are no more write requests</span>
+<span class="cm"> * available or no more data to send.  This function is</span>
+<span class="cm"> * run whenever data arrives or write requests are available.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Context: caller owns port_lock; port_usb is non-null.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_start_tx</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span><span class="p">)</span>
+<span class="cm">/*</span>
+<span class="cm">__releases(&amp;port-&gt;port_lock)</span>
+<span class="cm">__acquires(&amp;port-&gt;port_lock)</span>
+<span class="cm">*/</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_ep</span>		<span class="o">*</span><span class="n">in</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">status</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">bool</span>			<span class="n">do_tty_wake</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">pool</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">usb_request</span>	<span class="o">*</span><span class="n">req</span><span class="p">;</span>
+		<span class="kt">int</span>			<span class="n">len</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_started</span> <span class="o">&gt;=</span> <span class="n">QUEUE_SIZE</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">req</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">len</span> <span class="o">=</span> <span class="n">gs_send_packet</span><span class="p">(</span><span class="n">port</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">,</span> <span class="n">in</span><span class="o">-&gt;</span><span class="n">maxpacket</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">drain_wait</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">do_tty_wake</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">zero</span> <span class="o">=</span> <span class="p">(</span><span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+
+		<span class="n">pr_vdebug</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: tx len=%d, 0x%02x 0x%02x 0x%02x ...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="o">*</span><span class="p">((</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">),</span>
+				<span class="o">*</span><span class="p">((</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="o">+</span><span class="mi">1</span><span class="p">),</span> <span class="o">*</span><span class="p">((</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="o">+</span><span class="mi">2</span><span class="p">));</span>
+
+		<span class="cm">/* Drop lock while we call out of driver; completions</span>
+<span class="cm">		 * could be issued while we do so.  Disconnection may</span>
+<span class="cm">		 * happen too; maybe immediately before we queue this!</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * NOTE that we may keep sending data for a while after</span>
+<span class="cm">		 * the TTY closed (dev-&gt;ioport-&gt;port_tty is NULL).</span>
+<span class="cm">		 */</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">usb_ep_queue</span><span class="p">(</span><span class="n">in</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: %s %s err %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">__func__</span><span class="p">,</span> <span class="s">&quot;queue&quot;</span><span class="p">,</span> <span class="n">in</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">status</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">write_started</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="cm">/* abort immediately after disconnect */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">do_tty_wake</span> <span class="o">&amp;&amp;</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">)</span>
+		<span class="n">tty_wakeup</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Context: caller owns port_lock, and port_usb is set</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="n">gs_start_rx</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span><span class="p">)</span>
+<span class="cm">/*</span>
+<span class="cm">__releases(&amp;port-&gt;port_lock)</span>
+<span class="cm">__acquires(&amp;port-&gt;port_lock)</span>
+<span class="cm">*/</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_ep</span>		<span class="o">*</span><span class="n">out</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">pool</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">usb_request</span>	<span class="o">*</span><span class="n">req</span><span class="p">;</span>
+		<span class="kt">int</span>			<span class="n">status</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">tty_struct</span>	<span class="o">*</span><span class="n">tty</span><span class="p">;</span>
+
+		<span class="cm">/* no more rx if closed */</span>
+		<span class="n">tty</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tty</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_started</span> <span class="o">&gt;=</span> <span class="n">QUEUE_SIZE</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">req</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">length</span> <span class="o">=</span> <span class="n">out</span><span class="o">-&gt;</span><span class="n">maxpacket</span><span class="p">;</span>
+
+		<span class="cm">/* drop lock while we call out; the controller driver</span>
+<span class="cm">		 * may need to call us back (e.g. for disconnect)</span>
+<span class="cm">		 */</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">usb_ep_queue</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: %s %s err %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">__func__</span><span class="p">,</span> <span class="s">&quot;queue&quot;</span><span class="p">,</span> <span class="n">out</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">status</span><span class="p">);</span>
+			<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">read_started</span><span class="o">++</span><span class="p">;</span>
+
+		<span class="cm">/* abort immediately after disconnect */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">read_started</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * RX tasklet takes data out of the RX queue and hands it up to the TTY</span>
+<span class="cm"> * layer until it refuses to take any more data (or is throttled back).</span>
+<span class="cm"> * Then it issues reads for any further data.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If the RX queue becomes full enough that no usb_request is queued,</span>
+<span class="cm"> * the OUT endpoint may begin NAKing as soon as its FIFO fills up.</span>
+<span class="cm"> * So QUEUE_SIZE packets plus however many the FIFO holds (usually two)</span>
+<span class="cm"> * can be buffered before the TTY layer&#39;s buffers (currently 64 KB).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_rx_push</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">_port</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>		<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">_port</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tty_struct</span>	<span class="o">*</span><span class="n">tty</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="o">*</span><span class="n">queue</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_queue</span><span class="p">;</span>
+	<span class="n">bool</span>			<span class="n">disconnect</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="n">bool</span>			<span class="n">do_push</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/* hand any queued data to the tty */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">tty</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">queue</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">usb_request</span>	<span class="o">*</span><span class="n">req</span><span class="p">;</span>
+
+		<span class="n">req</span> <span class="o">=</span> <span class="n">list_first_entry</span><span class="p">(</span><span class="n">queue</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+
+		<span class="cm">/* discard data if tty was closed */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tty</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">recycle</span><span class="p">;</span>
+
+		<span class="cm">/* leave data queued if tty was rx throttled */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">test_bit</span><span class="p">(</span><span class="n">TTY_THROTTLED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tty</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="o">-</span><span class="n">ESHUTDOWN</span>:
+			<span class="n">disconnect</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="n">pr_vdebug</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: shutdown</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="nl">default:</span>
+			<span class="cm">/* presumably a transient fault */</span>
+			<span class="n">pr_warning</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: unexpected RX status %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">);</span>
+			<span class="cm">/* FALLTHROUGH */</span>
+		<span class="k">case</span> <span class="mi">0</span>:
+			<span class="cm">/* normal completion */</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* push data to (open) tty */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">actual</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">char</span>		<span class="o">*</span><span class="n">packet</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">;</span>
+			<span class="kt">unsigned</span>	<span class="n">size</span> <span class="o">=</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">actual</span><span class="p">;</span>
+			<span class="kt">unsigned</span>	<span class="n">n</span><span class="p">;</span>
+			<span class="kt">int</span>		<span class="n">count</span><span class="p">;</span>
+
+			<span class="cm">/* we may have pushed part of this packet already... */</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">n_read</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">packet</span> <span class="o">+=</span> <span class="n">n</span><span class="p">;</span>
+				<span class="n">size</span> <span class="o">-=</span> <span class="n">n</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">count</span> <span class="o">=</span> <span class="n">tty_insert_flip_string</span><span class="p">(</span><span class="n">tty</span><span class="p">,</span> <span class="n">packet</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">count</span><span class="p">)</span>
+				<span class="n">do_push</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">!=</span> <span class="n">size</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/* stop pushing; TTY layer can&#39;t handle more */</span>
+				<span class="n">port</span><span class="o">-&gt;</span><span class="n">n_read</span> <span class="o">+=</span> <span class="n">count</span><span class="p">;</span>
+				<span class="n">pr_vdebug</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: rx block %d/%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+						<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span>
+						<span class="n">count</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">actual</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">port</span><span class="o">-&gt;</span><span class="n">n_read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="nl">recycle:</span>
+		<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_pool</span><span class="p">);</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">read_started</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Push from tty to ldisc; without low_latency set this is handled by</span>
+<span class="cm">	 * a workqueue, so we won&#39;t get callbacks and can hold port_lock</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tty</span> <span class="o">&amp;&amp;</span> <span class="n">do_push</span><span class="p">)</span>
+		<span class="n">tty_flip_buffer_push</span><span class="p">(</span><span class="n">tty</span><span class="p">);</span>
+
+
+	<span class="cm">/* We want our data queue to become empty ASAP, keeping data</span>
+<span class="cm">	 * in the tty and ldisc (not here).  If we couldn&#39;t push any</span>
+<span class="cm">	 * this time around, there may be trouble unless there&#39;s an</span>
+<span class="cm">	 * implicit tty_unthrottle() call on its way...</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * REVISIT we should probably add a timer to keep the tasklet</span>
+<span class="cm">	 * from starving ... but it&#39;s not clear that case ever happens.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">queue</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">tty</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">TTY_THROTTLED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tty</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">do_push</span><span class="p">)</span>
+				<span class="n">tasklet_schedule</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">push</span><span class="p">);</span>
+			<span class="k">else</span>
+				<span class="n">pr_warning</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: RX not scheduled?</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* If we&#39;re still connected, refill the USB RX queue. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">disconnect</span> <span class="o">&amp;&amp;</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+		<span class="n">gs_start_rx</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_read_complete</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+
+	<span class="cm">/* Queue all received data until the tty layer is ready for it. */</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_queue</span><span class="p">);</span>
+	<span class="n">tasklet_schedule</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">push</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_write_complete</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span><span class="n">req</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">);</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">write_started</span><span class="o">--</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+	<span class="nl">default:</span>
+		<span class="cm">/* presumably a transient fault */</span>
+		<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;%s: unexpected %s status %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">__func__</span><span class="p">,</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">req</span><span class="o">-&gt;</span><span class="n">status</span><span class="p">);</span>
+		<span class="cm">/* FALL THROUGH */</span>
+	<span class="k">case</span> <span class="mi">0</span>:
+		<span class="cm">/* normal completion */</span>
+		<span class="n">gs_start_tx</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+
+	<span class="k">case</span> <span class="o">-</span><span class="n">ESHUTDOWN</span>:
+		<span class="cm">/* disconnect */</span>
+		<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;%s: %s shutdown</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_free_requests</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">,</span>
+							 <span class="kt">int</span> <span class="o">*</span><span class="n">allocated</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">usb_request</span>	<span class="o">*</span><span class="n">req</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">head</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">req</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">head</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">gs_free_req</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">req</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">allocated</span><span class="p">)</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">allocated</span><span class="p">)</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_alloc_requests</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="n">ep</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">head</span><span class="p">,</span>
+		<span class="kt">void</span> <span class="p">(</span><span class="o">*</span><span class="n">fn</span><span class="p">)(</span><span class="k">struct</span> <span class="n">usb_ep</span> <span class="o">*</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_request</span> <span class="o">*</span><span class="p">),</span>
+		<span class="kt">int</span> <span class="o">*</span><span class="n">allocated</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span>			<span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_request</span>	<span class="o">*</span><span class="n">req</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">n</span> <span class="o">=</span> <span class="n">allocated</span> <span class="o">?</span> <span class="n">QUEUE_SIZE</span> <span class="o">-</span> <span class="o">*</span><span class="n">allocated</span> <span class="o">:</span> <span class="n">QUEUE_SIZE</span><span class="p">;</span>
+
+	<span class="cm">/* Pre-allocate up to QUEUE_SIZE transfers, but if we can&#39;t</span>
+<span class="cm">	 * do quite that many this time, don&#39;t fail ... we just won&#39;t</span>
+<span class="cm">	 * be as speedy as we might otherwise be.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">n</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">req</span> <span class="o">=</span> <span class="n">gs_alloc_req</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">ep</span><span class="o">-&gt;</span><span class="n">maxpacket</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">req</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">list_empty</span><span class="p">(</span><span class="n">head</span><span class="p">)</span> <span class="o">?</span> <span class="o">-</span><span class="n">ENOMEM</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">req</span><span class="o">-&gt;</span><span class="n">complete</span> <span class="o">=</span> <span class="n">fn</span><span class="p">;</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">head</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">allocated</span><span class="p">)</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">allocated</span><span class="p">)</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * gs_start_io - start USB I/O streams</span>
+<span class="cm"> * @dev: encapsulates endpoints to use</span>
+<span class="cm"> * Context: holding port_lock; port_tty and port_usb are non-null</span>
+<span class="cm"> *</span>
+<span class="cm"> * We only start I/O when something is connected to both sides of</span>
+<span class="cm"> * this port.  If nothing is listening on the host side, we may</span>
+<span class="cm"> * be pointlessly filling up our TX buffers and FIFO.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_start_io</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span>	<span class="o">*</span><span class="n">head</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_ep</span>		<span class="o">*</span><span class="n">ep</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">status</span><span class="p">;</span>
+	<span class="kt">unsigned</span>		<span class="n">started</span><span class="p">;</span>
+
+	<span class="cm">/* Allocate RX and TX I/O buffers.  We can&#39;t easily do this much</span>
+<span class="cm">	 * earlier (with GFP_KERNEL) because the requests are coupled to</span>
+<span class="cm">	 * endpoints, as are the packet sizes we&#39;ll be using.  Different</span>
+<span class="cm">	 * configurations may use different endpoints with a given port;</span>
+<span class="cm">	 * and high speed vs full speed changes packet sizes too.</span>
+<span class="cm">	 */</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">gs_alloc_requests</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">head</span><span class="p">,</span> <span class="n">gs_read_complete</span><span class="p">,</span>
+		<span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_allocated</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+
+	<span class="n">status</span> <span class="o">=</span> <span class="n">gs_alloc_requests</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">,</span>
+			<span class="n">gs_write_complete</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_allocated</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">head</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_allocated</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* queue read requests */</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">n_read</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">started</span> <span class="o">=</span> <span class="n">gs_start_rx</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+
+	<span class="cm">/* unblock any pending writes into our circular buffer */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">started</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tty_wakeup</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">head</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_allocated</span><span class="p">);</span>
+		<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">,</span>
+			<span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_allocated</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*-------------------------------------------------------------------------*/</span>
+
+<span class="cm">/* TTY Driver */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * gs_open sets up the link between a gs_port and its associated TTY.</span>
+<span class="cm"> * That link is broken *only* by TTY close(), and all driver methods</span>
+<span class="cm"> * know that.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span>		<span class="n">port_num</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">status</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ports</span><span class="p">[</span><span class="n">port_num</span><span class="p">].</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">port</span> <span class="o">=</span> <span class="n">ports</span><span class="p">[</span><span class="n">port_num</span><span class="p">].</span><span class="n">port</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">port</span><span class="p">)</span>
+			<span class="n">status</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+		<span class="k">else</span> <span class="p">{</span>
+			<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+			<span class="cm">/* already open?  Great. */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">status</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+
+			<span class="cm">/* currently opening/closing? wait ... */</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">status</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+
+			<span class="cm">/* ... else we do the work */</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">status</span> <span class="o">=</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+				<span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ports</span><span class="p">[</span><span class="n">port_num</span><span class="p">].</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="k">switch</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+		<span class="nl">default:</span>
+			<span class="cm">/* fully handled */</span>
+			<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="n">EAGAIN</span>:
+			<span class="cm">/* must do the work */</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="n">EBUSY</span>:
+			<span class="cm">/* wait for EAGAIN task to finish */</span>
+			<span class="n">msleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+			<span class="cm">/* REVISIT could have a waitchannel here, if</span>
+<span class="cm">			 * concurrent open performance is important</span>
+<span class="cm">			 */</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">status</span> <span class="o">!=</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">);</span>
+
+	<span class="cm">/* Do the &quot;real open&quot; */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+	<span class="cm">/* allocate circular buffer on first open */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">.</span><span class="n">buf_buf</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">gs_buf_alloc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">,</span> <span class="n">WRITE_BUF_SIZE</span><span class="p">);</span>
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gs_open: ttyGS%d (%p,%p) no buffer</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+			<span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">exit_unlock_port</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* REVISIT if REMOVED (ports[].port NULL), abort the open</span>
+<span class="cm">	 * to let rmmod work faster (but this way isn&#39;t wrong).</span>
+<span class="cm">	 */</span>
+
+	<span class="cm">/* REVISIT maybe wait for &quot;carrier detect&quot; */</span>
+
+	<span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="n">port</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span> <span class="o">=</span> <span class="n">tty</span><span class="p">;</span>
+
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="cm">/* if connected, start the I/O stream */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">gserial</span>	<span class="o">*</span><span class="n">gser</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">;</span>
+
+		<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gs_open: start ttyGS%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">);</span>
+		<span class="n">gs_start_io</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">connect</span><span class="p">)</span>
+			<span class="n">gser</span><span class="o">-&gt;</span><span class="n">connect</span><span class="p">(</span><span class="n">gser</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gs_open: ttyGS%d (%p,%p)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+
+	<span class="n">status</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">exit_unlock_port:</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_writes_finished</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cond</span><span class="p">;</span>
+
+	<span class="cm">/* return true on disconnect or empty buffer */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">cond</span> <span class="o">=</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">port_usb</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">cond</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_close</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gserial</span>	<span class="o">*</span><span class="n">gser</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">WARN_ON</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="o">--</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gs_close: ttyGS%d (%p,%p) ...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+
+	<span class="cm">/* mark port as closing but in use; we can drop port lock</span>
+<span class="cm">	 * and sleep if necessary</span>
+<span class="cm">	 */</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">gser</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gser</span> <span class="o">&amp;&amp;</span> <span class="n">gser</span><span class="o">-&gt;</span><span class="n">disconnect</span><span class="p">)</span>
+		<span class="n">gser</span><span class="o">-&gt;</span><span class="n">disconnect</span><span class="p">(</span><span class="n">gser</span><span class="p">);</span>
+
+	<span class="cm">/* wait for circular write buffer to drain, disconnect, or at</span>
+<span class="cm">	 * most GS_CLOSE_TIMEOUT seconds; then discard the rest</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">gser</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="n">wait_event_interruptible_timeout</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">drain_wait</span><span class="p">,</span>
+					<span class="n">gs_writes_finished</span><span class="p">(</span><span class="n">port</span><span class="p">),</span>
+					<span class="n">GS_CLOSE_TIMEOUT</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+		<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+		<span class="n">gser</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Iff we&#39;re disconnected, there can be no I/O in flight so it&#39;s</span>
+<span class="cm">	 * ok to free the circular buffer; else just scrub it.  And don&#39;t</span>
+<span class="cm">	 * let the push tasklet fire again until we&#39;re re-opened.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gser</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">gs_buf_free</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">gs_buf_clear</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+
+	<span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gs_close: ttyGS%d (%p,%p) done!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">file</span><span class="p">);</span>
+
+	<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">close_wait</span><span class="p">);</span>
+<span class="nl">exit:</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">,</span> <span class="k">const</span> <span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">status</span><span class="p">;</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_write: ttyGS%d (%p) writing %d bytes</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span><span class="p">)</span>
+		<span class="n">count</span> <span class="o">=</span> <span class="n">gs_buf_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+	<span class="cm">/* treat count == 0 as flush_chars() */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">gs_start_tx</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_put_char</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">ch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">status</span><span class="p">;</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_put_char: (%d,%p) char=0x%x, called from %pf</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">ch</span><span class="p">,</span> <span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">gs_buf_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ch</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_flush_chars</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_flush_chars: (%d,%p)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+		<span class="n">gs_start_tx</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_write_room</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">room</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span>
+		<span class="n">room</span> <span class="o">=</span> <span class="n">gs_buf_space_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_write_room: (%d,%p) room=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">room</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">room</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_chars_in_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">chars</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">chars</span> <span class="o">=</span> <span class="n">gs_buf_data_avail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_chars_in_buffer: (%d,%p) chars=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">tty</span><span class="p">,</span> <span class="n">chars</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">chars</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* undo side effects of setting TTY_THROTTLED */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">gs_unthrottle</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>		<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>		<span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Kickstart read queue processing.  We don&#39;t do xon/xoff,</span>
+<span class="cm">		 * rts/cts, or other handshaking with the host, but if the</span>
+<span class="cm">		 * read queue backs up enough we&#39;ll be NAKing OUT packets.</span>
+<span class="cm">		 */</span>
+		<span class="n">tasklet_schedule</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">push</span><span class="p">);</span>
+		<span class="n">pr_vdebug</span><span class="p">(</span><span class="n">PREFIX</span> <span class="s">&quot;%d: unthrottle</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gs_break_ctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">tty_struct</span> <span class="o">*</span><span class="n">tty</span><span class="p">,</span> <span class="kt">int</span> <span class="n">duration</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">tty</span><span class="o">-&gt;</span><span class="n">driver_data</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">status</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gserial</span>	<span class="o">*</span><span class="n">gser</span><span class="p">;</span>
+
+	<span class="n">pr_vdebug</span><span class="p">(</span><span class="s">&quot;gs_break_ctl: ttyGS%d, send break (%d) </span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">,</span> <span class="n">duration</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">gser</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gser</span> <span class="o">&amp;&amp;</span> <span class="n">gser</span><span class="o">-&gt;</span><span class="n">send_break</span><span class="p">)</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">gser</span><span class="o">-&gt;</span><span class="n">send_break</span><span class="p">(</span><span class="n">gser</span><span class="p">,</span> <span class="n">duration</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">tty_operations</span> <span class="n">gs_tty_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span>			<span class="n">gs_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">close</span> <span class="o">=</span>		<span class="n">gs_close</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write</span> <span class="o">=</span>		<span class="n">gs_write</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">put_char</span> <span class="o">=</span>		<span class="n">gs_put_char</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">flush_chars</span> <span class="o">=</span>		<span class="n">gs_flush_chars</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">write_room</span> <span class="o">=</span>		<span class="n">gs_write_room</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">chars_in_buffer</span> <span class="o">=</span>	<span class="n">gs_chars_in_buffer</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unthrottle</span> <span class="o">=</span>		<span class="n">gs_unthrottle</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">break_ctl</span> <span class="o">=</span>		<span class="n">gs_break_ctl</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*-------------------------------------------------------------------------*/</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tty_driver</span> <span class="o">*</span><span class="n">gs_tty_driver</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">gs_port_alloc</span><span class="p">(</span><span class="kt">unsigned</span> <span class="n">port_num</span><span class="p">,</span> <span class="k">struct</span> <span class="n">usb_cdc_line_coding</span> <span class="o">*</span><span class="n">coding</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span><span class="p">;</span>
+
+	<span class="n">port</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">tty_port_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">);</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">drain_wait</span><span class="p">);</span>
+
+	<span class="n">tasklet_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">push</span><span class="p">,</span> <span class="n">gs_rx_push</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">port</span><span class="p">);</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_pool</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_queue</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">);</span>
+
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span> <span class="o">=</span> <span class="n">port_num</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_line_coding</span> <span class="o">=</span> <span class="o">*</span><span class="n">coding</span><span class="p">;</span>
+
+	<span class="n">ports</span><span class="p">[</span><span class="n">port_num</span><span class="p">].</span><span class="n">port</span> <span class="o">=</span> <span class="n">port</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * gserial_setup - initialize TTY driver for one or more ports</span>
+<span class="cm"> * @g: gadget to associate with these ports</span>
+<span class="cm"> * @count: how many ports to support</span>
+<span class="cm"> * Context: may sleep</span>
+<span class="cm"> *</span>
+<span class="cm"> * The TTY stack needs to know in advance how many devices it should</span>
+<span class="cm"> * plan to manage.  Use this call to set up the ports you will be</span>
+<span class="cm"> * exporting through USB.  Later, connect them to functions based</span>
+<span class="cm"> * on what configuration is activated by the USB host; and disconnect</span>
+<span class="cm"> * them as appropriate.</span>
+<span class="cm"> *</span>
+<span class="cm"> * An example would be a two-configuration device in which both</span>
+<span class="cm"> * configurations expose port 0, but through different functions.</span>
+<span class="cm"> * One configuration could even expose port 1 while the other</span>
+<span class="cm"> * one doesn&#39;t.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns negative errno or zero.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">gserial_setup</span><span class="p">(</span><span class="k">struct</span> <span class="n">usb_gadget</span> <span class="o">*</span><span class="n">g</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span>			<span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">usb_cdc_line_coding</span>	<span class="n">coding</span><span class="p">;</span>
+	<span class="kt">int</span>				<span class="n">status</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">count</span> <span class="o">&gt;</span> <span class="n">N_PORTS</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">gs_tty_driver</span> <span class="o">=</span> <span class="n">alloc_tty_driver</span><span class="p">(</span><span class="n">count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gs_tty_driver</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">driver_name</span> <span class="o">=</span> <span class="s">&quot;g_serial&quot;</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">=</span> <span class="n">PREFIX</span><span class="p">;</span>
+	<span class="cm">/* uses dynamically assigned dev_t values */</span>
+
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">type</span> <span class="o">=</span> <span class="n">TTY_DRIVER_TYPE_SERIAL</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">subtype</span> <span class="o">=</span> <span class="n">SERIAL_TYPE_NORMAL</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">TTY_DRIVER_REAL_RAW</span> <span class="o">|</span> <span class="n">TTY_DRIVER_DYNAMIC_DEV</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">init_termios</span> <span class="o">=</span> <span class="n">tty_std_termios</span><span class="p">;</span>
+
+	<span class="cm">/* 9600-8-N-1 ... matches defaults expected by &quot;usbser.sys&quot; on</span>
+<span class="cm">	 * MS-Windows.  Otherwise, most of these flags shouldn&#39;t affect</span>
+<span class="cm">	 * anything unless we were to actually hook up to a serial line.</span>
+<span class="cm">	 */</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">init_termios</span><span class="p">.</span><span class="n">c_cflag</span> <span class="o">=</span>
+			<span class="n">B9600</span> <span class="o">|</span> <span class="n">CS8</span> <span class="o">|</span> <span class="n">CREAD</span> <span class="o">|</span> <span class="n">HUPCL</span> <span class="o">|</span> <span class="n">CLOCAL</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">init_termios</span><span class="p">.</span><span class="n">c_ispeed</span> <span class="o">=</span> <span class="mi">9600</span><span class="p">;</span>
+	<span class="n">gs_tty_driver</span><span class="o">-&gt;</span><span class="n">init_termios</span><span class="p">.</span><span class="n">c_ospeed</span> <span class="o">=</span> <span class="mi">9600</span><span class="p">;</span>
+
+	<span class="n">coding</span><span class="p">.</span><span class="n">dwDTERate</span> <span class="o">=</span> <span class="n">cpu_to_le32</span><span class="p">(</span><span class="mi">9600</span><span class="p">);</span>
+	<span class="n">coding</span><span class="p">.</span><span class="n">bCharFormat</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+	<span class="n">coding</span><span class="p">.</span><span class="n">bParityType</span> <span class="o">=</span> <span class="n">USB_CDC_NO_PARITY</span><span class="p">;</span>
+	<span class="n">coding</span><span class="p">.</span><span class="n">bDataBits</span> <span class="o">=</span> <span class="n">USB_CDC_1_STOP_BITS</span><span class="p">;</span>
+
+	<span class="n">tty_set_operations</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gs_tty_ops</span><span class="p">);</span>
+
+	<span class="cm">/* make devices be openable */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ports</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">gs_port_alloc</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">coding</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">count</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">n_ports</span> <span class="o">=</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="cm">/* export the driver ... */</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">tty_register_driver</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;%s: cannot register, err %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">__func__</span><span class="p">,</span> <span class="n">status</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">fail</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* ... and sysfs class devices, so mdev/udev make /dev/ttyGS* */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">device</span>	<span class="o">*</span><span class="n">tty_dev</span><span class="p">;</span>
+
+		<span class="n">tty_dev</span> <span class="o">=</span> <span class="n">tty_register_device</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">g</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">tty_dev</span><span class="p">))</span>
+			<span class="n">pr_warning</span><span class="p">(</span><span class="s">&quot;%s: no classdev for port %d, err %ld</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">__func__</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">tty_dev</span><span class="p">));</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: registered %d ttyGS* device%s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span>
+			<span class="n">count</span><span class="p">,</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot;&quot;</span> <span class="o">:</span> <span class="s">&quot;s&quot;</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="nl">fail:</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">count</span><span class="o">--</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">ports</span><span class="p">[</span><span class="n">count</span><span class="p">].</span><span class="n">port</span><span class="p">);</span>
+	<span class="n">put_tty_driver</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">);</span>
+	<span class="n">gs_tty_driver</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gs_closed</span><span class="p">(</span><span class="k">struct</span> <span class="n">gs_port</span> <span class="o">*</span><span class="n">port</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cond</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="n">cond</span> <span class="o">=</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span><span class="p">;</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">cond</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * gserial_cleanup - remove TTY-over-USB driver and devices</span>
+<span class="cm"> * Context: may sleep</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is called to free all resources allocated by @gserial_setup().</span>
+<span class="cm"> * Accordingly, it may need to wait until some open /dev/ files have</span>
+<span class="cm"> * closed.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The caller must have issued @gserial_disconnect() for any ports</span>
+<span class="cm"> * that had previously been connected, so that there is never any</span>
+<span class="cm"> * I/O pending when it&#39;s called.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">gserial_cleanup</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span>	<span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gs_tty_driver</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* start sysfs and /dev/ttyGS* node removal */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">n_ports</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">tty_unregister_device</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">n_ports</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* prevent new opens */</span>
+		<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ports</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">port</span> <span class="o">=</span> <span class="n">ports</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">port</span><span class="p">;</span>
+		<span class="n">ports</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">port</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ports</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">lock</span><span class="p">);</span>
+
+		<span class="n">tasklet_kill</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">push</span><span class="p">);</span>
+
+		<span class="cm">/* wait for old opens to finish */</span>
+		<span class="n">wait_event</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">close_wait</span><span class="p">,</span> <span class="n">gs_closed</span><span class="p">(</span><span class="n">port</span><span class="p">));</span>
+
+		<span class="n">WARN_ON</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="n">kfree</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">n_ports</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">tty_unregister_driver</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">);</span>
+	<span class="n">put_tty_driver</span><span class="p">(</span><span class="n">gs_tty_driver</span><span class="p">);</span>
+	<span class="n">gs_tty_driver</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: cleaned up ttyGS* support</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * gserial_connect - notify TTY I/O glue that USB link is active</span>
+<span class="cm"> * @gser: the function, set up with endpoints and descriptors</span>
+<span class="cm"> * @port_num: which port is active</span>
+<span class="cm"> * Context: any (usually from irq)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is called activate endpoints and let the TTY layer know that</span>
+<span class="cm"> * the connection is active ... not unlike &quot;carrier detect&quot;.  It won&#39;t</span>
+<span class="cm"> * necessarily start I/O queues; unless the TTY is held open by any</span>
+<span class="cm"> * task, there would be no point.  However, the endpoints will be</span>
+<span class="cm"> * activated so the USB host can perform I/O, subject to basic USB</span>
+<span class="cm"> * hardware flow control.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Caller needs to have set up the endpoints and USB function in @dev</span>
+<span class="cm"> * before calling this, as well as the appropriate (speed-specific)</span>
+<span class="cm"> * endpoint descriptors, and also have set up the TTY driver by calling</span>
+<span class="cm"> * @gserial_setup().</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns negative errno or zero.</span>
+<span class="cm"> * On success, ep-&gt;driver_data will be overwritten.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">gserial_connect</span><span class="p">(</span><span class="k">struct</span> <span class="n">gserial</span> <span class="o">*</span><span class="n">gser</span><span class="p">,</span> <span class="n">u8</span> <span class="n">port_num</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">status</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gs_tty_driver</span> <span class="o">||</span> <span class="n">port_num</span> <span class="o">&gt;=</span> <span class="n">n_ports</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="cm">/* we &quot;know&quot; gserial_cleanup() hasn&#39;t been called */</span>
+	<span class="n">port</span> <span class="o">=</span> <span class="n">ports</span><span class="p">[</span><span class="n">port_num</span><span class="p">].</span><span class="n">port</span><span class="p">;</span>
+
+	<span class="cm">/* activate the endpoints */</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">usb_ep_enable</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="n">port</span><span class="p">;</span>
+
+	<span class="n">status</span> <span class="o">=</span> <span class="n">usb_ep_enable</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">fail_out</span><span class="p">;</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="n">port</span><span class="p">;</span>
+
+	<span class="cm">/* then tell the tty glue that I/O can work */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">ioport</span> <span class="o">=</span> <span class="n">port</span><span class="p">;</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span> <span class="o">=</span> <span class="n">gser</span><span class="p">;</span>
+
+	<span class="cm">/* REVISIT unclear how best to handle this state...</span>
+<span class="cm">	 * we don&#39;t really couple it with the Linux TTY.</span>
+<span class="cm">	 */</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">port_line_coding</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_line_coding</span><span class="p">;</span>
+
+	<span class="cm">/* REVISIT if waiting on &quot;carrier detect&quot;, signal. */</span>
+
+	<span class="cm">/* if it&#39;s already open, start I/O ... and notify the serial</span>
+<span class="cm">	 * protocol about open/close status (connect/disconnect).</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;gserial_connect: start ttyGS%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">port_num</span><span class="p">);</span>
+		<span class="n">gs_start_io</span><span class="p">(</span><span class="n">port</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">connect</span><span class="p">)</span>
+			<span class="n">gser</span><span class="o">-&gt;</span><span class="n">connect</span><span class="p">(</span><span class="n">gser</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">disconnect</span><span class="p">)</span>
+			<span class="n">gser</span><span class="o">-&gt;</span><span class="n">disconnect</span><span class="p">(</span><span class="n">gser</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+
+<span class="nl">fail_out:</span>
+	<span class="n">usb_ep_disable</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">);</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * gserial_disconnect - notify TTY I/O glue that USB link is inactive</span>
+<span class="cm"> * @gser: the function, on which gserial_connect() was called</span>
+<span class="cm"> * Context: any (usually from irq)</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is called to deactivate endpoints and let the TTY layer know</span>
+<span class="cm"> * that the connection went inactive ... not unlike &quot;hangup&quot;.</span>
+<span class="cm"> *</span>
+<span class="cm"> * On return, the state is as if gserial_connect() had never been called;</span>
+<span class="cm"> * there is no active USB I/O on these endpoints.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">gserial_disconnect</span><span class="p">(</span><span class="k">struct</span> <span class="n">gserial</span> <span class="o">*</span><span class="n">gser</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gs_port</span>	<span class="o">*</span><span class="n">port</span> <span class="o">=</span> <span class="n">gser</span><span class="o">-&gt;</span><span class="n">ioport</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">port</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* tell the TTY glue not to do I/O here any more */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* REVISIT as above: how best to track this? */</span>
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_line_coding</span> <span class="o">=</span> <span class="n">gser</span><span class="o">-&gt;</span><span class="n">port_line_coding</span><span class="p">;</span>
+
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">port_usb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">ioport</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">drain_wait</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">)</span>
+			<span class="n">tty_hangup</span><span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">tty</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* disable endpoints, aborting down any active I/O */</span>
+	<span class="n">usb_ep_disable</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">);</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">usb_ep_disable</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">);</span>
+	<span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="o">-&gt;</span><span class="n">driver_data</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* finally, free any unused/unusable I/O buffers */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port</span><span class="p">.</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">openclose</span><span class="p">)</span>
+		<span class="n">gs_buf_free</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_write_buf</span><span class="p">);</span>
+	<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_pool</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">out</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">read_queue</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">gs_free_requests</span><span class="p">(</span><span class="n">gser</span><span class="o">-&gt;</span><span class="n">in</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">write_pool</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">port</span><span class="o">-&gt;</span><span class="n">read_allocated</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">read_started</span> <span class="o">=</span>
+		<span class="n">port</span><span class="o">-&gt;</span><span class="n">write_allocated</span> <span class="o">=</span> <span class="n">port</span><span class="o">-&gt;</span><span class="n">write_started</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">port</span><span class="o">-&gt;</span><span class="n">port_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

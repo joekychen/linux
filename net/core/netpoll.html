@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › core › netpoll.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>netpoll.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Common framework for low-level network console, dump, and debugger code</span>
+<span class="cm"> *</span>
+<span class="cm"> * Sep 8 2003  Matt Mackall &lt;mpm@selenic.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * based on the netconsole code from:</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2001  Ingo Molnar &lt;mingo@redhat.com&gt;</span>
+<span class="cm"> * Copyright (C) 2002  Red Hat, Inc.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define pr_fmt(fmt) KBUILD_MODNAME &quot;: &quot; fmt</span>
+
+<span class="cp">#include &lt;linux/moduleparam.h&gt;</span>
+<span class="cp">#include &lt;linux/netdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/etherdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/if_arp.h&gt;</span>
+<span class="cp">#include &lt;linux/inetdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/inet.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/netpoll.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+<span class="cp">#include &lt;linux/rcupdate.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;net/tcp.h&gt;</span>
+<span class="cp">#include &lt;net/udp.h&gt;</span>
+<span class="cp">#include &lt;asm/unaligned.h&gt;</span>
+<span class="cp">#include &lt;trace/events/napi.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We maintain a small pool of fully-sized skbs, to make sure the</span>
+<span class="cm"> * message gets out even in extreme OOM situations.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define MAX_UDP_CHUNK 1460</span>
+<span class="cp">#define MAX_SKBS 32</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff_head</span> <span class="n">skb_pool</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">atomic_t</span> <span class="n">trapped</span><span class="p">;</span>
+
+<span class="cp">#define USEC_PER_POLL	50</span>
+<span class="cp">#define NETPOLL_RX_ENABLED  1</span>
+<span class="cp">#define NETPOLL_RX_DROP     2</span>
+
+<span class="cp">#define MAX_SKB_SIZE							\</span>
+<span class="cp">	(sizeof(struct ethhdr) +					\</span>
+<span class="cp">	 sizeof(struct iphdr) +						\</span>
+<span class="cp">	 sizeof(struct udphdr) +					\</span>
+<span class="cp">	 MAX_UDP_CHUNK)</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">zap_completion_queue</span><span class="p">(</span><span class="kt">void</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">arp_reply</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">carrier_timeout</span> <span class="o">=</span> <span class="mi">4</span><span class="p">;</span>
+<span class="n">module_param</span><span class="p">(</span><span class="n">carrier_timeout</span><span class="p">,</span> <span class="n">uint</span><span class="p">,</span> <span class="mo">0644</span><span class="p">);</span>
+
+<span class="cp">#define np_info(np, fmt, ...)				\</span>
+<span class="cp">	pr_info(&quot;%s: &quot; fmt, np-&gt;name, ##__VA_ARGS__)</span>
+<span class="cp">#define np_err(np, fmt, ...)				\</span>
+<span class="cp">	pr_err(&quot;%s: &quot; fmt, np-&gt;name, ##__VA_ARGS__)</span>
+<span class="cp">#define np_notice(np, fmt, ...)				\</span>
+<span class="cp">	pr_notice(&quot;%s: &quot; fmt, np-&gt;name, ##__VA_ARGS__)</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">queue_process</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span> <span class="k">struct</span> <span class="n">netpoll_info</span><span class="p">,</span> <span class="n">tx_work</span><span class="p">.</span><span class="n">work</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">skb</span> <span class="o">=</span> <span class="n">skb_dequeue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+		<span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="o">*</span><span class="n">ops</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">netdev_queue</span> <span class="o">*</span><span class="n">txq</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">netif_device_present</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">netif_running</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">__kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">txq</span> <span class="o">=</span> <span class="n">netdev_get_tx_queue</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">skb_get_queue_mapping</span><span class="p">(</span><span class="n">skb</span><span class="p">));</span>
+
+		<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+		<span class="n">__netif_tx_lock</span><span class="p">(</span><span class="n">txq</span><span class="p">,</span> <span class="n">smp_processor_id</span><span class="p">());</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">netif_xmit_frozen_or_stopped</span><span class="p">(</span><span class="n">txq</span><span class="p">)</span> <span class="o">||</span>
+		    <span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_start_xmit</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">dev</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NETDEV_TX_OK</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">skb_queue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+			<span class="n">__netif_tx_unlock</span><span class="p">(</span><span class="n">txq</span><span class="p">);</span>
+			<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+			<span class="n">schedule_delayed_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">tx_work</span><span class="p">,</span> <span class="n">HZ</span><span class="o">/</span><span class="mi">10</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">__netif_tx_unlock</span><span class="p">(</span><span class="n">txq</span><span class="p">);</span>
+		<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">__sum16</span> <span class="nf">checksum_udp</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">udphdr</span> <span class="o">*</span><span class="n">uh</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="kt">short</span> <span class="n">ulen</span><span class="p">,</span> <span class="n">__be32</span> <span class="n">saddr</span><span class="p">,</span> <span class="n">__be32</span> <span class="n">daddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__wsum</span> <span class="n">psum</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">uh</span><span class="o">-&gt;</span><span class="n">check</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">||</span> <span class="n">skb_csum_unnecessary</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">psum</span> <span class="o">=</span> <span class="n">csum_tcpudp_nofold</span><span class="p">(</span><span class="n">saddr</span><span class="p">,</span> <span class="n">daddr</span><span class="p">,</span> <span class="n">ulen</span><span class="p">,</span> <span class="n">IPPROTO_UDP</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span> <span class="o">==</span> <span class="n">CHECKSUM_COMPLETE</span> <span class="o">&amp;&amp;</span>
+	    <span class="o">!</span><span class="n">csum_fold</span><span class="p">(</span><span class="n">csum_add</span><span class="p">(</span><span class="n">psum</span><span class="p">,</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">csum</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">csum</span> <span class="o">=</span> <span class="n">psum</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">__skb_checksum_complete</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Check whether delayed processing was scheduled for our NIC. If so,</span>
+<span class="cm"> * we attempt to grab the poll lock and use -&gt;poll() to pump the card.</span>
+<span class="cm"> * If this fails, either we&#39;ve recursed in -&gt;poll() or it&#39;s already</span>
+<span class="cm"> * running on another CPU.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note: we don&#39;t mask interrupts with this lock because we&#39;re using</span>
+<span class="cm"> * trylock here and interrupts are already disabled in the softirq</span>
+<span class="cm"> * case. Further, we test the poll_owner to avoid recursion on UP</span>
+<span class="cm"> * systems where the lock doesn&#39;t exist.</span>
+<span class="cm"> *</span>
+<span class="cm"> * In cases where there is bi-directional communications, reading only</span>
+<span class="cm"> * one message at a time can lead to packets being dropped by the</span>
+<span class="cm"> * network adapter, forcing superfluous retries and possibly timeouts.</span>
+<span class="cm"> * Thus, we set our budget to greater than 1.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">poll_one_napi</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span><span class="p">,</span>
+			 <span class="k">struct</span> <span class="n">napi_struct</span> <span class="o">*</span><span class="n">napi</span><span class="p">,</span> <span class="kt">int</span> <span class="n">budget</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">work</span><span class="p">;</span>
+
+	<span class="cm">/* net_rx_action&#39;s -&gt;poll() invocations and our&#39;s are</span>
+<span class="cm">	 * synchronized by this test which is only made while</span>
+<span class="cm">	 * holding the napi-&gt;poll_lock.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">NAPI_STATE_SCHED</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">budget</span><span class="p">;</span>
+
+	<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_flags</span> <span class="o">|=</span> <span class="n">NETPOLL_RX_DROP</span><span class="p">;</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">);</span>
+	<span class="n">set_bit</span><span class="p">(</span><span class="n">NAPI_STATE_NPSVC</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+
+	<span class="n">work</span> <span class="o">=</span> <span class="n">napi</span><span class="o">-&gt;</span><span class="n">poll</span><span class="p">(</span><span class="n">napi</span><span class="p">,</span> <span class="n">budget</span><span class="p">);</span>
+	<span class="n">trace_napi_poll</span><span class="p">(</span><span class="n">napi</span><span class="p">);</span>
+
+	<span class="n">clear_bit</span><span class="p">(</span><span class="n">NAPI_STATE_NPSVC</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">state</span><span class="p">);</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">);</span>
+	<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">NETPOLL_RX_DROP</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">budget</span> <span class="o">-</span> <span class="n">work</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">poll_napi</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">napi_struct</span> <span class="o">*</span><span class="n">napi</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">budget</span> <span class="o">=</span> <span class="mi">16</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">napi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">napi_list</span><span class="p">,</span> <span class="n">dev_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">poll_owner</span> <span class="o">!=</span> <span class="n">smp_processor_id</span><span class="p">()</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">spin_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">poll_lock</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">budget</span> <span class="o">=</span> <span class="n">poll_one_napi</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">,</span> <span class="n">napi</span><span class="p">,</span> <span class="n">budget</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">poll_lock</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">budget</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">service_arp_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npi</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">npi</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+		<span class="k">while</span> <span class="p">((</span><span class="n">skb</span> <span class="o">=</span> <span class="n">skb_dequeue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npi</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">)))</span>
+			<span class="n">arp_reply</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">netpoll_poll_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="o">*</span><span class="n">ops</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev</span> <span class="o">||</span> <span class="o">!</span><span class="n">netif_running</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">ops</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_poll_controller</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* Process pending work on NIC */</span>
+	<span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_poll_controller</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">poll_napi</span><span class="p">(</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IFF_SLAVE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">bond_dev</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">master</span><span class="p">;</span>
+			<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+			<span class="k">while</span> <span class="p">((</span><span class="n">skb</span> <span class="o">=</span> <span class="n">skb_dequeue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">)))</span> <span class="p">{</span>
+				<span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">bond_dev</span><span class="p">;</span>
+				<span class="n">skb_queue_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bond_dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">service_arp_queue</span><span class="p">(</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">);</span>
+
+	<span class="n">zap_completion_queue</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">refill_skbs</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb_pool</span><span class="p">.</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">skb_pool</span><span class="p">.</span><span class="n">qlen</span> <span class="o">&lt;</span> <span class="n">MAX_SKBS</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">skb</span> <span class="o">=</span> <span class="n">alloc_skb</span><span class="p">(</span><span class="n">MAX_SKB_SIZE</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">__skb_queue_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb_pool</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb_pool</span><span class="p">.</span><span class="n">lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">zap_completion_queue</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">softnet_data</span> <span class="o">*</span><span class="n">sd</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">get_cpu_var</span><span class="p">(</span><span class="n">softnet_data</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sd</span><span class="o">-&gt;</span><span class="n">completion_queue</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">clist</span><span class="p">;</span>
+
+		<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+		<span class="n">clist</span> <span class="o">=</span> <span class="n">sd</span><span class="o">-&gt;</span><span class="n">completion_queue</span><span class="p">;</span>
+		<span class="n">sd</span><span class="o">-&gt;</span><span class="n">completion_queue</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+		<span class="k">while</span> <span class="p">(</span><span class="n">clist</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">clist</span><span class="p">;</span>
+			<span class="n">clist</span> <span class="o">=</span> <span class="n">clist</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">destructor</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">users</span><span class="p">);</span>
+				<span class="n">dev_kfree_skb_any</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span> <span class="cm">/* put this one back */</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">__kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">put_cpu_var</span><span class="p">(</span><span class="n">softnet_data</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">find_skb</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="kt">int</span> <span class="n">reserve</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+	<span class="n">zap_completion_queue</span><span class="p">();</span>
+	<span class="n">refill_skbs</span><span class="p">();</span>
+<span class="nl">repeat:</span>
+
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">alloc_skb</span><span class="p">(</span><span class="n">len</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span>
+		<span class="n">skb</span> <span class="o">=</span> <span class="n">skb_dequeue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb_pool</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">count</span> <span class="o">&lt;</span> <span class="mi">10</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">netpoll_poll_dev</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">repeat</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">users</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">skb_reserve</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">reserve</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">netpoll_owner_active</span><span class="p">(</span><span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">napi_struct</span> <span class="o">*</span><span class="n">napi</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">napi</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">napi_list</span><span class="p">,</span> <span class="n">dev_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">napi</span><span class="o">-&gt;</span><span class="n">poll_owner</span> <span class="o">==</span> <span class="n">smp_processor_id</span><span class="p">())</span>
+			<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">netpoll_send_skb_on_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">dev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">status</span> <span class="o">=</span> <span class="n">NETDEV_TX_BUSY</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tries</span><span class="p">;</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="o">*</span><span class="n">ops</span> <span class="o">=</span> <span class="n">dev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="p">;</span>
+	<span class="cm">/* It is up to the caller to keep npinfo alive. */</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">npinfo</span> <span class="o">||</span> <span class="o">!</span><span class="n">netif_running</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">netif_device_present</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">__kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* don&#39;t get messages out of order, and no recursion */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb_queue_len</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">netpoll_owner_active</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">netdev_queue</span> <span class="o">*</span><span class="n">txq</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+		<span class="n">txq</span> <span class="o">=</span> <span class="n">netdev_get_tx_queue</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">skb_get_queue_mapping</span><span class="p">(</span><span class="n">skb</span><span class="p">));</span>
+
+		<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+		<span class="cm">/* try until next clock tick */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">tries</span> <span class="o">=</span> <span class="n">jiffies_to_usecs</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="o">/</span><span class="n">USEC_PER_POLL</span><span class="p">;</span>
+		     <span class="n">tries</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">;</span> <span class="o">--</span><span class="n">tries</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">__netif_tx_trylock</span><span class="p">(</span><span class="n">txq</span><span class="p">))</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">netif_xmit_stopped</span><span class="p">(</span><span class="n">txq</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">status</span> <span class="o">=</span> <span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_start_xmit</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">dev</span><span class="p">);</span>
+					<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">==</span> <span class="n">NETDEV_TX_OK</span><span class="p">)</span>
+						<span class="n">txq_trans_update</span><span class="p">(</span><span class="n">txq</span><span class="p">);</span>
+				<span class="p">}</span>
+				<span class="n">__netif_tx_unlock</span><span class="p">(</span><span class="n">txq</span><span class="p">);</span>
+
+				<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">==</span> <span class="n">NETDEV_TX_OK</span><span class="p">)</span>
+					<span class="k">break</span><span class="p">;</span>
+
+			<span class="p">}</span>
+
+			<span class="cm">/* tickle device maybe there is some cleanup */</span>
+			<span class="n">netpoll_poll_dev</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+			<span class="n">udelay</span><span class="p">(</span><span class="n">USEC_PER_POLL</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">WARN_ONCE</span><span class="p">(</span><span class="o">!</span><span class="n">irqs_disabled</span><span class="p">(),</span>
+			<span class="s">&quot;netpoll_send_skb(): %s enabled interrupts in poll (%pF)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">dev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_start_xmit</span><span class="p">);</span>
+
+		<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">!=</span> <span class="n">NETDEV_TX_OK</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">skb_queue_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="n">schedule_delayed_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">tx_work</span><span class="p">,</span><span class="mi">0</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_send_skb_on_dev</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">netpoll_send_udp</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">msg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">len</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">total_len</span><span class="p">,</span> <span class="n">ip_len</span><span class="p">,</span> <span class="n">udp_len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">udphdr</span> <span class="o">*</span><span class="n">udph</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">iphdr</span> <span class="o">*</span><span class="n">iph</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ethhdr</span> <span class="o">*</span><span class="n">eth</span><span class="p">;</span>
+
+	<span class="n">udp_len</span> <span class="o">=</span> <span class="n">len</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">udph</span><span class="p">);</span>
+	<span class="n">ip_len</span> <span class="o">=</span> <span class="n">udp_len</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">iph</span><span class="p">);</span>
+	<span class="n">total_len</span> <span class="o">=</span> <span class="n">ip_len</span> <span class="o">+</span> <span class="n">LL_RESERVED_SPACE</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">find_skb</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">total_len</span> <span class="o">+</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">needed_tailroom</span><span class="p">,</span>
+		       <span class="n">total_len</span> <span class="o">-</span> <span class="n">len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">skb_copy_to_linear_data</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+	<span class="n">skb_put</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+
+	<span class="n">skb_push</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">udph</span><span class="p">));</span>
+	<span class="n">skb_reset_transport_header</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">udph</span> <span class="o">=</span> <span class="n">udp_hdr</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">udph</span><span class="o">-&gt;</span><span class="n">source</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_port</span><span class="p">);</span>
+	<span class="n">udph</span><span class="o">-&gt;</span><span class="n">dest</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_port</span><span class="p">);</span>
+	<span class="n">udph</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">udp_len</span><span class="p">);</span>
+	<span class="n">udph</span><span class="o">-&gt;</span><span class="n">check</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">udph</span><span class="o">-&gt;</span><span class="n">check</span> <span class="o">=</span> <span class="n">csum_tcpudp_magic</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">,</span>
+					<span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span><span class="p">,</span>
+					<span class="n">udp_len</span><span class="p">,</span> <span class="n">IPPROTO_UDP</span><span class="p">,</span>
+					<span class="n">csum_partial</span><span class="p">(</span><span class="n">udph</span><span class="p">,</span> <span class="n">udp_len</span><span class="p">,</span> <span class="mi">0</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">udph</span><span class="o">-&gt;</span><span class="n">check</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">udph</span><span class="o">-&gt;</span><span class="n">check</span> <span class="o">=</span> <span class="n">CSUM_MANGLED_0</span><span class="p">;</span>
+
+	<span class="n">skb_push</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">iph</span><span class="p">));</span>
+	<span class="n">skb_reset_network_header</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">iph</span> <span class="o">=</span> <span class="n">ip_hdr</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+
+	<span class="cm">/* iph-&gt;version = 4; iph-&gt;ihl = 5; */</span>
+	<span class="n">put_unaligned</span><span class="p">(</span><span class="mh">0x45</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">iph</span><span class="p">);</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">tos</span>      <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">put_unaligned</span><span class="p">(</span><span class="n">htons</span><span class="p">(</span><span class="n">ip_len</span><span class="p">),</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">tot_len</span><span class="p">));</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">id</span>       <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">frag_off</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">ttl</span>      <span class="o">=</span> <span class="mi">64</span><span class="p">;</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">IPPROTO_UDP</span><span class="p">;</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">check</span>    <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">put_unaligned</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">,</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">saddr</span><span class="p">));</span>
+	<span class="n">put_unaligned</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span><span class="p">,</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">));</span>
+	<span class="n">iph</span><span class="o">-&gt;</span><span class="n">check</span>    <span class="o">=</span> <span class="n">ip_fast_csum</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">iph</span><span class="p">,</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="p">);</span>
+
+	<span class="n">eth</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">ethhdr</span> <span class="o">*</span><span class="p">)</span> <span class="n">skb_push</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">ETH_HLEN</span><span class="p">);</span>
+	<span class="n">skb_reset_mac_header</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">eth</span><span class="o">-&gt;</span><span class="n">h_proto</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ETH_P_IP</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">eth</span><span class="o">-&gt;</span><span class="n">h_source</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">,</span> <span class="n">ETH_ALEN</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">eth</span><span class="o">-&gt;</span><span class="n">h_dest</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_mac</span><span class="p">,</span> <span class="n">ETH_ALEN</span><span class="p">);</span>
+
+	<span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+
+	<span class="n">netpoll_send_skb</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_send_udp</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">arp_reply</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">arphdr</span> <span class="o">*</span><span class="n">arp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">arp_ptr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">size</span><span class="p">,</span> <span class="n">type</span> <span class="o">=</span> <span class="n">ARPOP_REPLY</span><span class="p">,</span> <span class="n">ptype</span> <span class="o">=</span> <span class="n">ETH_P_ARP</span><span class="p">;</span>
+	<span class="n">__be32</span> <span class="n">sip</span><span class="p">,</span> <span class="n">tip</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="n">sha</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">send_skb</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">hlen</span><span class="p">,</span> <span class="n">tlen</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">hits</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* Before checking the packet, we do some early</span>
+<span class="cm">	   inspection whether this is interesting at all */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">,</span> <span class="n">rx</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">==</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+			<span class="n">hits</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/* No netpoll struct is using this dev */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hits</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* No arp on this interface */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">IFF_NOARP</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pskb_may_pull</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">arp_hdr_len</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">skb_reset_network_header</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">skb_reset_transport_header</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">arp</span> <span class="o">=</span> <span class="n">arp_hdr</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_hrd</span> <span class="o">!=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ARPHRD_ETHER</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	     <span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_hrd</span> <span class="o">!=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ARPHRD_IEEE802</span><span class="p">))</span> <span class="o">||</span>
+	    <span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_pro</span> <span class="o">!=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ETH_P_IP</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_op</span> <span class="o">!=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ARPOP_REQUEST</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">arp_ptr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)(</span><span class="n">arp</span><span class="o">+</span><span class="mi">1</span><span class="p">);</span>
+	<span class="cm">/* save the location of the src hw addr */</span>
+	<span class="n">sha</span> <span class="o">=</span> <span class="n">arp_ptr</span><span class="p">;</span>
+	<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sip</span><span class="p">,</span> <span class="n">arp_ptr</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+	<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="mi">4</span><span class="p">;</span>
+	<span class="cm">/* If we actually cared about dst hw addr,</span>
+<span class="cm">	   it would get copied here */</span>
+	<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">;</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tip</span><span class="p">,</span> <span class="n">arp_ptr</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+
+	<span class="cm">/* Should we ignore arp? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ipv4_is_loopback</span><span class="p">(</span><span class="n">tip</span><span class="p">)</span> <span class="o">||</span> <span class="n">ipv4_is_multicast</span><span class="p">(</span><span class="n">tip</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="n">arp_hdr_len</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">,</span> <span class="n">rx</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">tip</span> <span class="o">!=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">hlen</span> <span class="o">=</span> <span class="n">LL_RESERVED_SPACE</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+		<span class="n">tlen</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">needed_tailroom</span><span class="p">;</span>
+		<span class="n">send_skb</span> <span class="o">=</span> <span class="n">find_skb</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">size</span> <span class="o">+</span> <span class="n">hlen</span> <span class="o">+</span> <span class="n">tlen</span><span class="p">,</span> <span class="n">hlen</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">send_skb</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">skb_reset_network_header</span><span class="p">(</span><span class="n">send_skb</span><span class="p">);</span>
+		<span class="n">arp</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">arphdr</span> <span class="o">*</span><span class="p">)</span> <span class="n">skb_put</span><span class="p">(</span><span class="n">send_skb</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+		<span class="n">send_skb</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+		<span class="n">send_skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ETH_P_ARP</span><span class="p">);</span>
+
+		<span class="cm">/* Fill the device header for the ARP frame */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dev_hard_header</span><span class="p">(</span><span class="n">send_skb</span><span class="p">,</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span> <span class="n">ptype</span><span class="p">,</span>
+				    <span class="n">sha</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">,</span>
+				    <span class="n">send_skb</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kfree_skb</span><span class="p">(</span><span class="n">send_skb</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Fill out the arp protocol part.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * we only support ethernet device type,</span>
+<span class="cm">		 * which (according to RFC 1390) should</span>
+<span class="cm">		 * always equal 1 (Ethernet).</span>
+<span class="cm">		 */</span>
+
+		<span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_hrd</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">type</span><span class="p">);</span>
+		<span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_pro</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">ETH_P_IP</span><span class="p">);</span>
+		<span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_hln</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">;</span>
+		<span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_pln</span> <span class="o">=</span> <span class="mi">4</span><span class="p">;</span>
+		<span class="n">arp</span><span class="o">-&gt;</span><span class="n">ar_op</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">type</span><span class="p">);</span>
+
+		<span class="n">arp_ptr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)(</span><span class="n">arp</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">arp_ptr</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">dev_addr</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">);</span>
+		<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">arp_ptr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tip</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+		<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="mi">4</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">arp_ptr</span><span class="p">,</span> <span class="n">sha</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">);</span>
+		<span class="n">arp_ptr</span> <span class="o">+=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">addr_len</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">arp_ptr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sip</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+
+		<span class="n">netpoll_send_skb</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">send_skb</span><span class="p">);</span>
+
+		<span class="cm">/* If there are several rx_hooks for the same address,</span>
+<span class="cm">		   we&#39;re fine by sending a single reply */</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">__netpoll_rx</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">proto</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">ulen</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">hits</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">iphdr</span> <span class="o">*</span><span class="n">iph</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">udphdr</span> <span class="o">*</span><span class="n">uh</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span> <span class="o">=</span> <span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">type</span> <span class="o">!=</span> <span class="n">ARPHRD_ETHER</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* check if netpoll clients need ARP */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">htons</span><span class="p">(</span><span class="n">ETH_P_ARP</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">skb_queue_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">proto</span> <span class="o">=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">eth_hdr</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">h_proto</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">proto</span> <span class="o">!=</span> <span class="n">ETH_P_IP</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">pkt_type</span> <span class="o">==</span> <span class="n">PACKET_OTHERHOST</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb_shared</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pskb_may_pull</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">iphdr</span><span class="p">)))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">iph</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">iphdr</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span> <span class="o">&lt;</span> <span class="mi">5</span> <span class="o">||</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">version</span> <span class="o">!=</span> <span class="mi">4</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pskb_may_pull</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="o">*</span><span class="mi">4</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">iph</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">iphdr</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ip_fast_csum</span><span class="p">((</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">iph</span><span class="p">,</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">tot_len</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">&lt;</span> <span class="n">len</span> <span class="o">||</span> <span class="n">len</span> <span class="o">&lt;</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="o">*</span><span class="mi">4</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Our transport medium may have padded the buffer out.</span>
+<span class="cm">	 * Now We trim to the true length of the frame.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pskb_trim_rcsum</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">len</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">iph</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">iphdr</span> <span class="o">*</span><span class="p">)</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">iph</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">!=</span> <span class="n">IPPROTO_UDP</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">-=</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="o">*</span><span class="mi">4</span><span class="p">;</span>
+	<span class="n">uh</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">udphdr</span> <span class="o">*</span><span class="p">)(((</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">iph</span><span class="p">)</span> <span class="o">+</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">ihl</span><span class="o">*</span><span class="mi">4</span><span class="p">);</span>
+	<span class="n">ulen</span> <span class="o">=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">uh</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ulen</span> <span class="o">!=</span> <span class="n">len</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">checksum_udp</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">uh</span><span class="p">,</span> <span class="n">ulen</span><span class="p">,</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">saddr</span><span class="p">,</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">,</span> <span class="n">rx</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span> <span class="o">&amp;&amp;</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span> <span class="o">!=</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span> <span class="o">&amp;&amp;</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span> <span class="o">!=</span> <span class="n">iph</span><span class="o">-&gt;</span><span class="n">saddr</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_port</span> <span class="o">&amp;&amp;</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">local_port</span> <span class="o">!=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">uh</span><span class="o">-&gt;</span><span class="n">dest</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">np</span><span class="o">-&gt;</span><span class="n">rx_hook</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">uh</span><span class="o">-&gt;</span><span class="n">source</span><span class="p">),</span>
+			       <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)(</span><span class="n">uh</span><span class="o">+</span><span class="mi">1</span><span class="p">),</span>
+			       <span class="n">ulen</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">udphdr</span><span class="p">));</span>
+		<span class="n">hits</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hits</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">netpoll_print_options</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;local port %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">local_port</span><span class="p">);</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;local IP %pI4</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">);</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;interface &#39;%s&#39;</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;remote port %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_port</span><span class="p">);</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;remote IP %pI4</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span><span class="p">);</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;remote ethernet address %pM</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_mac</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_print_options</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">netpoll_parse_options</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">cur</span><span class="o">=</span><span class="n">opt</span><span class="p">,</span> <span class="o">*</span><span class="n">delim</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">!=</span> <span class="sc">&#39;@&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">delim</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="sc">&#39;@&#39;</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">delim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">np</span><span class="o">-&gt;</span><span class="n">local_port</span> <span class="o">=</span> <span class="n">simple_strtol</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">10</span><span class="p">);</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">delim</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cur</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">!=</span> <span class="sc">&#39;/&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">delim</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="sc">&#39;/&#39;</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">delim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span> <span class="o">=</span> <span class="n">in_aton</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">delim</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cur</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">!=</span> <span class="sc">&#39;,&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* parse out dev name */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">delim</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="sc">&#39;,&#39;</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">delim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">strlcpy</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">,</span> <span class="n">cur</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">));</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">delim</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cur</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">!=</span> <span class="sc">&#39;@&#39;</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* dst port */</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">delim</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="sc">&#39;@&#39;</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">delim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">==</span> <span class="sc">&#39; &#39;</span> <span class="o">||</span> <span class="o">*</span><span class="n">cur</span> <span class="o">==</span> <span class="sc">&#39;\t&#39;</span><span class="p">)</span>
+			<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;warning: whitespace is not allowed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_port</span> <span class="o">=</span> <span class="n">simple_strtol</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">10</span><span class="p">);</span>
+		<span class="n">cur</span> <span class="o">=</span> <span class="n">delim</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">cur</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="cm">/* dst ip */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">delim</span> <span class="o">=</span> <span class="n">strchr</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="sc">&#39;/&#39;</span><span class="p">))</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">delim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_ip</span> <span class="o">=</span> <span class="n">in_aton</span><span class="p">(</span><span class="n">cur</span><span class="p">);</span>
+	<span class="n">cur</span> <span class="o">=</span> <span class="n">delim</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">cur</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* MAC address */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mac_pton</span><span class="p">(</span><span class="n">cur</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">remote_mac</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">parse_failed</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">netpoll_print_options</span><span class="p">(</span><span class="n">np</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">parse_failed:</span>
+	<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;couldn&#39;t parse config at &#39;%s&#39;!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cur</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_parse_options</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">__netpoll_setup</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">ndev</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span><span class="p">;</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="o">*</span><span class="n">ops</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">ndev</span><span class="o">-&gt;</span><span class="n">priv_flags</span> <span class="o">&amp;</span> <span class="n">IFF_DISABLE_NETPOLL</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="o">!</span><span class="n">ndev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="o">-&gt;</span><span class="n">ndo_poll_controller</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">np_err</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;%s doesn&#39;t support polling, aborting</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOTSUPP</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ndev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">npinfo</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">npinfo</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">npinfo</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">);</span>
+
+		<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">);</span>
+		<span class="n">skb_queue_head_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">);</span>
+		<span class="n">skb_queue_head_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">);</span>
+		<span class="n">INIT_DELAYED_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">tx_work</span><span class="p">,</span> <span class="n">queue_process</span><span class="p">);</span>
+
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+		<span class="n">ops</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_netpoll_setup</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">err</span> <span class="o">=</span> <span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_netpoll_setup</span><span class="p">(</span><span class="n">ndev</span><span class="p">,</span> <span class="n">npinfo</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+				<span class="k">goto</span> <span class="n">free_npinfo</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">npinfo</span> <span class="o">=</span> <span class="n">ndev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">;</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">netpoll</span> <span class="o">=</span> <span class="n">np</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">rx_hook</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_flags</span> <span class="o">|=</span> <span class="n">NETPOLL_RX_ENABLED</span><span class="p">;</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">rx</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* last thing to do is link it to the net device structure */</span>
+	<span class="n">rcu_assign_pointer</span><span class="p">(</span><span class="n">ndev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">,</span> <span class="n">npinfo</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">free_npinfo:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">npinfo</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">__netpoll_setup</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">netpoll_setup</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">ndev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">in_device</span> <span class="o">*</span><span class="n">in_dev</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">)</span>
+		<span class="n">ndev</span> <span class="o">=</span> <span class="n">dev_get_by_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_net</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ndev</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">np_err</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;%s doesn&#39;t exist, aborting</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ndev</span><span class="o">-&gt;</span><span class="n">master</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">np_err</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;%s is a slave device, aborting</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">put</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">netif_running</span><span class="p">(</span><span class="n">ndev</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">atmost</span><span class="p">,</span> <span class="n">atleast</span><span class="p">;</span>
+
+		<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;device %s not up yet, forcing it</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+
+		<span class="n">rtnl_lock</span><span class="p">();</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">dev_open</span><span class="p">(</span><span class="n">ndev</span><span class="p">);</span>
+		<span class="n">rtnl_unlock</span><span class="p">();</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">np_err</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;failed to open %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ndev</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">put</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">atleast</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">HZ</span><span class="o">/</span><span class="mi">10</span><span class="p">;</span>
+		<span class="n">atmost</span> <span class="o">=</span> <span class="n">jiffies</span> <span class="o">+</span> <span class="n">carrier_timeout</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+		<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">netif_carrier_ok</span><span class="p">(</span><span class="n">ndev</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">atmost</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">np_notice</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;timeout waiting for carrier</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">msleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* If carrier appears to come up instantly, we don&#39;t</span>
+<span class="cm">		 * trust it and pause so that we don&#39;t pump all our</span>
+<span class="cm">		 * queued console messages into the bitbucket.</span>
+<span class="cm">		 */</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_before</span><span class="p">(</span><span class="n">jiffies</span><span class="p">,</span> <span class="n">atleast</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">np_notice</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;carrier detect appears untrustworthy, waiting 4 seconds</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">msleep</span><span class="p">(</span><span class="mi">4000</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rcu_read_lock</span><span class="p">();</span>
+		<span class="n">in_dev</span> <span class="o">=</span> <span class="n">__in_dev_get_rcu</span><span class="p">(</span><span class="n">ndev</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">in_dev</span> <span class="o">||</span> <span class="o">!</span><span class="n">in_dev</span><span class="o">-&gt;</span><span class="n">ifa_list</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">rcu_read_unlock</span><span class="p">();</span>
+			<span class="n">np_err</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;no IP address for %s, aborting</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev_name</span><span class="p">);</span>
+			<span class="n">err</span> <span class="o">=</span> <span class="o">-</span><span class="n">EDESTADDRREQ</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">put</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span> <span class="o">=</span> <span class="n">in_dev</span><span class="o">-&gt;</span><span class="n">ifa_list</span><span class="o">-&gt;</span><span class="n">ifa_local</span><span class="p">;</span>
+		<span class="n">rcu_read_unlock</span><span class="p">();</span>
+		<span class="n">np_info</span><span class="p">(</span><span class="n">np</span><span class="p">,</span> <span class="s">&quot;local IP %pI4</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">local_ip</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="n">ndev</span><span class="p">;</span>
+
+	<span class="cm">/* fill up the skb queue */</span>
+	<span class="n">refill_skbs</span><span class="p">();</span>
+
+	<span class="n">rtnl_lock</span><span class="p">();</span>
+	<span class="n">err</span> <span class="o">=</span> <span class="n">__netpoll_setup</span><span class="p">(</span><span class="n">np</span><span class="p">);</span>
+	<span class="n">rtnl_unlock</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">put</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">put:</span>
+	<span class="n">dev_put</span><span class="p">(</span><span class="n">ndev</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_setup</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">netpoll_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">skb_queue_head_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">skb_pool</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">core_initcall</span><span class="p">(</span><span class="n">netpoll_init</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">__netpoll_cleanup</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">netpoll_info</span> <span class="o">*</span><span class="n">npinfo</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">npinfo</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">npinfo</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">rx</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_np</span><span class="p">))</span>
+			<span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">NETPOLL_RX_ENABLED</span><span class="p">;</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">rx_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">atomic_dec_and_test</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">const</span> <span class="k">struct</span> <span class="n">net_device_ops</span> <span class="o">*</span><span class="n">ops</span><span class="p">;</span>
+
+		<span class="n">ops</span> <span class="o">=</span> <span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">netdev_ops</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_netpoll_cleanup</span><span class="p">)</span>
+			<span class="n">ops</span><span class="o">-&gt;</span><span class="n">ndo_netpoll_cleanup</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+
+		<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="o">-&gt;</span><span class="n">npinfo</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+		<span class="cm">/* avoid racing with NAPI reading npinfo */</span>
+		<span class="n">synchronize_rcu_bh</span><span class="p">();</span>
+
+		<span class="n">skb_queue_purge</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">arp_tx</span><span class="p">);</span>
+		<span class="n">skb_queue_purge</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">);</span>
+		<span class="n">cancel_delayed_work_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">tx_work</span><span class="p">);</span>
+
+		<span class="cm">/* clean after last, unfinished work */</span>
+		<span class="n">__skb_queue_purge</span><span class="p">(</span><span class="o">&amp;</span><span class="n">npinfo</span><span class="o">-&gt;</span><span class="n">txq</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">npinfo</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">__netpoll_cleanup</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">netpoll_cleanup</span><span class="p">(</span><span class="k">struct</span> <span class="n">netpoll</span> <span class="o">*</span><span class="n">np</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">rtnl_lock</span><span class="p">();</span>
+	<span class="n">__netpoll_cleanup</span><span class="p">(</span><span class="n">np</span><span class="p">);</span>
+	<span class="n">rtnl_unlock</span><span class="p">();</span>
+
+	<span class="n">dev_put</span><span class="p">(</span><span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">);</span>
+	<span class="n">np</span><span class="o">-&gt;</span><span class="n">dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_cleanup</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">netpoll_trap</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_trap</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">netpoll_set_trap</span><span class="p">(</span><span class="kt">int</span> <span class="n">trap</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">trap</span><span class="p">)</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">trapped</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">netpoll_set_trap</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

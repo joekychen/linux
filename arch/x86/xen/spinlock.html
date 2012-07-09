@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » arch › x86 › xen › spinlock.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>spinlock.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Split spinlock implementation out into its own file, so it can be</span>
+<span class="cm"> * compiled in a FTRACE-compatible way.</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/kernel_stat.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/debugfs.h&gt;</span>
+<span class="cp">#include &lt;linux/log2.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+
+<span class="cp">#include &lt;asm/paravirt.h&gt;</span>
+
+<span class="cp">#include &lt;xen/interface/xen.h&gt;</span>
+<span class="cp">#include &lt;xen/events.h&gt;</span>
+
+<span class="cp">#include &quot;xen-ops.h&quot;</span>
+<span class="cp">#include &quot;debugfs.h&quot;</span>
+
+<span class="cp">#ifdef CONFIG_XEN_DEBUG_FS</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">xen_spinlock_stats</span>
+<span class="p">{</span>
+	<span class="n">u64</span> <span class="n">taken</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">taken_slow</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">taken_slow_nested</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">taken_slow_pickup</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">taken_slow_spurious</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">taken_slow_irqenable</span><span class="p">;</span>
+
+	<span class="n">u64</span> <span class="n">released</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">released_slow</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">released_slow_kicked</span><span class="p">;</span>
+
+<span class="cp">#define HISTO_BUCKETS	30</span>
+	<span class="n">u32</span> <span class="n">histo_spin_total</span><span class="p">[</span><span class="n">HISTO_BUCKETS</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span>
+	<span class="n">u32</span> <span class="n">histo_spin_spinning</span><span class="p">[</span><span class="n">HISTO_BUCKETS</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span>
+	<span class="n">u32</span> <span class="n">histo_spin_blocked</span><span class="p">[</span><span class="n">HISTO_BUCKETS</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span>
+
+	<span class="n">u64</span> <span class="n">time_total</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">time_spinning</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">time_blocked</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">spinlock_stats</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">u8</span> <span class="n">zero_stats</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="n">lock_timeout</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">10</span><span class="p">;</span>
+<span class="cp">#define TIMEOUT lock_timeout</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">check_zero</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">zero_stats</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">spinlock_stats</span><span class="p">));</span>
+		<span class="n">zero_stats</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cp">#define ADD_STATS(elem, val)			\</span>
+<span class="cp">	do { check_zero(); spinlock_stats.elem += (val); } while(0)</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u64</span> <span class="nf">spin_time_start</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">xen_clocksource_read</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__spin_time_accum</span><span class="p">(</span><span class="n">u64</span> <span class="n">delta</span><span class="p">,</span> <span class="n">u32</span> <span class="o">*</span><span class="n">array</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">index</span> <span class="o">=</span> <span class="n">ilog2</span><span class="p">(</span><span class="n">delta</span><span class="p">);</span>
+
+	<span class="n">check_zero</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&lt;</span> <span class="n">HISTO_BUCKETS</span><span class="p">)</span>
+		<span class="n">array</span><span class="p">[</span><span class="n">index</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">array</span><span class="p">[</span><span class="n">HISTO_BUCKETS</span><span class="p">]</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_spinning</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">delta</span> <span class="o">=</span> <span class="n">xen_clocksource_read</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">;</span>
+
+	<span class="n">__spin_time_accum</span><span class="p">(</span><span class="n">delta</span><span class="p">,</span> <span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_spinning</span><span class="p">);</span>
+	<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_spinning</span> <span class="o">+=</span> <span class="n">delta</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_total</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">delta</span> <span class="o">=</span> <span class="n">xen_clocksource_read</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">;</span>
+
+	<span class="n">__spin_time_accum</span><span class="p">(</span><span class="n">delta</span><span class="p">,</span> <span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_total</span><span class="p">);</span>
+	<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_total</span> <span class="o">+=</span> <span class="n">delta</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_blocked</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">u32</span> <span class="n">delta</span> <span class="o">=</span> <span class="n">xen_clocksource_read</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">;</span>
+
+	<span class="n">__spin_time_accum</span><span class="p">(</span><span class="n">delta</span><span class="p">,</span> <span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_blocked</span><span class="p">);</span>
+	<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_blocked</span> <span class="o">+=</span> <span class="n">delta</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#else  </span><span class="cm">/* !CONFIG_XEN_DEBUG_FS */</span><span class="cp"></span>
+<span class="cp">#define TIMEOUT			(1 &lt;&lt; 10)</span>
+<span class="cp">#define ADD_STATS(elem, val)	do { (void)(val); } while(0)</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u64</span> <span class="nf">spin_time_start</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_total</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_spinning</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">spin_time_accum_blocked</span><span class="p">(</span><span class="n">u64</span> <span class="n">start</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+<span class="cp">#endif  </span><span class="cm">/* CONFIG_XEN_DEBUG_FS */</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Size struct xen_spinlock so it&#39;s the same as arch_spinlock_t.</span>
+<span class="cm"> */</span>
+<span class="cp">#if NR_CPUS &lt; 256</span>
+<span class="k">typedef</span> <span class="n">u8</span> <span class="n">xen_spinners_t</span><span class="p">;</span>
+<span class="cp"># define inc_spinners(xl) \</span>
+<span class="cp">	asm(LOCK_PREFIX &quot; incb %0&quot; : &quot;+m&quot; ((xl)-&gt;spinners) : : &quot;memory&quot;);</span>
+<span class="cp"># define dec_spinners(xl) \</span>
+<span class="cp">	asm(LOCK_PREFIX &quot; decb %0&quot; : &quot;+m&quot; ((xl)-&gt;spinners) : : &quot;memory&quot;);</span>
+<span class="cp">#else</span>
+<span class="k">typedef</span> <span class="n">u16</span> <span class="n">xen_spinners_t</span><span class="p">;</span>
+<span class="cp"># define inc_spinners(xl) \</span>
+<span class="cp">	asm(LOCK_PREFIX &quot; incw %0&quot; : &quot;+m&quot; ((xl)-&gt;spinners) : : &quot;memory&quot;);</span>
+<span class="cp"># define dec_spinners(xl) \</span>
+<span class="cp">	asm(LOCK_PREFIX &quot; decw %0&quot; : &quot;+m&quot; ((xl)-&gt;spinners) : : &quot;memory&quot;);</span>
+<span class="cp">#endif</span>
+
+<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span> <span class="n">lock</span><span class="p">;</span>		<span class="cm">/* 0 -&gt; free; 1 -&gt; locked */</span>
+	<span class="n">xen_spinners_t</span> <span class="n">spinners</span><span class="p">;</span>	<span class="cm">/* count of waiting cpus */</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_spin_is_locked</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">xl</span><span class="o">-&gt;</span><span class="n">lock</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_spin_is_contended</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+
+	<span class="cm">/* Not strictly true; this is only the count of contended</span>
+<span class="cm">	   lock-takers entering the slow path. */</span>
+	<span class="k">return</span> <span class="n">xl</span><span class="o">-&gt;</span><span class="n">spinners</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">xen_spin_trylock</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">old</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">asm</span><span class="p">(</span><span class="s">&quot;xchgb %b0,%1&quot;</span>
+	    <span class="o">:</span> <span class="s">&quot;+q&quot;</span> <span class="p">(</span><span class="n">old</span><span class="p">),</span> <span class="s">&quot;+m&quot;</span> <span class="p">(</span><span class="n">xl</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">)</span> <span class="o">:</span> <span class="o">:</span> <span class="s">&quot;memory&quot;</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">old</span> <span class="o">==</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span> <span class="n">lock_kicker_irq</span><span class="p">)</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">,</span> <span class="n">lock_spinners</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Mark a cpu as interested in a lock.  Returns the CPU&#39;s previous</span>
+<span class="cm"> * lock of interest, in case we got preempted by an interrupt.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="nf">spinning_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">prev</span><span class="p">;</span>
+
+	<span class="n">prev</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">lock_spinners</span><span class="p">);</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">lock_spinners</span><span class="p">,</span> <span class="n">xl</span><span class="p">);</span>
+
+	<span class="n">wmb</span><span class="p">();</span>			<span class="cm">/* set lock of interest before count */</span>
+
+	<span class="n">inc_spinners</span><span class="p">(</span><span class="n">xl</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">prev</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Mark a cpu as no longer interested in a lock.  Restores previous</span>
+<span class="cm"> * lock of interest (NULL for none).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">unspinning_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span><span class="p">,</span> <span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">prev</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dec_spinners</span><span class="p">(</span><span class="n">xl</span><span class="p">);</span>
+	<span class="n">wmb</span><span class="p">();</span>			<span class="cm">/* decrement count before restoring lock */</span>
+	<span class="n">__this_cpu_write</span><span class="p">(</span><span class="n">lock_spinners</span><span class="p">,</span> <span class="n">prev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">noinline</span> <span class="kt">int</span> <span class="nf">xen_spin_lock_slow</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="n">bool</span> <span class="n">irq_enable</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">prev</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">irq</span> <span class="o">=</span> <span class="n">__this_cpu_read</span><span class="p">(</span><span class="n">lock_kicker_irq</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">start</span><span class="p">;</span>
+
+	<span class="cm">/* If kicker interrupts not initialized yet, just spin */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">irq</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">start</span> <span class="o">=</span> <span class="n">spin_time_start</span><span class="p">();</span>
+
+	<span class="cm">/* announce we&#39;re spinning */</span>
+	<span class="n">prev</span> <span class="o">=</span> <span class="n">spinning_lock</span><span class="p">(</span><span class="n">xl</span><span class="p">);</span>
+
+	<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken_slow</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken_slow_nested</span><span class="p">,</span> <span class="n">prev</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+		<span class="cm">/* clear pending */</span>
+		<span class="n">xen_clear_irq_pending</span><span class="p">(</span><span class="n">irq</span><span class="p">);</span>
+
+		<span class="cm">/* check again make sure it didn&#39;t become free while</span>
+<span class="cm">		   we weren&#39;t looking  */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">xen_spin_trylock</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken_slow_pickup</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * If we interrupted another spinlock while it</span>
+<span class="cm">			 * was blocking, make sure it doesn&#39;t block</span>
+<span class="cm">			 * without rechecking the lock.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">prev</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+				<span class="n">xen_set_irq_pending</span><span class="p">(</span><span class="n">irq</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">flags</span> <span class="o">=</span> <span class="n">arch_local_save_flags</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">irq_enable</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken_slow_irqenable</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="n">raw_local_irq_enable</span><span class="p">();</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Block until irq becomes pending.  If we&#39;re</span>
+<span class="cm">		 * interrupted at this point (after the trylock but</span>
+<span class="cm">		 * before entering the block), then the nested lock</span>
+<span class="cm">		 * handler guarantees that the irq will be left</span>
+<span class="cm">		 * pending if there&#39;s any chance the lock became free;</span>
+<span class="cm">		 * xen_poll_irq() returns immediately if the irq is</span>
+<span class="cm">		 * pending.</span>
+<span class="cm">		 */</span>
+		<span class="n">xen_poll_irq</span><span class="p">(</span><span class="n">irq</span><span class="p">);</span>
+
+		<span class="n">raw_local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+		<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken_slow_spurious</span><span class="p">,</span> <span class="o">!</span><span class="n">xen_test_irq_pending</span><span class="p">(</span><span class="n">irq</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_test_irq_pending</span><span class="p">(</span><span class="n">irq</span><span class="p">));</span> <span class="cm">/* check for spurious wakeups */</span>
+
+	<span class="n">kstat_incr_irqs_this_cpu</span><span class="p">(</span><span class="n">irq</span><span class="p">,</span> <span class="n">irq_to_desc</span><span class="p">(</span><span class="n">irq</span><span class="p">));</span>
+
+<span class="nl">out:</span>
+	<span class="n">unspinning_lock</span><span class="p">(</span><span class="n">xl</span><span class="p">,</span> <span class="n">prev</span><span class="p">);</span>
+	<span class="n">spin_time_accum_blocked</span><span class="p">(</span><span class="n">start</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">__xen_spin_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="n">bool</span> <span class="n">irq_enable</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">timeout</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="n">oldval</span><span class="p">;</span>
+	<span class="n">u64</span> <span class="n">start_spin</span><span class="p">;</span>
+
+	<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">taken</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="n">start_spin</span> <span class="o">=</span> <span class="n">spin_time_start</span><span class="p">();</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">u64</span> <span class="n">start_spin_fast</span> <span class="o">=</span> <span class="n">spin_time_start</span><span class="p">();</span>
+
+		<span class="n">timeout</span> <span class="o">=</span> <span class="n">TIMEOUT</span><span class="p">;</span>
+
+		<span class="n">asm</span><span class="p">(</span><span class="s">&quot;1: xchgb %1,%0</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   testb %1,%1</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   jz 3f</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;2: rep;nop</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   cmpb $0,%0</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   je 1b</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   dec %2</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;   jnz 2b</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="s">&quot;3:</span><span class="se">\n</span><span class="s">&quot;</span>
+		    <span class="o">:</span> <span class="s">&quot;+m&quot;</span> <span class="p">(</span><span class="n">xl</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">),</span> <span class="s">&quot;=q&quot;</span> <span class="p">(</span><span class="n">oldval</span><span class="p">),</span> <span class="s">&quot;+r&quot;</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+		    <span class="o">:</span> <span class="s">&quot;1&quot;</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+		    <span class="o">:</span> <span class="s">&quot;memory&quot;</span><span class="p">);</span>
+
+		<span class="n">spin_time_accum_spinning</span><span class="p">(</span><span class="n">start_spin_fast</span><span class="p">);</span>
+
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">oldval</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+			  <span class="p">(</span><span class="n">TIMEOUT</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0</span> <span class="o">||</span> <span class="o">!</span><span class="n">xen_spin_lock_slow</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">irq_enable</span><span class="p">))));</span>
+
+	<span class="n">spin_time_accum_total</span><span class="p">(</span><span class="n">start_spin</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_spin_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__xen_spin_lock</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_spin_lock_flags</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__xen_spin_lock</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="o">!</span><span class="n">raw_irqs_disabled_flags</span><span class="p">(</span><span class="n">flags</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">noinline</span> <span class="kt">void</span> <span class="nf">xen_spin_unlock_slow</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">released_slow</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="n">for_each_online_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* XXX should mix up next cpu selection */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">lock_spinners</span><span class="p">,</span> <span class="n">cpu</span><span class="p">)</span> <span class="o">==</span> <span class="n">xl</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">released_slow_kicked</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="n">xen_send_IPI_one</span><span class="p">(</span><span class="n">cpu</span><span class="p">,</span> <span class="n">XEN_SPIN_UNLOCK_VECTOR</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">xen_spin_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">arch_spinlock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="n">xl</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span> <span class="o">*</span><span class="p">)</span><span class="n">lock</span><span class="p">;</span>
+
+	<span class="n">ADD_STATS</span><span class="p">(</span><span class="n">released</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="n">smp_wmb</span><span class="p">();</span>		<span class="cm">/* make sure no writes get moved after unlock */</span>
+	<span class="n">xl</span><span class="o">-&gt;</span><span class="n">lock</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>		<span class="cm">/* release lock */</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Make sure unlock happens before checking for waiting</span>
+<span class="cm">	 * spinners.  We need a strong barrier to enforce the</span>
+<span class="cm">	 * write-read ordering to different memory locations, as the</span>
+<span class="cm">	 * CPU makes no implied guarantees about their ordering.</span>
+<span class="cm">	 */</span>
+	<span class="n">mb</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">xl</span><span class="o">-&gt;</span><span class="n">spinners</span><span class="p">))</span>
+		<span class="n">xen_spin_unlock_slow</span><span class="p">(</span><span class="n">xl</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">irqreturn_t</span> <span class="nf">dummy_handler</span><span class="p">(</span><span class="kt">int</span> <span class="n">irq</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">dev_id</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">IRQ_HANDLED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__cpuinit</span> <span class="nf">xen_init_lock_cpu</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">irq</span><span class="p">;</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">;</span>
+
+	<span class="n">name</span> <span class="o">=</span> <span class="n">kasprintf</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span> <span class="s">&quot;spinlock%d&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+	<span class="n">irq</span> <span class="o">=</span> <span class="n">bind_ipi_to_irqhandler</span><span class="p">(</span><span class="n">XEN_SPIN_UNLOCK_VECTOR</span><span class="p">,</span>
+				     <span class="n">cpu</span><span class="p">,</span>
+				     <span class="n">dummy_handler</span><span class="p">,</span>
+				     <span class="n">IRQF_DISABLED</span><span class="o">|</span><span class="n">IRQF_PERCPU</span><span class="o">|</span><span class="n">IRQF_NOBALANCING</span><span class="p">,</span>
+				     <span class="n">name</span><span class="p">,</span>
+				     <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">irq</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">disable_irq</span><span class="p">(</span><span class="n">irq</span><span class="p">);</span> <span class="cm">/* make sure it&#39;s never delivered */</span>
+		<span class="n">per_cpu</span><span class="p">(</span><span class="n">lock_kicker_irq</span><span class="p">,</span> <span class="n">cpu</span><span class="p">)</span> <span class="o">=</span> <span class="n">irq</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="s">&quot;cpu %d spinlock event irq %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">cpu</span><span class="p">,</span> <span class="n">irq</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">xen_uninit_lock_cpu</span><span class="p">(</span><span class="kt">int</span> <span class="n">cpu</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unbind_from_irqhandler</span><span class="p">(</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">lock_kicker_irq</span><span class="p">,</span> <span class="n">cpu</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">xen_init_spinlocks</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">xen_spinlock</span><span class="p">)</span> <span class="o">&gt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">arch_spinlock_t</span><span class="p">));</span>
+
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_is_locked</span> <span class="o">=</span> <span class="n">xen_spin_is_locked</span><span class="p">;</span>
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_is_contended</span> <span class="o">=</span> <span class="n">xen_spin_is_contended</span><span class="p">;</span>
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_lock</span> <span class="o">=</span> <span class="n">xen_spin_lock</span><span class="p">;</span>
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_lock_flags</span> <span class="o">=</span> <span class="n">xen_spin_lock_flags</span><span class="p">;</span>
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_trylock</span> <span class="o">=</span> <span class="n">xen_spin_trylock</span><span class="p">;</span>
+	<span class="n">pv_lock_ops</span><span class="p">.</span><span class="n">spin_unlock</span> <span class="o">=</span> <span class="n">xen_spin_unlock</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#ifdef CONFIG_XEN_DEBUG_FS</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">d_spin_debug</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">xen_spinlock_debugfs</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dentry</span> <span class="o">*</span><span class="n">d_xen</span> <span class="o">=</span> <span class="n">xen_init_debugfs</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">d_xen</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">d_spin_debug</span> <span class="o">=</span> <span class="n">debugfs_create_dir</span><span class="p">(</span><span class="s">&quot;spinlocks&quot;</span><span class="p">,</span> <span class="n">d_xen</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u8</span><span class="p">(</span><span class="s">&quot;zero_stats&quot;</span><span class="p">,</span> <span class="mo">0644</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">zero_stats</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;timeout&quot;</span><span class="p">,</span> <span class="mo">0644</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock_timeout</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u64</span><span class="p">(</span><span class="s">&quot;taken&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;taken_slow&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken_slow</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;taken_slow_nested&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken_slow_nested</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;taken_slow_pickup&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken_slow_pickup</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;taken_slow_spurious&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken_slow_spurious</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;taken_slow_irqenable&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">taken_slow_irqenable</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u64</span><span class="p">(</span><span class="s">&quot;released&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">released</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;released_slow&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">released_slow</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32</span><span class="p">(</span><span class="s">&quot;released_slow_kicked&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">released_slow_kicked</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u64</span><span class="p">(</span><span class="s">&quot;time_spinning&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_spinning</span><span class="p">);</span>
+	<span class="n">debugfs_create_u64</span><span class="p">(</span><span class="s">&quot;time_blocked&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_blocked</span><span class="p">);</span>
+	<span class="n">debugfs_create_u64</span><span class="p">(</span><span class="s">&quot;time_total&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+			   <span class="o">&amp;</span><span class="n">spinlock_stats</span><span class="p">.</span><span class="n">time_total</span><span class="p">);</span>
+
+	<span class="n">debugfs_create_u32_array</span><span class="p">(</span><span class="s">&quot;histo_total&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+				<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_total</span><span class="p">,</span> <span class="n">HISTO_BUCKETS</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32_array</span><span class="p">(</span><span class="s">&quot;histo_spinning&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+				<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_spinning</span><span class="p">,</span> <span class="n">HISTO_BUCKETS</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">debugfs_create_u32_array</span><span class="p">(</span><span class="s">&quot;histo_blocked&quot;</span><span class="p">,</span> <span class="mo">0444</span><span class="p">,</span> <span class="n">d_spin_debug</span><span class="p">,</span>
+				<span class="n">spinlock_stats</span><span class="p">.</span><span class="n">histo_spin_blocked</span><span class="p">,</span> <span class="n">HISTO_BUCKETS</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">fs_initcall</span><span class="p">(</span><span class="n">xen_spinlock_debugfs</span><span class="p">);</span>
+
+<span class="cp">#endif	</span><span class="cm">/* CONFIG_XEN_DEBUG_FS */</span><span class="cp"></span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

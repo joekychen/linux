@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › net › ethernet › sfc › rx.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../../index.html"></a><h1>rx.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/****************************************************************************</span>
+<span class="cm"> * Driver for Solarflare Solarstorm network controllers and boards</span>
+<span class="cm"> * Copyright 2005-2006 Fen Systems Ltd.</span>
+<span class="cm"> * Copyright 2005-2011 Solarflare Communications Inc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or modify it</span>
+<span class="cm"> * under the terms of the GNU General Public License version 2 as published</span>
+<span class="cm"> * by the Free Software Foundation, incorporated herein by reference.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/socket.h&gt;</span>
+<span class="cp">#include &lt;linux/in.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/ip.h&gt;</span>
+<span class="cp">#include &lt;linux/tcp.h&gt;</span>
+<span class="cp">#include &lt;linux/udp.h&gt;</span>
+<span class="cp">#include &lt;linux/prefetch.h&gt;</span>
+<span class="cp">#include &lt;linux/moduleparam.h&gt;</span>
+<span class="cp">#include &lt;net/ip.h&gt;</span>
+<span class="cp">#include &lt;net/checksum.h&gt;</span>
+<span class="cp">#include &quot;net_driver.h&quot;</span>
+<span class="cp">#include &quot;efx.h&quot;</span>
+<span class="cp">#include &quot;nic.h&quot;</span>
+<span class="cp">#include &quot;selftest.h&quot;</span>
+<span class="cp">#include &quot;workarounds.h&quot;</span>
+
+<span class="cm">/* Number of RX descriptors pushed at once. */</span>
+<span class="cp">#define EFX_RX_BATCH  8</span>
+
+<span class="cm">/* Maximum size of a buffer sharing a page */</span>
+<span class="cp">#define EFX_RX_HALF_PAGE ((PAGE_SIZE &gt;&gt; 1) - sizeof(struct efx_rx_page_state))</span>
+
+<span class="cm">/* Size of buffer allocated for skb header area. */</span>
+<span class="cp">#define EFX_SKB_HEADERS  64u</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * rx_alloc_method - RX buffer allocation method</span>
+<span class="cm"> *</span>
+<span class="cm"> * This driver supports two methods for allocating and using RX buffers:</span>
+<span class="cm"> * each RX buffer may be backed by an skb or by an order-n page.</span>
+<span class="cm"> *</span>
+<span class="cm"> * When GRO is in use then the second method has a lower overhead,</span>
+<span class="cm"> * since we don&#39;t have to allocate then free skbs on reassembled frames.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Values:</span>
+<span class="cm"> *   - RX_ALLOC_METHOD_AUTO = 0</span>
+<span class="cm"> *   - RX_ALLOC_METHOD_SKB  = 1</span>
+<span class="cm"> *   - RX_ALLOC_METHOD_PAGE = 2</span>
+<span class="cm"> *</span>
+<span class="cm"> * The heuristic for %RX_ALLOC_METHOD_AUTO is a simple hysteresis count</span>
+<span class="cm"> * controlled by the parameters below.</span>
+<span class="cm"> *</span>
+<span class="cm"> *   - Since pushing and popping descriptors are separated by the rx_queue</span>
+<span class="cm"> *     size, so the watermarks should be ~rxd_size.</span>
+<span class="cm"> *   - The performance win by using page-based allocation for GRO is less</span>
+<span class="cm"> *     than the performance hit of using page-based allocation of non-GRO,</span>
+<span class="cm"> *     so the watermarks should reflect this.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Per channel we maintain a single variable, updated by each channel:</span>
+<span class="cm"> *</span>
+<span class="cm"> *   rx_alloc_level += (gro_performed ? RX_ALLOC_FACTOR_GRO :</span>
+<span class="cm"> *                      RX_ALLOC_FACTOR_SKB)</span>
+<span class="cm"> * Per NAPI poll interval, we constrain rx_alloc_level to 0..MAX (which</span>
+<span class="cm"> * limits the hysteresis), and update the allocation strategy:</span>
+<span class="cm"> *</span>
+<span class="cm"> *   rx_alloc_method = (rx_alloc_level &gt; RX_ALLOC_LEVEL_GRO ?</span>
+<span class="cm"> *                      RX_ALLOC_METHOD_PAGE : RX_ALLOC_METHOD_SKB)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">rx_alloc_method</span> <span class="o">=</span> <span class="n">RX_ALLOC_METHOD_AUTO</span><span class="p">;</span>
+
+<span class="cp">#define RX_ALLOC_LEVEL_GRO 0x2000</span>
+<span class="cp">#define RX_ALLOC_LEVEL_MAX 0x3000</span>
+<span class="cp">#define RX_ALLOC_FACTOR_GRO 1</span>
+<span class="cp">#define RX_ALLOC_FACTOR_SKB (-2)</span>
+
+<span class="cm">/* This is the percentage fill level below which new RX descriptors</span>
+<span class="cm"> * will be added to the RX descriptor ring.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">rx_refill_threshold</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * RX maximum head room required.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This must be at least 1 to prevent overflow and at least 2 to allow</span>
+<span class="cm"> * pipelined receives.</span>
+<span class="cm"> */</span>
+<span class="cp">#define EFX_RXD_HEAD_ROOM 2</span>
+
+<span class="cm">/* Offset of ethernet header within page */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">efx_rx_buf_offset</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span><span class="p">,</span>
+					     <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* Offset is always within one page, so we don&#39;t need to consider</span>
+<span class="cm">	 * the page order.</span>
+<span class="cm">	 */</span>
+	<span class="k">return</span> <span class="p">((</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span> <span class="n">buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="o">+</span>
+		<span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_hash_size</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">efx_rx_buf_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">PAGE_SIZE</span> <span class="o">&lt;&lt;</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_order</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u8</span> <span class="o">*</span><span class="nf">efx_rx_buf_eh</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span><span class="p">,</span> <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">page_address</span><span class="p">(</span><span class="n">buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">)</span> <span class="o">+</span> <span class="n">efx_rx_buf_offset</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">buf</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span><span class="n">buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">+</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_hash_size</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u32</span> <span class="nf">efx_rx_buf_hash</span><span class="p">(</span><span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">eh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* The ethernet header is always directly after any hash. */</span>
+<span class="cp">#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) || NET_IP_ALIGN % 4 == 0</span>
+	<span class="k">return</span> <span class="n">__le32_to_cpup</span><span class="p">((</span><span class="k">const</span> <span class="n">__le32</span> <span class="o">*</span><span class="p">)(</span><span class="n">eh</span> <span class="o">-</span> <span class="mi">4</span><span class="p">));</span>
+<span class="cp">#else</span>
+	<span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="n">eh</span> <span class="o">-</span> <span class="mi">4</span><span class="p">;</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>	  <span class="o">|</span>
+	       <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">data</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">&lt;&lt;</span> <span class="mi">8</span>  <span class="o">|</span>
+	       <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">data</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">&lt;&lt;</span> <span class="mi">16</span> <span class="o">|</span>
+	       <span class="p">(</span><span class="n">u32</span><span class="p">)</span><span class="n">data</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">&lt;&lt;</span> <span class="mi">24</span><span class="p">;</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * efx_init_rx_buffers_skb - create EFX_RX_BATCH skb-based RX buffers</span>
+<span class="cm"> *</span>
+<span class="cm"> * @rx_queue:		Efx RX queue</span>
+<span class="cm"> *</span>
+<span class="cm"> * This allocates EFX_RX_BATCH skbs, maps them for DMA, and populates a</span>
+<span class="cm"> * struct efx_rx_buffer for each one. Return a negative error code or 0</span>
+<span class="cm"> * on success. May fail having only inserted fewer than EFX_RX_BATCH</span>
+<span class="cm"> * buffers.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">efx_init_rx_buffers_skb</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">net_device</span> <span class="o">*</span><span class="n">net_dev</span> <span class="o">=</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">skb_len</span> <span class="o">=</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_len</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">index</span><span class="p">,</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">count</span> <span class="o">&lt;</span> <span class="n">EFX_RX_BATCH</span><span class="p">;</span> <span class="o">++</span><span class="n">count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">&amp;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">;</span>
+		<span class="n">rx_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span> <span class="o">=</span> <span class="n">skb</span> <span class="o">=</span> <span class="n">netdev_alloc_skb</span><span class="p">(</span><span class="n">net_dev</span><span class="p">,</span> <span class="n">skb_len</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+		<span class="cm">/* Adjust the SKB for padding */</span>
+		<span class="n">skb_reserve</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">NET_IP_ALIGN</span><span class="p">);</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">skb_len</span> <span class="o">-</span> <span class="n">NET_IP_ALIGN</span><span class="p">;</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">=</span> <span class="n">pci_map_single</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span>
+						  <span class="n">skb</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">,</span>
+						  <span class="n">PCI_DMA_FROMDEVICE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">pci_dma_mapping_error</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span>
+						   <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span><span class="p">)))</span> <span class="p">{</span>
+			<span class="n">dev_kfree_skb_any</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+			<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">alloc_skb_count</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * efx_init_rx_buffers_page - create EFX_RX_BATCH page-based RX buffers</span>
+<span class="cm"> *</span>
+<span class="cm"> * @rx_queue:		Efx RX queue</span>
+<span class="cm"> *</span>
+<span class="cm"> * This allocates memory for EFX_RX_BATCH receive buffers, maps them for DMA,</span>
+<span class="cm"> * and populates struct efx_rx_buffers for each one. Return a negative error</span>
+<span class="cm"> * code or 0 on success. If a single page can be split between two buffers,</span>
+<span class="cm"> * then the page will either be inserted fully, or not at at all.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">efx_init_rx_buffers_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">page_addr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_rx_page_state</span> <span class="o">*</span><span class="n">state</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">dma_addr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">index</span><span class="p">,</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="cm">/* We can split a page between two buffers */</span>
+	<span class="n">BUILD_BUG_ON</span><span class="p">(</span><span class="n">EFX_RX_BATCH</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">count</span> <span class="o">&lt;</span> <span class="n">EFX_RX_BATCH</span><span class="p">;</span> <span class="o">++</span><span class="n">count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">alloc_pages</span><span class="p">(</span><span class="n">__GFP_COLD</span> <span class="o">|</span> <span class="n">__GFP_COMP</span> <span class="o">|</span> <span class="n">GFP_ATOMIC</span><span class="p">,</span>
+				   <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_order</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">page</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="n">dma_addr</span> <span class="o">=</span> <span class="n">pci_map_page</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+					<span class="n">efx_rx_buf_size</span><span class="p">(</span><span class="n">efx</span><span class="p">),</span>
+					<span class="n">PCI_DMA_FROMDEVICE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">pci_dma_mapping_error</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">)))</span> <span class="p">{</span>
+			<span class="n">__free_pages</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_order</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">page_addr</span> <span class="o">=</span> <span class="n">page_address</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">state</span> <span class="o">=</span> <span class="n">page_addr</span><span class="p">;</span>
+		<span class="n">state</span><span class="o">-&gt;</span><span class="n">refcnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">state</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">=</span> <span class="n">dma_addr</span><span class="p">;</span>
+
+		<span class="n">page_addr</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_page_state</span><span class="p">);</span>
+		<span class="n">dma_addr</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_page_state</span><span class="p">);</span>
+
+	<span class="nl">split:</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">&amp;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">;</span>
+		<span class="n">rx_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">=</span> <span class="n">dma_addr</span> <span class="o">+</span> <span class="n">EFX_PAGE_IP_ALIGN</span><span class="p">;</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span> <span class="o">=</span> <span class="n">page</span><span class="p">;</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_len</span> <span class="o">-</span> <span class="n">EFX_PAGE_IP_ALIGN</span><span class="p">;</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">alloc_page_count</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">((</span><span class="o">~</span><span class="n">count</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_len</span> <span class="o">&lt;=</span> <span class="n">EFX_RX_HALF_PAGE</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/* Use the second half of the page */</span>
+			<span class="n">get_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="n">dma_addr</span> <span class="o">+=</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="n">page_addr</span> <span class="o">+=</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">);</span>
+			<span class="o">++</span><span class="n">count</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">split</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_unmap_rx_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">efx_rx_page_state</span> <span class="o">*</span><span class="n">state</span><span class="p">;</span>
+
+		<span class="n">state</span> <span class="o">=</span> <span class="n">page_address</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">--</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">refcnt</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">pci_unmap_page</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span>
+				       <span class="n">state</span><span class="o">-&gt;</span><span class="n">dma_addr</span><span class="p">,</span>
+				       <span class="n">efx_rx_buf_size</span><span class="p">(</span><span class="n">efx</span><span class="p">),</span>
+				       <span class="n">PCI_DMA_FROMDEVICE</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pci_unmap_single</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">pci_dev</span><span class="p">,</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span><span class="p">,</span>
+				 <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">,</span> <span class="n">PCI_DMA_FROMDEVICE</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_free_rx_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">__free_pages</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_order</span><span class="p">);</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dev_kfree_skb_any</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">);</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_fini_rx_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">efx_unmap_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+	<span class="n">efx_free_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Attempt to resurrect the other receive buffer that used to share this page,</span>
+<span class="cm"> * which had previously been passed up to the kernel and freed. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_resurrect_rx_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_rx_page_state</span> <span class="o">*</span><span class="n">state</span> <span class="o">=</span> <span class="n">page_address</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">new_buf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">fill_level</span><span class="p">,</span> <span class="n">index</span><span class="p">;</span>
+
+	<span class="cm">/* +1 because efx_rx_packet() incremented removed_count. +1 because</span>
+<span class="cm">	 * we&#39;d like to insert an additional descriptor whilst leaving</span>
+<span class="cm">	 * EFX_RXD_HEAD_ROOM for the non-recycle path */</span>
+	<span class="n">fill_level</span> <span class="o">=</span> <span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">-</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span> <span class="o">+</span> <span class="mi">2</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">fill_level</span> <span class="o">&gt;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">max_fill</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/* We could place &quot;state&quot; on a list, and drain the list in</span>
+<span class="cm">		 * efx_fast_push_rx_descriptors(). For now, this will do. */</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="o">++</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">;</span>
+	<span class="n">get_page</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">index</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">&amp;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">;</span>
+	<span class="n">new_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="n">new_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span> <span class="o">^</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">new_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">;</span>
+	<span class="n">new_buf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+	<span class="n">new_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">;</span>
+	<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Recycle the given rx buffer directly back into the rx_queue. There is</span>
+<span class="cm"> * always room to add this buffer, because we&#39;ve just popped a buffer. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_recycle_rx_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span><span class="p">,</span>
+				  <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span> <span class="o">=</span> <span class="n">efx_channel_get_rx_queue</span><span class="p">(</span><span class="n">channel</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">new_buf</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">index</span><span class="p">;</span>
+
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rx_buffer_len</span> <span class="o">&lt;=</span> <span class="n">EFX_RX_HALF_PAGE</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">page_count</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">efx_resurrect_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+
+	<span class="n">index</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">&amp;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">;</span>
+	<span class="n">new_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">new_buf</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">new_buf</span><span class="p">));</span>
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * efx_fast_push_rx_descriptors - push new RX descriptors quickly</span>
+<span class="cm"> * @rx_queue:		RX descriptor queue</span>
+<span class="cm"> * This will aim to fill the RX descriptor queue up to</span>
+<span class="cm"> * @rx_queue-&gt;@max_fill. If there is insufficient atomic</span>
+<span class="cm"> * memory to do so, a slow fill will be scheduled.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The caller must provide serialisation (none is used here). In practise,</span>
+<span class="cm"> * this means this function must run from the NAPI handler, or be called</span>
+<span class="cm"> * when NAPI is disabled.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">efx_fast_push_rx_descriptors</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span> <span class="o">=</span> <span class="n">efx_rx_queue_channel</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="n">fill_level</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">space</span><span class="p">,</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* Calculate current fill level, and exit if we don&#39;t need to fill */</span>
+	<span class="n">fill_level</span> <span class="o">=</span> <span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">-</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span><span class="p">);</span>
+	<span class="n">EFX_BUG_ON_PARANOID</span><span class="p">(</span><span class="n">fill_level</span> <span class="o">&gt;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">rxq_entries</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fill_level</span> <span class="o">&gt;=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">fast_fill_trigger</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* Record minimum fill level */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">fill_level</span> <span class="o">&lt;</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">min_fill</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fill_level</span><span class="p">)</span>
+			<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">min_fill</span> <span class="o">=</span> <span class="n">fill_level</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">space</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">max_fill</span> <span class="o">-</span> <span class="n">fill_level</span><span class="p">;</span>
+	<span class="n">EFX_BUG_ON_PARANOID</span><span class="p">(</span><span class="n">space</span> <span class="o">&lt;</span> <span class="n">EFX_RX_BATCH</span><span class="p">);</span>
+
+	<span class="n">netif_vdbg</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_status</span><span class="p">,</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		   <span class="s">&quot;RX queue %d fast-filling descriptor ring from&quot;</span>
+		   <span class="s">&quot; level %d to level %d using %s allocation</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		   <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span> <span class="n">fill_level</span><span class="p">,</span>
+		   <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">max_fill</span><span class="p">,</span>
+		   <span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_push_pages</span> <span class="o">?</span> <span class="s">&quot;page&quot;</span> <span class="o">:</span> <span class="s">&quot;skb&quot;</span><span class="p">);</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_push_pages</span><span class="p">)</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="n">efx_init_rx_buffers_page</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="n">efx_init_rx_buffers_skb</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">rc</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/* Ensure that we don&#39;t leave the rx queue empty */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">==</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span><span class="p">)</span>
+				<span class="n">efx_schedule_slow_fill</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">((</span><span class="n">space</span> <span class="o">-=</span> <span class="n">EFX_RX_BATCH</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">EFX_RX_BATCH</span><span class="p">);</span>
+
+	<span class="n">netif_vdbg</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_status</span><span class="p">,</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		   <span class="s">&quot;RX queue %d fast-filled descriptor ring &quot;</span>
+		   <span class="s">&quot;to level %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span>
+		   <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">-</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span><span class="p">);</span>
+
+ <span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">notified_count</span> <span class="o">!=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span><span class="p">)</span>
+		<span class="n">efx_nic_notify_rx_desc</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_rx_slow_fill</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">context</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="p">)</span><span class="n">context</span><span class="p">;</span>
+
+	<span class="cm">/* Post an event to cause NAPI to run and refill the queue */</span>
+	<span class="n">efx_nic_generate_fill_event</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+	<span class="o">++</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">slow_fill_count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_rx_packet__check_len</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">,</span>
+				     <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">,</span>
+				     <span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="n">bool</span> <span class="o">*</span><span class="n">leak_packet</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">max_len</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">-</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_padding</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">len</span> <span class="o">&lt;=</span> <span class="n">max_len</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* The packet must be discarded, but this is only a fatal error</span>
+<span class="cm">	 * if the caller indicated it was</span>
+<span class="cm">	 */</span>
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">EFX_RX_PKT_DISCARD</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">len</span> <span class="o">&gt;</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">EFX_WORKAROUND_8071</span><span class="p">(</span><span class="n">efx</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">net_ratelimit</span><span class="p">())</span>
+			<span class="n">netif_err</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_err</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+				  <span class="s">&quot; RX queue %d seriously overlength &quot;</span>
+				  <span class="s">&quot;RX event (0x%x &gt; 0x%x+0x%x). Leaking</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				  <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span> <span class="n">len</span><span class="p">,</span> <span class="n">max_len</span><span class="p">,</span>
+				  <span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_padding</span><span class="p">);</span>
+		<span class="cm">/* If this buffer was skb-allocated, then the meta</span>
+<span class="cm">		 * data at the end of the skb will be trashed. So</span>
+<span class="cm">		 * we have no choice but to leak the fragment.</span>
+<span class="cm">		 */</span>
+		<span class="o">*</span><span class="n">leak_packet</span> <span class="o">=</span> <span class="o">!</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">);</span>
+		<span class="n">efx_schedule_reset</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">RESET_TYPE_RX_RECOVERY</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">net_ratelimit</span><span class="p">())</span>
+			<span class="n">netif_err</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_err</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+				  <span class="s">&quot; RX queue %d overlength RX event &quot;</span>
+				  <span class="s">&quot;(0x%x &gt; 0x%x)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				  <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span> <span class="n">len</span><span class="p">,</span> <span class="n">max_len</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">efx_rx_queue_channel</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">n_rx_overlength</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Pass a received packet up through GRO.  GRO can handle pages</span>
+<span class="cm"> * regardless of checksum state and skbs with a good checksum.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_rx_packet_gro</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">,</span>
+			      <span class="k">const</span> <span class="n">u8</span> <span class="o">*</span><span class="n">eh</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">napi_struct</span> <span class="o">*</span><span class="n">napi</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">napi_str</span><span class="p">;</span>
+	<span class="n">gro_result_t</span> <span class="n">gro_result</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">page</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+		<span class="n">skb</span> <span class="o">=</span> <span class="n">napi_get_frags</span><span class="p">(</span><span class="n">napi</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="o">-&gt;</span><span class="n">features</span> <span class="o">&amp;</span> <span class="n">NETIF_F_RXHASH</span><span class="p">)</span>
+			<span class="n">skb</span><span class="o">-&gt;</span><span class="n">rxhash</span> <span class="o">=</span> <span class="n">efx_rx_buf_hash</span><span class="p">(</span><span class="n">eh</span><span class="p">);</span>
+
+		<span class="n">skb_fill_page_desc</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span>
+				   <span class="n">efx_rx_buf_offset</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">),</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">data_len</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">truesize</span> <span class="o">+=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">;</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span> <span class="o">=</span> <span class="p">((</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_PKT_CSUMMED</span><span class="p">)</span> <span class="o">?</span>
+				  <span class="n">CHECKSUM_UNNECESSARY</span> <span class="o">:</span> <span class="n">CHECKSUM_NONE</span><span class="p">);</span>
+
+		<span class="n">skb_record_rx_queue</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">channel</span><span class="p">);</span>
+
+		<span class="n">gro_result</span> <span class="o">=</span> <span class="n">napi_gro_frags</span><span class="p">(</span><span class="n">napi</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">;</span>
+
+		<span class="n">EFX_BUG_ON_PARANOID</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_PKT_CSUMMED</span><span class="p">));</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span> <span class="o">=</span> <span class="n">CHECKSUM_UNNECESSARY</span><span class="p">;</span>
+
+		<span class="n">gro_result</span> <span class="o">=</span> <span class="n">napi_gro_receive</span><span class="p">(</span><span class="n">napi</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">gro_result</span> <span class="o">==</span> <span class="n">GRO_NORMAL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">+=</span> <span class="n">RX_ALLOC_FACTOR_SKB</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">gro_result</span> <span class="o">!=</span> <span class="n">GRO_DROP</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">+=</span> <span class="n">RX_ALLOC_FACTOR_GRO</span><span class="p">;</span>
+		<span class="n">channel</span><span class="o">-&gt;</span><span class="n">irq_mod_score</span> <span class="o">+=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_rx_packet</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">index</span><span class="p">,</span>
+		   <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len</span><span class="p">,</span> <span class="n">u16</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span> <span class="o">=</span> <span class="n">efx_rx_queue_channel</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">leak_packet</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">rx_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">|=</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="cm">/* This allows the refill path to post another buffer.</span>
+<span class="cm">	 * EFX_RXD_HEAD_ROOM ensures that the slot we are using</span>
+<span class="cm">	 * isn&#39;t overwritten yet.</span>
+<span class="cm">	 */</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="cm">/* Validate the length encoded in the event vs the descriptor pushed */</span>
+	<span class="n">efx_rx_packet__check_len</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">leak_packet</span><span class="p">);</span>
+
+	<span class="n">netif_vdbg</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_status</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		   <span class="s">&quot;RX queue %d received id %x at %llx+%x %s%s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		   <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span> <span class="n">index</span><span class="p">,</span>
+		   <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">dma_addr</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span>
+		   <span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_PKT_CSUMMED</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot; [SUMMED]&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">,</span>
+		   <span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_PKT_DISCARD</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot; [DISCARD]&quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">);</span>
+
+	<span class="cm">/* Discard packet, if instructed to do so */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_PKT_DISCARD</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">leak_packet</span><span class="p">))</span>
+			<span class="n">channel</span><span class="o">-&gt;</span><span class="n">n_skbuff_leaks</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">efx_recycle_rx_buffer</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+
+		<span class="cm">/* Don&#39;t hold off the previous receive */</span>
+		<span class="n">rx_buf</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Release card resources - assumes all RX buffers consumed in-order</span>
+<span class="cm">	 * per RX queue</span>
+<span class="cm">	 */</span>
+	<span class="n">efx_unmap_rx_buffer</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+
+	<span class="cm">/* Prefetch nice and early so data will (hopefully) be in cache by</span>
+<span class="cm">	 * the time we look at it.</span>
+<span class="cm">	 */</span>
+	<span class="n">prefetch</span><span class="p">(</span><span class="n">efx_rx_buf_eh</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">));</span>
+
+	<span class="cm">/* Pipeline receives so that we give time for packet headers to be</span>
+<span class="cm">	 * prefetched into cache.</span>
+<span class="cm">	 */</span>
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span> <span class="o">-</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_hash_size</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_pkt</span><span class="p">)</span>
+		<span class="n">__efx_rx_packet</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_pkt</span><span class="p">);</span>
+	<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_pkt</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">efx_rx_deliver</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+	<span class="cm">/* We now own the SKB */</span>
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">;</span>
+	<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* Set the SKB flags */</span>
+	<span class="n">skb_checksum_none_assert</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+
+	<span class="cm">/* Pass the packet up */</span>
+	<span class="n">netif_receive_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+
+	<span class="cm">/* Update allocation strategy method */</span>
+	<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">+=</span> <span class="n">RX_ALLOC_FACTOR_SKB</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Handle a received packet.  Second half: Touches packet payload. */</span>
+<span class="kt">void</span> <span class="nf">__efx_rx_packet</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span><span class="p">,</span> <span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="n">u8</span> <span class="o">*</span><span class="n">eh</span> <span class="o">=</span> <span class="n">efx_rx_buf_eh</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+
+	<span class="cm">/* If we&#39;re in loopback test, then pass the packet directly to the</span>
+<span class="cm">	 * loopback layer, and free the rx_buf here</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">loopback_selftest</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">efx_loopback_rx_packet</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">eh</span><span class="p">,</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+		<span class="n">efx_free_rx_buffer</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">EFX_RX_BUF_PAGE</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">u</span><span class="p">.</span><span class="n">skb</span><span class="p">;</span>
+
+		<span class="n">prefetch</span><span class="p">(</span><span class="n">skb_shinfo</span><span class="p">(</span><span class="n">skb</span><span class="p">));</span>
+
+		<span class="n">skb_reserve</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">rx_buffer_hash_size</span><span class="p">);</span>
+		<span class="n">skb_put</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="o">-&gt;</span><span class="n">features</span> <span class="o">&amp;</span> <span class="n">NETIF_F_RXHASH</span><span class="p">)</span>
+			<span class="n">skb</span><span class="o">-&gt;</span><span class="n">rxhash</span> <span class="o">=</span> <span class="n">efx_rx_buf_hash</span><span class="p">(</span><span class="n">eh</span><span class="p">);</span>
+
+		<span class="cm">/* Move past the ethernet header. rx_buf-&gt;data still points</span>
+<span class="cm">		 * at the ethernet header */</span>
+		<span class="n">skb</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">eth_type_trans</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">);</span>
+
+		<span class="n">skb_record_rx_queue</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">channel</span><span class="o">-&gt;</span><span class="n">channel</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="o">-&gt;</span><span class="n">features</span> <span class="o">&amp;</span> <span class="n">NETIF_F_RXCSUM</span><span class="p">)))</span>
+		<span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">EFX_RX_PKT_CSUMMED</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">rx_buf</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">EFX_RX_BUF_PAGE</span> <span class="o">|</span> <span class="n">EFX_RX_PKT_CSUMMED</span><span class="p">)))</span>
+		<span class="n">efx_rx_packet_gro</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">,</span> <span class="n">eh</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">efx_rx_deliver</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_rx_strategy</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_channel</span> <span class="o">*</span><span class="n">channel</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">enum</span> <span class="n">efx_rx_alloc_method</span> <span class="n">method</span> <span class="o">=</span> <span class="n">rx_alloc_method</span><span class="p">;</span>
+
+	<span class="cm">/* Only makes sense to use page based allocation if GRO is enabled */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="o">-&gt;</span><span class="n">features</span> <span class="o">&amp;</span> <span class="n">NETIF_F_GRO</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">method</span> <span class="o">=</span> <span class="n">RX_ALLOC_METHOD_SKB</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">method</span> <span class="o">==</span> <span class="n">RX_ALLOC_METHOD_AUTO</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Constrain the rx_alloc_level */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">&gt;</span> <span class="n">RX_ALLOC_LEVEL_MAX</span><span class="p">)</span>
+			<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">=</span> <span class="n">RX_ALLOC_LEVEL_MAX</span><span class="p">;</span>
+
+		<span class="cm">/* Decide on the allocation method */</span>
+		<span class="n">method</span> <span class="o">=</span> <span class="p">((</span><span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_level</span> <span class="o">&gt;</span> <span class="n">RX_ALLOC_LEVEL_GRO</span><span class="p">)</span> <span class="o">?</span>
+			  <span class="n">RX_ALLOC_METHOD_PAGE</span> <span class="o">:</span> <span class="n">RX_ALLOC_METHOD_SKB</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Push the option */</span>
+	<span class="n">channel</span><span class="o">-&gt;</span><span class="n">rx_alloc_push_pages</span> <span class="o">=</span> <span class="p">(</span><span class="n">method</span> <span class="o">==</span> <span class="n">RX_ALLOC_METHOD_PAGE</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">efx_probe_rx_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">entries</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="cm">/* Create the smallest power-of-two aligned ring */</span>
+	<span class="n">entries</span> <span class="o">=</span> <span class="n">max</span><span class="p">(</span><span class="n">roundup_pow_of_two</span><span class="p">(</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">rxq_entries</span><span class="p">),</span> <span class="n">EFX_MIN_DMAQ_SIZE</span><span class="p">);</span>
+	<span class="n">EFX_BUG_ON_PARANOID</span><span class="p">(</span><span class="n">entries</span> <span class="o">&gt;</span> <span class="n">EFX_MAX_DMAQ_SIZE</span><span class="p">);</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span> <span class="o">=</span> <span class="n">entries</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">netif_dbg</span><span class="p">(</span><span class="n">efx</span><span class="p">,</span> <span class="n">probe</span><span class="p">,</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		  <span class="s">&quot;creating RX queue %d size %#x mask %#x</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		  <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">),</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rxq_entries</span><span class="p">,</span>
+		  <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">);</span>
+
+	<span class="cm">/* Allocate RX buffers */</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span> <span class="o">=</span> <span class="n">kcalloc</span><span class="p">(</span><span class="n">entries</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">),</span>
+				   <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">efx_nic_probe_rx</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">);</span>
+		<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_init_rx_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">efx_nic</span> <span class="o">*</span><span class="n">efx</span> <span class="o">=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">max_fill</span><span class="p">,</span> <span class="n">trigger</span><span class="p">,</span> <span class="n">max_trigger</span><span class="p">;</span>
+
+	<span class="n">netif_dbg</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">drv</span><span class="p">,</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		  <span class="s">&quot;initialising RX queue %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">));</span>
+
+	<span class="cm">/* Initialise ptr fields */</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">added_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">notified_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">removed_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">min_fill</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1U</span><span class="p">;</span>
+
+	<span class="cm">/* Initialise limit fields */</span>
+	<span class="n">max_fill</span> <span class="o">=</span> <span class="n">efx</span><span class="o">-&gt;</span><span class="n">rxq_entries</span> <span class="o">-</span> <span class="n">EFX_RXD_HEAD_ROOM</span><span class="p">;</span>
+	<span class="n">max_trigger</span> <span class="o">=</span> <span class="n">max_fill</span> <span class="o">-</span> <span class="n">EFX_RX_BATCH</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rx_refill_threshold</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">trigger</span> <span class="o">=</span> <span class="n">max_fill</span> <span class="o">*</span> <span class="n">min</span><span class="p">(</span><span class="n">rx_refill_threshold</span><span class="p">,</span> <span class="mi">100U</span><span class="p">)</span> <span class="o">/</span> <span class="mi">100U</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">trigger</span> <span class="o">&gt;</span> <span class="n">max_trigger</span><span class="p">)</span>
+			<span class="n">trigger</span> <span class="o">=</span> <span class="n">max_trigger</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">trigger</span> <span class="o">=</span> <span class="n">max_trigger</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">max_fill</span> <span class="o">=</span> <span class="n">max_fill</span><span class="p">;</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">fast_fill_trigger</span> <span class="o">=</span> <span class="n">trigger</span><span class="p">;</span>
+
+	<span class="cm">/* Set up RX descriptor ring */</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">enabled</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="n">efx_nic_init_rx</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_fini_rx_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">efx_rx_buffer</span> <span class="o">*</span><span class="n">rx_buf</span><span class="p">;</span>
+
+	<span class="n">netif_dbg</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">drv</span><span class="p">,</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		  <span class="s">&quot;shutting down RX queue %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">));</span>
+
+	<span class="cm">/* A flush failure might have left rx_queue-&gt;enabled */</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">enabled</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">del_timer_sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">slow_fill</span><span class="p">);</span>
+	<span class="n">efx_nic_fini_rx</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+
+	<span class="cm">/* Release RX buffers NB start at index 0 not current HW ptr */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;=</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">ptr_mask</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">rx_buf</span> <span class="o">=</span> <span class="n">efx_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+			<span class="n">efx_fini_rx_buffer</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">,</span> <span class="n">rx_buf</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">efx_remove_rx_queue</span><span class="p">(</span><span class="k">struct</span> <span class="n">efx_rx_queue</span> <span class="o">*</span><span class="n">rx_queue</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">netif_dbg</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="p">,</span> <span class="n">drv</span><span class="p">,</span> <span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">efx</span><span class="o">-&gt;</span><span class="n">net_dev</span><span class="p">,</span>
+		  <span class="s">&quot;destroying RX queue %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">efx_rx_queue_index</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">));</span>
+
+	<span class="n">efx_nic_remove_rx</span><span class="p">(</span><span class="n">rx_queue</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span><span class="p">);</span>
+	<span class="n">rx_queue</span><span class="o">-&gt;</span><span class="n">buffer</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+
+<span class="n">module_param</span><span class="p">(</span><span class="n">rx_alloc_method</span><span class="p">,</span> <span class="kt">int</span><span class="p">,</span> <span class="mo">0644</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">rx_alloc_method</span><span class="p">,</span> <span class="s">&quot;Allocation method used for RX buffers&quot;</span><span class="p">);</span>
+
+<span class="n">module_param</span><span class="p">(</span><span class="n">rx_refill_threshold</span><span class="p">,</span> <span class="n">uint</span><span class="p">,</span> <span class="mo">0444</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">rx_refill_threshold</span><span class="p">,</span>
+		 <span class="s">&quot;RX descriptor ring refill threshold (%)&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:4}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../../javascript/docco.min.js"></script>
+</html>

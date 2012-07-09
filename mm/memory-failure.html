@@ -1,0 +1,1615 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » mm › memory-failure.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>memory-failure.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2008, 2009 Intel Corporation</span>
+<span class="cm"> * Authors: Andi Kleen, Fengguang Wu</span>
+<span class="cm"> *</span>
+<span class="cm"> * This software may be redistributed and/or modified under the terms of</span>
+<span class="cm"> * the GNU General Public License (&quot;GPL&quot;) version 2 only as published by the</span>
+<span class="cm"> * Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> * High level machine check handler. Handles pages reported by the</span>
+<span class="cm"> * hardware as being corrupted usually due to a multi-bit ECC memory or cache</span>
+<span class="cm"> * failure.</span>
+<span class="cm"> * </span>
+<span class="cm"> * In addition there is a &quot;soft offline&quot; entry point that allows stop using</span>
+<span class="cm"> * not-yet-corrupted-by-suspicious pages without killing anything.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Handles page cache pages in various states.	The tricky part</span>
+<span class="cm"> * here is that we can access any page asynchronously in respect to </span>
+<span class="cm"> * other VM users, because memory failures could happen anytime and </span>
+<span class="cm"> * anywhere. This could violate some of their assumptions. This is why </span>
+<span class="cm"> * this code has to be extremely careful. Generally it tries to use </span>
+<span class="cm"> * normal locking rules, as in get the standard locks, even if that means </span>
+<span class="cm"> * the error handling takes potentially a long time.</span>
+<span class="cm"> * </span>
+<span class="cm"> * There are several operations here with exponential complexity because</span>
+<span class="cm"> * of unsuitable VM data structures. For example the operation to map back </span>
+<span class="cm"> * from RMAP chains to processes has to walk the complete process list and </span>
+<span class="cm"> * has non linear complexity with the number. But since memory corruptions</span>
+<span class="cm"> * are rare we hope to get away with this. This avoids impacting the core </span>
+<span class="cm"> * VM.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Notebook:</span>
+<span class="cm"> * - hugetlb needs more code</span>
+<span class="cm"> * - kcore/oldmem/vmcore/mem/kmem check for hwpoison pages</span>
+<span class="cm"> * - pass bad pages to kdump next kernel</span>
+<span class="cm"> */</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/page-flags.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel-page-flags.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/ksm.h&gt;</span>
+<span class="cp">#include &lt;linux/rmap.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/swap.h&gt;</span>
+<span class="cp">#include &lt;linux/backing-dev.h&gt;</span>
+<span class="cp">#include &lt;linux/migrate.h&gt;</span>
+<span class="cp">#include &lt;linux/page-isolation.h&gt;</span>
+<span class="cp">#include &lt;linux/suspend.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/swapops.h&gt;</span>
+<span class="cp">#include &lt;linux/hugetlb.h&gt;</span>
+<span class="cp">#include &lt;linux/memory_hotplug.h&gt;</span>
+<span class="cp">#include &lt;linux/mm_inline.h&gt;</span>
+<span class="cp">#include &lt;linux/kfifo.h&gt;</span>
+<span class="cp">#include &quot;internal.h&quot;</span>
+
+<span class="kt">int</span> <span class="n">sysctl_memory_failure_early_kill</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="kt">int</span> <span class="n">sysctl_memory_failure_recovery</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="n">atomic_long_t</span> <span class="n">mce_bad_pages</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="n">ATOMIC_LONG_INIT</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+<span class="cp">#if defined(CONFIG_HWPOISON_INJECT) || defined(CONFIG_HWPOISON_INJECT_MODULE)</span>
+
+<span class="n">u32</span> <span class="n">hwpoison_filter_enable</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="n">u32</span> <span class="n">hwpoison_filter_dev_major</span> <span class="o">=</span> <span class="o">~</span><span class="mi">0U</span><span class="p">;</span>
+<span class="n">u32</span> <span class="n">hwpoison_filter_dev_minor</span> <span class="o">=</span> <span class="o">~</span><span class="mi">0U</span><span class="p">;</span>
+<span class="n">u64</span> <span class="n">hwpoison_filter_flags_mask</span><span class="p">;</span>
+<span class="n">u64</span> <span class="n">hwpoison_filter_flags_value</span><span class="p">;</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_enable</span><span class="p">);</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_dev_major</span><span class="p">);</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_dev_minor</span><span class="p">);</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_flags_mask</span><span class="p">);</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_flags_value</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwpoison_filter_dev</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="n">dev_t</span> <span class="n">dev</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_dev_major</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0U</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">hwpoison_filter_dev_minor</span> <span class="o">==</span> <span class="o">~</span><span class="mi">0U</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * page_mapping() does not accept slab pages.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageSlab</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">page_mapping</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mapping</span> <span class="o">==</span> <span class="nb">NULL</span> <span class="o">||</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">dev</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_dev</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_dev_major</span> <span class="o">!=</span> <span class="o">~</span><span class="mi">0U</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">hwpoison_filter_dev_major</span> <span class="o">!=</span> <span class="n">MAJOR</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_dev_minor</span> <span class="o">!=</span> <span class="o">~</span><span class="mi">0U</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">hwpoison_filter_dev_minor</span> <span class="o">!=</span> <span class="n">MINOR</span><span class="p">(</span><span class="n">dev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwpoison_filter_flags</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwpoison_filter_flags_mask</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">stable_page_flags</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">hwpoison_filter_flags_mask</span><span class="p">)</span> <span class="o">==</span>
+				    <span class="n">hwpoison_filter_flags_value</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This allows stress tests to limit test scope to a collection of tasks</span>
+<span class="cm"> * by putting them under some memcg. This prevents killing unrelated/important</span>
+<span class="cm"> * processes such as /sbin/init. Note that the target task may share clean</span>
+<span class="cm"> * pages with init (eg. libc text), which is harmless. If the target task</span>
+<span class="cm"> * share _dirty_ pages with another task B, the test scheme must make sure B</span>
+<span class="cm"> * is also included in the memcg. At last, due to race conditions this filter</span>
+<span class="cm"> * can only guarantee that the page either belongs to the memcg tasks, or is</span>
+<span class="cm"> * a freed page.</span>
+<span class="cm"> */</span>
+<span class="cp">#ifdef	CONFIG_CGROUP_MEM_RES_CTLR_SWAP</span>
+<span class="n">u64</span> <span class="n">hwpoison_filter_memcg</span><span class="p">;</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter_memcg</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwpoison_filter_task</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">mem_cgroup</span> <span class="o">*</span><span class="n">mem</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">cgroup_subsys_state</span> <span class="o">*</span><span class="n">css</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">ino</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwpoison_filter_memcg</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">mem</span> <span class="o">=</span> <span class="n">try_get_mem_cgroup_from_page</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mem</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">css</span> <span class="o">=</span> <span class="n">mem_cgroup_css</span><span class="p">(</span><span class="n">mem</span><span class="p">);</span>
+	<span class="cm">/* root_mem_cgroup has NULL dentries */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">css</span><span class="o">-&gt;</span><span class="n">cgroup</span><span class="o">-&gt;</span><span class="n">dentry</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">ino</span> <span class="o">=</span> <span class="n">css</span><span class="o">-&gt;</span><span class="n">cgroup</span><span class="o">-&gt;</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">;</span>
+	<span class="n">css_put</span><span class="p">(</span><span class="n">css</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ino</span> <span class="o">!=</span> <span class="n">hwpoison_filter_memcg</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#else</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwpoison_filter_task</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="mi">0</span><span class="p">;</span> <span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="kt">int</span> <span class="nf">hwpoison_filter</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">hwpoison_filter_enable</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_dev</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_flags</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter_task</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#else</span>
+<span class="kt">int</span> <span class="nf">hwpoison_filter</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">hwpoison_filter</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Send all the processes who have the page mapped a signal.</span>
+<span class="cm"> * ``action optional&#39;&#39; if they are not immediately affected by the error</span>
+<span class="cm"> * ``action required&#39;&#39; if error happened in current execution context</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">kill_proc</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">,</span> <span class="kt">int</span> <span class="n">trapno</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">siginfo</span> <span class="n">si</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		<span class="s">&quot;MCE %#lx: Killing %s:%d due to hardware memory corruption</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">pfn</span><span class="p">,</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">,</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">);</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">si_signo</span> <span class="o">=</span> <span class="n">SIGBUS</span><span class="p">;</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">si_errno</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">si_addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">addr</span><span class="p">;</span>
+<span class="cp">#ifdef __ARCH_SI_TRAPNO</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">si_trapno</span> <span class="o">=</span> <span class="n">trapno</span><span class="p">;</span>
+<span class="cp">#endif</span>
+	<span class="n">si</span><span class="p">.</span><span class="n">si_addr_lsb</span> <span class="o">=</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">compound_head</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="o">+</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">((</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">MF_ACTION_REQUIRED</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">t</span> <span class="o">==</span> <span class="n">current</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">si</span><span class="p">.</span><span class="n">si_code</span> <span class="o">=</span> <span class="n">BUS_MCEERR_AR</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">force_sig_info</span><span class="p">(</span><span class="n">SIGBUS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">t</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Don&#39;t use force here, it&#39;s convenient if the signal</span>
+<span class="cm">		 * can be temporarily blocked.</span>
+<span class="cm">		 * This could cause a loop when the user sets SIGBUS</span>
+<span class="cm">		 * to SIG_IGN, but hopefully no one will do that?</span>
+<span class="cm">		 */</span>
+		<span class="n">si</span><span class="p">.</span><span class="n">si_code</span> <span class="o">=</span> <span class="n">BUS_MCEERR_AO</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">send_sig_info</span><span class="p">(</span><span class="n">SIGBUS</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">t</span><span class="p">);</span>  <span class="cm">/* synchronous? */</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;MCE: Error sending signal to %s:%d: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">t</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">,</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When a unknown page type is encountered drain as many buffers as possible</span>
+<span class="cm"> * in the hope to turn the page into a LRU or free page, which we can handle.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">shake_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">int</span> <span class="n">access</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageSlab</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">lru_add_drain_all</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="n">drain_all_pages</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">||</span> <span class="n">is_free_buddy_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Only call shrink_slab here (which would also shrink other caches) if</span>
+<span class="cm">	 * access is not potentially fatal.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">access</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">nr</span><span class="p">;</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">shrink_control</span> <span class="n">shrink</span> <span class="o">=</span> <span class="p">{</span>
+				<span class="p">.</span><span class="n">gfp_mask</span> <span class="o">=</span> <span class="n">GFP_KERNEL</span><span class="p">,</span>
+			<span class="p">};</span>
+
+			<span class="n">nr</span> <span class="o">=</span> <span class="n">shrink_slab</span><span class="p">(</span><span class="o">&amp;</span><span class="n">shrink</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">page_count</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">nr</span> <span class="o">&gt;</span> <span class="mi">10</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">shake_page</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Kill all processes that have a poisoned page mapped and then isolate</span>
+<span class="cm"> * the page.</span>
+<span class="cm"> *</span>
+<span class="cm"> * General strategy:</span>
+<span class="cm"> * Find all processes having the page mapped and kill them.</span>
+<span class="cm"> * But we keep a page reference around so that the page is not</span>
+<span class="cm"> * actually freed yet.</span>
+<span class="cm"> * Then stash the page away</span>
+<span class="cm"> *</span>
+<span class="cm"> * There&#39;s no convenient way to get back to mapped processes</span>
+<span class="cm"> * from the VMAs. So do a brute-force search over all</span>
+<span class="cm"> * running processes.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Remember that machine checks are not common (or rather</span>
+<span class="cm"> * if they are common you have other problems), so this shouldn&#39;t</span>
+<span class="cm"> * be a performance issue.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Also there are some races possible while we get from the</span>
+<span class="cm"> * error detection to actually handle it.</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">to_kill</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">nd</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">addr</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">addr_valid</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Failure handling: if we can&#39;t find or can&#39;t kill a process there&#39;s</span>
+<span class="cm"> * not much we can do.	We just print a message and ignore otherwise.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Schedule a process for later kill.</span>
+<span class="cm"> * Uses GFP_ATOMIC allocations to avoid potential recursions in the VM.</span>
+<span class="cm"> * TBD would GFP_NOIO be enough?</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">add_to_kill</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">to_kill</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">to_kill</span> <span class="o">**</span><span class="n">tkc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">to_kill</span> <span class="o">*</span><span class="n">tk</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">tkc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tk</span> <span class="o">=</span> <span class="o">*</span><span class="n">tkc</span><span class="p">;</span>
+		<span class="o">*</span><span class="n">tkc</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">tk</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">to_kill</span><span class="p">),</span> <span class="n">GFP_ATOMIC</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tk</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		<span class="s">&quot;MCE: Out of memory while machine check handling</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr</span> <span class="o">=</span> <span class="n">page_address_in_vma</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">vma</span><span class="p">);</span>
+	<span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr_valid</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * In theory we don&#39;t have to kill when the page was</span>
+<span class="cm">	 * munmaped. But it could be also a mremap. Since that&#39;s</span>
+<span class="cm">	 * likely very rare kill anyways just out of paranoia, but use</span>
+<span class="cm">	 * a SIGKILL because the error is not contained anymore.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr</span> <span class="o">==</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE: Unable to find user space address %lx in %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">page_to_pfn</span><span class="p">(</span><span class="n">p</span><span class="p">),</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">);</span>
+		<span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr_valid</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">get_task_struct</span><span class="p">(</span><span class="n">tsk</span><span class="p">);</span>
+	<span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span> <span class="o">=</span> <span class="n">tsk</span><span class="p">;</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tk</span><span class="o">-&gt;</span><span class="n">nd</span><span class="p">,</span> <span class="n">to_kill</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Kill the processes that have been collected earlier.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Only do anything when DOIT is set, otherwise just free the list</span>
+<span class="cm"> * (this is used for clean pages which do not need killing)</span>
+<span class="cm"> * Also when FAIL is set do a force kill because something went</span>
+<span class="cm"> * wrong earlier.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">kill_procs</span><span class="p">(</span><span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">to_kill</span><span class="p">,</span> <span class="kt">int</span> <span class="n">doit</span><span class="p">,</span> <span class="kt">int</span> <span class="n">trapno</span><span class="p">,</span>
+			  <span class="kt">int</span> <span class="n">fail</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span>
+			  <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">to_kill</span> <span class="o">*</span><span class="n">tk</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span> <span class="p">(</span><span class="n">tk</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="n">to_kill</span><span class="p">,</span> <span class="n">nd</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">doit</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * In case something went wrong with munmapping</span>
+<span class="cm">			 * make sure the process doesn&#39;t catch the</span>
+<span class="cm">			 * signal and then access the memory. Just kill it.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">fail</span> <span class="o">||</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr_valid</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		<span class="s">&quot;MCE %#lx: forcibly killing %s:%d because of failure to unmap corrupted page</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">pfn</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">);</span>
+				<span class="n">force_sig</span><span class="p">(</span><span class="n">SIGKILL</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="p">);</span>
+			<span class="p">}</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * In theory the process could have mapped</span>
+<span class="cm">			 * something else on the address in-between. We could</span>
+<span class="cm">			 * check for that, but we need to tell the</span>
+<span class="cm">			 * process anyways.</span>
+<span class="cm">			 */</span>
+			<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">kill_proc</span><span class="p">(</span><span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">,</span> <span class="n">trapno</span><span class="p">,</span>
+					      <span class="n">pfn</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">flags</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		<span class="s">&quot;MCE %#lx: Cannot send advisory machine check signal to %s:%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">pfn</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">comm</span><span class="p">,</span> <span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">put_task_struct</span><span class="p">(</span><span class="n">tk</span><span class="o">-&gt;</span><span class="n">tsk</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">tk</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">task_early_kill</span><span class="p">(</span><span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">PF_MCE_PROCESS</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">!!</span><span class="p">(</span><span class="n">tsk</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">PF_MCE_EARLY</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">sysctl_memory_failure_early_kill</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Collect processes when the error hit an anonymous page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">collect_procs_anon</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">to_kill</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">to_kill</span> <span class="o">**</span><span class="n">tkc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">anon_vma</span> <span class="o">*</span><span class="n">av</span><span class="p">;</span>
+
+	<span class="n">av</span> <span class="o">=</span> <span class="n">page_lock_anon_vma</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">av</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>	<span class="cm">/* Not actually mapped anymore */</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tasklist_lock</span><span class="p">);</span>
+	<span class="n">for_each_process</span> <span class="p">(</span><span class="n">tsk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">anon_vma_chain</span> <span class="o">*</span><span class="n">vmac</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">task_early_kill</span><span class="p">(</span><span class="n">tsk</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">vmac</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">av</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">,</span> <span class="n">same_anon_vma</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">vma</span> <span class="o">=</span> <span class="n">vmac</span><span class="o">-&gt;</span><span class="n">vma</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page_mapped_in_vma</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">vma</span><span class="p">))</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span> <span class="o">==</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">)</span>
+				<span class="n">add_to_kill</span><span class="p">(</span><span class="n">tsk</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">to_kill</span><span class="p">,</span> <span class="n">tkc</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tasklist_lock</span><span class="p">);</span>
+	<span class="n">page_unlock_anon_vma</span><span class="p">(</span><span class="n">av</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Collect processes when the error hit a file mapped page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">collect_procs_file</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">to_kill</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">to_kill</span> <span class="o">**</span><span class="n">tkc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">tsk</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">prio_tree_iter</span> <span class="n">iter</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap_mutex</span><span class="p">);</span>
+	<span class="n">read_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tasklist_lock</span><span class="p">);</span>
+	<span class="n">for_each_process</span><span class="p">(</span><span class="n">tsk</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pgoff_t</span> <span class="n">pgoff</span> <span class="o">=</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">PAGE_CACHE_SHIFT</span> <span class="o">-</span> <span class="n">PAGE_SHIFT</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">task_early_kill</span><span class="p">(</span><span class="n">tsk</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">vma_prio_tree_foreach</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">iter</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap</span><span class="p">,</span> <span class="n">pgoff</span><span class="p">,</span>
+				      <span class="n">pgoff</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Send early kill signal to tasks where a vma covers</span>
+<span class="cm">			 * the page but the corrupted page is not necessarily</span>
+<span class="cm">			 * mapped it in its pte.</span>
+<span class="cm">			 * Assume applications who requested early kill want</span>
+<span class="cm">			 * to be informed of all such data corruptions.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_mm</span> <span class="o">==</span> <span class="n">tsk</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">)</span>
+				<span class="n">add_to_kill</span><span class="p">(</span><span class="n">tsk</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">vma</span><span class="p">,</span> <span class="n">to_kill</span><span class="p">,</span> <span class="n">tkc</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">read_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tasklist_lock</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">i_mmap_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Collect the processes who have the corrupted page mapped to kill.</span>
+<span class="cm"> * This is done in two steps for locking reasons.</span>
+<span class="cm"> * First preallocate one tokill structure outside the spin locks,</span>
+<span class="cm"> * so that we can kill at least one process reasonably reliable.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">collect_procs</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">tokill</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">to_kill</span> <span class="o">*</span><span class="n">tk</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">tk</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">to_kill</span><span class="p">),</span> <span class="n">GFP_NOIO</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">tk</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageAnon</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="n">collect_procs_anon</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">tokill</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tk</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">collect_procs_file</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">tokill</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tk</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">tk</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Error handlers for various types of pages.</span>
+<span class="cm"> */</span>
+
+<span class="k">enum</span> <span class="n">outcome</span> <span class="p">{</span>
+	<span class="n">IGNORED</span><span class="p">,</span>	<span class="cm">/* Error: cannot be handled */</span>
+	<span class="n">FAILED</span><span class="p">,</span>		<span class="cm">/* Error: handling failed */</span>
+	<span class="n">DELAYED</span><span class="p">,</span>	<span class="cm">/* Will be handled later */</span>
+	<span class="n">RECOVERED</span><span class="p">,</span>	<span class="cm">/* Successfully recovered */</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">action_name</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">[</span><span class="n">IGNORED</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;Ignored&quot;</span><span class="p">,</span>
+	<span class="p">[</span><span class="n">FAILED</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;Failed&quot;</span><span class="p">,</span>
+	<span class="p">[</span><span class="n">DELAYED</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;Delayed&quot;</span><span class="p">,</span>
+	<span class="p">[</span><span class="n">RECOVERED</span><span class="p">]</span> <span class="o">=</span> <span class="s">&quot;Recovered&quot;</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * XXX: It is possible that a page is isolated from LRU cache,</span>
+<span class="cm"> * and then kept in swap cache or failed to remove from page cache.</span>
+<span class="cm"> * The page count will stop it from being freed by unpoison.</span>
+<span class="cm"> * Stress tests should be aware of this memory leak problem.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">delete_from_lru_cache</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">isolate_lru_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Clear sensible page flags, so that the buddy system won&#39;t</span>
+<span class="cm">		 * complain when the page is unpoison-and-freed.</span>
+<span class="cm">		 */</span>
+		<span class="n">ClearPageActive</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+		<span class="n">ClearPageUnevictable</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * drop the page count elevated by isolate_lru_page()</span>
+<span class="cm">		 */</span>
+		<span class="n">page_cache_release</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Error hit kernel page.</span>
+<span class="cm"> * Do nothing, try to be lucky and not touch this instead. For a few cases we</span>
+<span class="cm"> * could be more sophisticated.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_kernel</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">IGNORED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Page in unknown state. Do nothing.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_unknown</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: Unknown page state</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">FAILED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Clean (or cleaned) page cache page.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_pagecache_clean</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="n">FAILED</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+
+	<span class="n">delete_from_lru_cache</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * For anonymous pages we&#39;re done the only reference left</span>
+<span class="cm">	 * should be the one m_f() holds.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageAnon</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">RECOVERED</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now truncate the page in the page cache. This is really</span>
+<span class="cm">	 * more like a &quot;temporary hole punch&quot;</span>
+<span class="cm">	 * Don&#39;t do this for block devices when someone else</span>
+<span class="cm">	 * has a reference, because it could be file system metadata</span>
+<span class="cm">	 * and that&#39;s not safe to truncate.</span>
+<span class="cm">	 */</span>
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">page_mapping</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mapping</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Page has been teared down in the meanwhile</span>
+<span class="cm">		 */</span>
+		<span class="k">return</span> <span class="n">FAILED</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Truncation is a bit tricky. Enable it per file system for now.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Open: to take i_mutex or not for this? Right now we don&#39;t.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">error_remove_page</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">error_remove_page</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;MCE %#lx: Failed to punch page: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+					<span class="n">pfn</span><span class="p">,</span> <span class="n">err</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">page_has_private</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+				<span class="o">!</span><span class="n">try_to_release_page</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">GFP_NOIO</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE %#lx: failed to release buffers</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">RECOVERED</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * If the file system doesn&#39;t support it just invalidate</span>
+<span class="cm">		 * This fails on dirty or anything with private pages</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">invalidate_inode_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">RECOVERED</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;MCE %#lx: Failed to invalidate</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pfn</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Dirty cache page page</span>
+<span class="cm"> * Issues: when the error hit a hole page the error is not properly</span>
+<span class="cm"> * propagated.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_pagecache_dirty</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">page_mapping</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="n">SetPageError</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="cm">/* TBD: print more information about the file. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mapping</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * IO error will be reported by write(), fsync(), etc.</span>
+<span class="cm">		 * who check the mapping.</span>
+<span class="cm">		 * This way the application knows that something went</span>
+<span class="cm">		 * wrong with its dirty file data.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * There&#39;s one open issue:</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * The EIO will be only reported on the next IO</span>
+<span class="cm">		 * operation and then cleared through the IO map.</span>
+<span class="cm">		 * Normally Linux has two mechanisms to pass IO error</span>
+<span class="cm">		 * first through the AS_EIO flag in the address space</span>
+<span class="cm">		 * and then through the PageError flag in the page.</span>
+<span class="cm">		 * Since we drop pages on memory failure handling the</span>
+<span class="cm">		 * only mechanism open to use is through AS_AIO.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * This has the disadvantage that it gets cleared on</span>
+<span class="cm">		 * the first operation that returns an error, while</span>
+<span class="cm">		 * the PageError bit is more sticky and only cleared</span>
+<span class="cm">		 * when the page is reread or dropped.  If an</span>
+<span class="cm">		 * application assumes it will always get error on</span>
+<span class="cm">		 * fsync, but does other operations on the fd before</span>
+<span class="cm">		 * and the page is dropped between then the error</span>
+<span class="cm">		 * will not be properly reported.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * This can already happen even without hwpoisoned</span>
+<span class="cm">		 * pages: first on metadata IO errors (which only</span>
+<span class="cm">		 * report through AS_EIO) or when the page is dropped</span>
+<span class="cm">		 * at the wrong time.</span>
+<span class="cm">		 *</span>
+<span class="cm">		 * So right now we assume that the application DTRT on</span>
+<span class="cm">		 * the first EIO, but we&#39;re not worse than other parts</span>
+<span class="cm">		 * of the kernel.</span>
+<span class="cm">		 */</span>
+		<span class="n">mapping_set_error</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">EIO</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">me_pagecache_clean</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Clean and dirty swap cache.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Dirty swap cache page is tricky to handle. The page could live both in page</span>
+<span class="cm"> * cache and swap cache(ie. page is freshly swapped in). So it could be</span>
+<span class="cm"> * referenced concurrently by 2 types of PTEs:</span>
+<span class="cm"> * normal PTEs and swap PTEs. We try to handle them consistently by calling</span>
+<span class="cm"> * try_to_unmap(TTU_IGNORE_HWPOISON) to convert the normal PTEs to swap PTEs,</span>
+<span class="cm"> * and then</span>
+<span class="cm"> *      - clear dirty bit to prevent IO</span>
+<span class="cm"> *      - remove from LRU</span>
+<span class="cm"> *      - but keep in the swap cache, so that when we return to it on</span>
+<span class="cm"> *        a later page fault, we know the application is accessing</span>
+<span class="cm"> *        corrupted data and shall be killed (we installed simple</span>
+<span class="cm"> *        interception code in do_swap_page to catch it).</span>
+<span class="cm"> *</span>
+<span class="cm"> * Clean swap cache pages can be directly isolated. A later page fault will</span>
+<span class="cm"> * bring in the known good data from disk.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_swapcache_dirty</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ClearPageDirty</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="cm">/* Trigger EIO in shmem: */</span>
+	<span class="n">ClearPageUptodate</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delete_from_lru_cache</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">DELAYED</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="n">FAILED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_swapcache_clean</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">delete_from_swap_cache</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delete_from_lru_cache</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">RECOVERED</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="n">FAILED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Huge pages. Needs work.</span>
+<span class="cm"> * Issues:</span>
+<span class="cm"> * - Error on hugepage is contained in hugepage unit (not in raw page unit.)</span>
+<span class="cm"> *   To narrow down kill region to one page, we need to break up pmd.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">me_huge_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">res</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span> <span class="o">=</span> <span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * We can safely recover from error on free or reserved (i.e.</span>
+<span class="cm">	 * not in-use) hugepage by dequeuing it from freelist.</span>
+<span class="cm">	 * To check whether a hugepage is in-use or not, we can&#39;t use</span>
+<span class="cm">	 * page-&gt;lru because it can be used in other hugepage operations,</span>
+<span class="cm">	 * such as __unmap_hugepage_range() and gather_surplus_pages().</span>
+<span class="cm">	 * So instead we use page_mapping() and PageAnon().</span>
+<span class="cm">	 * We assume that this function is called with page lock held,</span>
+<span class="cm">	 * so there is no race between isolation and mapping/unmapping.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">page_mapping</span><span class="p">(</span><span class="n">hpage</span><span class="p">)</span> <span class="o">||</span> <span class="n">PageAnon</span><span class="p">(</span><span class="n">hpage</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">res</span> <span class="o">=</span> <span class="n">dequeue_hwpoisoned_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">RECOVERED</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">DELAYED</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Various page states we can handle.</span>
+<span class="cm"> *</span>
+<span class="cm"> * A page state is defined by its current page-&gt;flags bits.</span>
+<span class="cm"> * The table matches them in order and calls the right handler.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is quite tricky because we can access page at any time</span>
+<span class="cm"> * in its live cycle, so all accesses have to be extremely careful.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is not complete. More states could be added.</span>
+<span class="cm"> * For any missing state don&#39;t attempt recovery.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define dirty		(1UL &lt;&lt; PG_dirty)</span>
+<span class="cp">#define sc		(1UL &lt;&lt; PG_swapcache)</span>
+<span class="cp">#define unevict		(1UL &lt;&lt; PG_unevictable)</span>
+<span class="cp">#define mlock		(1UL &lt;&lt; PG_mlocked)</span>
+<span class="cp">#define writeback	(1UL &lt;&lt; PG_writeback)</span>
+<span class="cp">#define lru		(1UL &lt;&lt; PG_lru)</span>
+<span class="cp">#define swapbacked	(1UL &lt;&lt; PG_swapbacked)</span>
+<span class="cp">#define head		(1UL &lt;&lt; PG_head)</span>
+<span class="cp">#define tail		(1UL &lt;&lt; PG_tail)</span>
+<span class="cp">#define compound	(1UL &lt;&lt; PG_compound)</span>
+<span class="cp">#define slab		(1UL &lt;&lt; PG_slab)</span>
+<span class="cp">#define reserved	(1UL &lt;&lt; PG_reserved)</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">page_state</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">res</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">msg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">action</span><span class="p">)(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">);</span>
+<span class="p">}</span> <span class="n">error_states</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">{</span> <span class="n">reserved</span><span class="p">,</span>	<span class="n">reserved</span><span class="p">,</span>	<span class="s">&quot;reserved kernel&quot;</span><span class="p">,</span>	<span class="n">me_kernel</span> <span class="p">},</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * free pages are specially detected outside this table:</span>
+<span class="cm">	 * PG_buddy pages only make a small fraction of all free pages.</span>
+<span class="cm">	 */</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Could in theory check if slab page is free or if we can drop</span>
+<span class="cm">	 * currently unused objects without touching them. But just</span>
+<span class="cm">	 * treat it as standard kernel for now.</span>
+<span class="cm">	 */</span>
+	<span class="p">{</span> <span class="n">slab</span><span class="p">,</span>		<span class="n">slab</span><span class="p">,</span>		<span class="s">&quot;kernel slab&quot;</span><span class="p">,</span>	<span class="n">me_kernel</span> <span class="p">},</span>
+
+<span class="cp">#ifdef CONFIG_PAGEFLAGS_EXTENDED</span>
+	<span class="p">{</span> <span class="n">head</span><span class="p">,</span>		<span class="n">head</span><span class="p">,</span>		<span class="s">&quot;huge&quot;</span><span class="p">,</span>		<span class="n">me_huge_page</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="n">tail</span><span class="p">,</span>		<span class="n">tail</span><span class="p">,</span>		<span class="s">&quot;huge&quot;</span><span class="p">,</span>		<span class="n">me_huge_page</span> <span class="p">},</span>
+<span class="cp">#else</span>
+	<span class="p">{</span> <span class="n">compound</span><span class="p">,</span>	<span class="n">compound</span><span class="p">,</span>	<span class="s">&quot;huge&quot;</span><span class="p">,</span>		<span class="n">me_huge_page</span> <span class="p">},</span>
+<span class="cp">#endif</span>
+
+	<span class="p">{</span> <span class="n">sc</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="n">sc</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="s">&quot;swapcache&quot;</span><span class="p">,</span>	<span class="n">me_swapcache_dirty</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="n">sc</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="n">sc</span><span class="p">,</span>		<span class="s">&quot;swapcache&quot;</span><span class="p">,</span>	<span class="n">me_swapcache_clean</span> <span class="p">},</span>
+
+	<span class="p">{</span> <span class="n">unevict</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span> <span class="n">unevict</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="s">&quot;unevictable LRU&quot;</span><span class="p">,</span> <span class="n">me_pagecache_dirty</span><span class="p">},</span>
+	<span class="p">{</span> <span class="n">unevict</span><span class="p">,</span>	<span class="n">unevict</span><span class="p">,</span>	<span class="s">&quot;unevictable LRU&quot;</span><span class="p">,</span> <span class="n">me_pagecache_clean</span><span class="p">},</span>
+
+	<span class="p">{</span> <span class="n">mlock</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="n">mlock</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="s">&quot;mlocked LRU&quot;</span><span class="p">,</span>	<span class="n">me_pagecache_dirty</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="n">mlock</span><span class="p">,</span>	<span class="n">mlock</span><span class="p">,</span>		<span class="s">&quot;mlocked LRU&quot;</span><span class="p">,</span>	<span class="n">me_pagecache_clean</span> <span class="p">},</span>
+
+	<span class="p">{</span> <span class="n">lru</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="n">lru</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="s">&quot;LRU&quot;</span><span class="p">,</span>		<span class="n">me_pagecache_dirty</span> <span class="p">},</span>
+	<span class="p">{</span> <span class="n">lru</span><span class="o">|</span><span class="n">dirty</span><span class="p">,</span>	<span class="n">lru</span><span class="p">,</span>		<span class="s">&quot;clean LRU&quot;</span><span class="p">,</span>	<span class="n">me_pagecache_clean</span> <span class="p">},</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Catchall entry: must be at end.</span>
+<span class="cm">	 */</span>
+	<span class="p">{</span> <span class="mi">0</span><span class="p">,</span>		<span class="mi">0</span><span class="p">,</span>		<span class="s">&quot;unknown page state&quot;</span><span class="p">,</span>	<span class="n">me_unknown</span> <span class="p">},</span>
+<span class="p">};</span>
+
+<span class="cp">#undef dirty</span>
+<span class="cp">#undef sc</span>
+<span class="cp">#undef unevict</span>
+<span class="cp">#undef mlock</span>
+<span class="cp">#undef writeback</span>
+<span class="cp">#undef lru</span>
+<span class="cp">#undef swapbacked</span>
+<span class="cp">#undef head</span>
+<span class="cp">#undef tail</span>
+<span class="cp">#undef compound</span>
+<span class="cp">#undef slab</span>
+<span class="cp">#undef reserved</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">action_result</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">msg</span><span class="p">,</span> <span class="kt">int</span> <span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">pfn_to_page</span><span class="p">(</span><span class="n">pfn</span><span class="p">);</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: %s%s page recovery: %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">pfn</span><span class="p">,</span>
+		<span class="n">PageDirty</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">?</span> <span class="s">&quot;dirty &quot;</span> <span class="o">:</span> <span class="s">&quot;&quot;</span><span class="p">,</span>
+		<span class="n">msg</span><span class="p">,</span> <span class="n">action_name</span><span class="p">[</span><span class="n">result</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">page_action</span><span class="p">(</span><span class="k">struct</span> <span class="n">page_state</span> <span class="o">*</span><span class="n">ps</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">action</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+	<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">msg</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+
+	<span class="n">count</span> <span class="o">=</span> <span class="n">page_count</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ps</span><span class="o">-&gt;</span><span class="n">action</span> <span class="o">==</span> <span class="n">me_swapcache_dirty</span> <span class="o">&amp;&amp;</span> <span class="n">result</span> <span class="o">==</span> <span class="n">DELAYED</span><span class="p">)</span>
+		<span class="n">count</span><span class="o">--</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		       <span class="s">&quot;MCE %#lx: %s page still referenced by %d users</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">pfn</span><span class="p">,</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">msg</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+		<span class="n">result</span> <span class="o">=</span> <span class="n">FAILED</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Could do more checks here if page looks ok */</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Could adjust zone counters here to correct for the missing page.</span>
+<span class="cm">	 */</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">result</span> <span class="o">==</span> <span class="n">RECOVERED</span> <span class="o">||</span> <span class="n">result</span> <span class="o">==</span> <span class="n">DELAYED</span><span class="p">)</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Do all that is necessary to remove user space mappings. Unmap</span>
+<span class="cm"> * the pages and send SIGBUS to the processes if the data was dirty.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">hwpoison_user_mappings</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span>
+				  <span class="kt">int</span> <span class="n">trapno</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">enum</span> <span class="n">ttu_flags</span> <span class="n">ttu</span> <span class="o">=</span> <span class="n">TTU_UNMAP</span> <span class="o">|</span> <span class="n">TTU_IGNORE_MLOCK</span> <span class="o">|</span> <span class="n">TTU_IGNORE_ACCESS</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">tokill</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">kill</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span> <span class="o">=</span> <span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">ppage</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageReserved</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">||</span> <span class="n">PageSlab</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">SWAP_SUCCESS</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * This check implies we don&#39;t kill processes if their pages</span>
+<span class="cm">	 * are in the swap cache early. Those are always late kills.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page_mapped</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">SWAP_SUCCESS</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageKsm</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">SWAP_FAIL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageSwapCache</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		       <span class="s">&quot;MCE %#lx: keeping poisoned page in swap cache</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="n">ttu</span> <span class="o">|=</span> <span class="n">TTU_IGNORE_HWPOISON</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Propagate the dirty bit from PTEs to struct page first, because we</span>
+<span class="cm">	 * need this to decide if we should kill or just drop the page.</span>
+<span class="cm">	 * XXX: the dirty test could be racy: set_page_dirty() may not always</span>
+<span class="cm">	 * be called inside page lock (it&#39;s recommended but not enforced).</span>
+<span class="cm">	 */</span>
+	<span class="n">mapping</span> <span class="o">=</span> <span class="n">page_mapping</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">hpage</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">mapping</span> <span class="o">&amp;&amp;</span>
+	    <span class="n">mapping_cap_writeback_dirty</span><span class="p">(</span><span class="n">mapping</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">page_mkclean</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">SetPageDirty</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">kill</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">ttu</span> <span class="o">|=</span> <span class="n">TTU_IGNORE_HWPOISON</span><span class="p">;</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span>
+	<span class="s">&quot;MCE %#lx: corrupted page was clean: dropped without side effects</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pfn</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * ppage: poisoned page</span>
+<span class="cm">	 *   if p is regular page(4k page)</span>
+<span class="cm">	 *        ppage == real poisoned page;</span>
+<span class="cm">	 *   else p is hugetlb or THP, ppage == head page.</span>
+<span class="cm">	 */</span>
+	<span class="n">ppage</span> <span class="o">=</span> <span class="n">hpage</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageTransHuge</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Verify that this isn&#39;t a hugetlbfs head page, the check for</span>
+<span class="cm">		 * PageAnon is just for avoid tripping a split_huge_page</span>
+<span class="cm">		 * internal debug check, as split_huge_page refuses to deal with</span>
+<span class="cm">		 * anything that isn&#39;t an anon page. PageAnon can&#39;t go away fro</span>
+<span class="cm">		 * under us because we hold a refcount on the hpage, without a</span>
+<span class="cm">		 * refcount on the hpage. split_huge_page can&#39;t be safely called</span>
+<span class="cm">		 * in the first place, having a refcount on the tail isn&#39;t</span>
+<span class="cm">		 * enough * to be safe.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">hpage</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">PageAnon</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">split_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">)))</span> <span class="p">{</span>
+				<span class="cm">/*</span>
+<span class="cm">				 * FIXME: if splitting THP is failed, it is</span>
+<span class="cm">				 * better to stop the following operation rather</span>
+<span class="cm">				 * than causing panic by unmapping. System might</span>
+<span class="cm">				 * survive if the page is freed later.</span>
+<span class="cm">				 */</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span>
+					<span class="s">&quot;MCE %#lx: failed to split THP</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+
+				<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">));</span>
+				<span class="k">return</span> <span class="n">SWAP_FAIL</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="cm">/* THP is split, so ppage should be the real poisoned page. */</span>
+			<span class="n">ppage</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * First collect all the processes that have the page</span>
+<span class="cm">	 * mapped in dirty form.  This has to be done before try_to_unmap,</span>
+<span class="cm">	 * because ttu takes the rmap data structures down.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * Error handling: We ignore errors here because</span>
+<span class="cm">	 * there&#39;s nothing that can be done.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">kill</span><span class="p">)</span>
+		<span class="n">collect_procs</span><span class="p">(</span><span class="n">ppage</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tokill</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hpage</span> <span class="o">!=</span> <span class="n">ppage</span><span class="p">)</span>
+		<span class="n">lock_page</span><span class="p">(</span><span class="n">ppage</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">try_to_unmap</span><span class="p">(</span><span class="n">ppage</span><span class="p">,</span> <span class="n">ttu</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="n">SWAP_SUCCESS</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: failed to unmap page (mapcount=%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pfn</span><span class="p">,</span> <span class="n">page_mapcount</span><span class="p">(</span><span class="n">ppage</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hpage</span> <span class="o">!=</span> <span class="n">ppage</span><span class="p">)</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">ppage</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now that the dirty bit has been propagated to the</span>
+<span class="cm">	 * struct page and all unmaps done we can decide if</span>
+<span class="cm">	 * killing is needed or not.  Only kill when the page</span>
+<span class="cm">	 * was dirty, otherwise the tokill list is merely</span>
+<span class="cm">	 * freed.  When there was a problem unmapping earlier</span>
+<span class="cm">	 * use a more force-full uncatchable kill to prevent</span>
+<span class="cm">	 * any accesses to the poisoned memory.</span>
+<span class="cm">	 */</span>
+	<span class="n">kill_procs</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tokill</span><span class="p">,</span> <span class="o">!!</span><span class="n">PageDirty</span><span class="p">(</span><span class="n">ppage</span><span class="p">),</span> <span class="n">trapno</span><span class="p">,</span>
+		      <span class="n">ret</span> <span class="o">!=</span> <span class="n">SWAP_SUCCESS</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">set_page_hwpoison_huge_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nr_pages</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nr_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">SetPageHWPoison</span><span class="p">(</span><span class="n">hpage</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">clear_page_hwpoison_huge_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">nr_pages</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nr_pages</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">ClearPageHWPoison</span><span class="p">(</span><span class="n">hpage</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * memory_failure - Handle memory failure of a page.</span>
+<span class="cm"> * @pfn: Page Number of the corrupted page</span>
+<span class="cm"> * @trapno: Trap number reported in the signal to user space.</span>
+<span class="cm"> * @flags: fine tune action taken</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function is called by the low level machine check code</span>
+<span class="cm"> * of an architecture when it detects hardware memory corruption</span>
+<span class="cm"> * of a page. It tries its best to recover, which includes</span>
+<span class="cm"> * dropping pages, killing processes etc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The function is primarily of use for corruptions that</span>
+<span class="cm"> * happen outside the current execution context (e.g. when</span>
+<span class="cm"> * detected by a background scrubber)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Must run in process context (e.g. a work queue) with interrupts</span>
+<span class="cm"> * enabled and no spinlocks hold.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">memory_failure</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="kt">int</span> <span class="n">trapno</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page_state</span> <span class="o">*</span><span class="n">ps</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">res</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_pages</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">sysctl_memory_failure_recovery</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Memory failure from trap %d on page %lx&quot;</span><span class="p">,</span> <span class="n">trapno</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pfn_valid</span><span class="p">(</span><span class="n">pfn</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span>
+		       <span class="s">&quot;MCE %#lx: memory outside kernel control</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">pfn_to_page</span><span class="p">(</span><span class="n">pfn</span><span class="p">);</span>
+	<span class="n">hpage</span> <span class="o">=</span> <span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">TestSetPageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: already hardware poisoned</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">nr_pages</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="n">atomic_long_add</span><span class="p">(</span><span class="n">nr_pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We need/can do nothing about count=0 pages.</span>
+<span class="cm">	 * 1) it&#39;s a free page, and therefore in safe hand:</span>
+<span class="cm">	 *    prep_new_page() will be the gate keeper.</span>
+<span class="cm">	 * 2) it&#39;s a free hugepage, which is also safe:</span>
+<span class="cm">	 *    an affected hugepage will be dequeued from hugepage freelist,</span>
+<span class="cm">	 *    so there&#39;s no concern about reusing it ever after.</span>
+<span class="cm">	 * 3) it&#39;s part of a non-compound high order page.</span>
+<span class="cm">	 *    Implies some kernel user: cannot stop them from</span>
+<span class="cm">	 *    R/W the page; let&#39;s pray that the page has been</span>
+<span class="cm">	 *    used and will be freed some time later.</span>
+<span class="cm">	 * In fact it&#39;s dangerous to directly bump up page count from 0,</span>
+<span class="cm">	 * that may make page_freeze_refs()/page_unfreeze_refs() mismatch.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">MF_COUNT_INCREASED</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		<span class="o">!</span><span class="n">get_page_unless_zero</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_free_buddy_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;free buddy&quot;</span><span class="p">,</span> <span class="n">DELAYED</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * Check &quot;just unpoisoned&quot;, &quot;filter hit&quot;, and</span>
+<span class="cm">			 * &quot;race with other subpage.&quot;</span>
+<span class="cm">			 */</span>
+			<span class="n">lock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">hpage</span><span class="p">)</span>
+			    <span class="o">||</span> <span class="p">(</span><span class="n">hwpoison_filter</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">TestClearPageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			    <span class="o">||</span> <span class="p">(</span><span class="n">p</span> <span class="o">!=</span> <span class="n">hpage</span> <span class="o">&amp;&amp;</span> <span class="n">TestSetPageHWPoison</span><span class="p">(</span><span class="n">hpage</span><span class="p">)))</span> <span class="p">{</span>
+				<span class="n">atomic_long_sub</span><span class="p">(</span><span class="n">nr_pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+				<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">set_page_hwpoison_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+			<span class="n">res</span> <span class="o">=</span> <span class="n">dequeue_hwpoisoned_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+			<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;free huge&quot;</span><span class="p">,</span>
+				      <span class="n">res</span> <span class="o">?</span> <span class="n">IGNORED</span> <span class="o">:</span> <span class="n">DELAYED</span><span class="p">);</span>
+			<span class="n">unlock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">res</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;high order kernel&quot;</span><span class="p">,</span> <span class="n">IGNORED</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * We ignore non-LRU pages for good reasons.</span>
+<span class="cm">	 * - PG_locked is only well defined for LRU pages and a few others</span>
+<span class="cm">	 * - to avoid races with __set_page_locked()</span>
+<span class="cm">	 * - to avoid races with __SetPageSlab*() (and more non-atomic ops)</span>
+<span class="cm">	 * The check (unnecessarily) ignores LRU pages being isolated and</span>
+<span class="cm">	 * walked by the page reclaim code, however that&#39;s not a big loss.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">PageTransTail</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="n">shake_page</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="cm">/*</span>
+<span class="cm">			 * shake_page could have turned it free.</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">is_free_buddy_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;free buddy, 2nd try&quot;</span><span class="p">,</span>
+						<span class="n">DELAYED</span><span class="p">);</span>
+				<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;non LRU&quot;</span><span class="p">,</span> <span class="n">IGNORED</span><span class="p">);</span>
+			<span class="n">put_page</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Lock the page and wait for writeback to finish.</span>
+<span class="cm">	 * It&#39;s very difficult to mess with pages currently under IO</span>
+<span class="cm">	 * and in many cases impossible, so we just avoid it here.</span>
+<span class="cm">	 */</span>
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * unpoison always clear PG_hwpoison inside page lock</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: just unpoisoned</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="n">res</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_filter</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">TestClearPageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="n">atomic_long_sub</span><span class="p">(</span><span class="n">nr_pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * For error on the tail page, we should set PG_hwpoison</span>
+<span class="cm">	 * on the head page to show that the hugepage is hwpoisoned</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">PageTail</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">TestSetPageHWPoison</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;hugepage already hardware poisoned&quot;</span><span class="p">,</span>
+				<span class="n">IGNORED</span><span class="p">);</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Set PG_hwpoison on all pages in an error hugepage,</span>
+<span class="cm">	 * because containment is done in hugepage unit for now.</span>
+<span class="cm">	 * Since we have done TestSetPageHWPoison() for the head page with</span>
+<span class="cm">	 * page lock held, we can safely set PG_hwpoison bits on tail pages.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="n">set_page_hwpoison_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+
+	<span class="n">wait_on_page_writeback</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now take care of user space mappings.</span>
+<span class="cm">	 * Abort on fail: __delete_from_page_cache() assumes unmapped page.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwpoison_user_mappings</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">trapno</span><span class="p">,</span> <span class="n">flags</span><span class="p">)</span> <span class="o">!=</span> <span class="n">SWAP_SUCCESS</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;MCE %#lx: cannot unmap page, give up</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="n">res</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Torn down by someone else?</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">PageSwapCache</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">action_result</span><span class="p">(</span><span class="n">pfn</span><span class="p">,</span> <span class="s">&quot;already truncated LRU&quot;</span><span class="p">,</span> <span class="n">IGNORED</span><span class="p">);</span>
+		<span class="n">res</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">res</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">ps</span> <span class="o">=</span> <span class="n">error_states</span><span class="p">;;</span> <span class="n">ps</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">mask</span><span class="p">)</span> <span class="o">==</span> <span class="n">ps</span><span class="o">-&gt;</span><span class="n">res</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">res</span> <span class="o">=</span> <span class="n">page_action</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">res</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">memory_failure</span><span class="p">);</span>
+
+<span class="cp">#define MEMORY_FAILURE_FIFO_ORDER	4</span>
+<span class="cp">#define MEMORY_FAILURE_FIFO_SIZE	(1 &lt;&lt; MEMORY_FAILURE_FIFO_ORDER)</span>
+
+<span class="k">struct</span> <span class="n">memory_failure_entry</span> <span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">trapno</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">memory_failure_cpu</span> <span class="p">{</span>
+	<span class="n">DECLARE_KFIFO</span><span class="p">(</span><span class="n">fifo</span><span class="p">,</span> <span class="k">struct</span> <span class="n">memory_failure_entry</span><span class="p">,</span>
+		      <span class="n">MEMORY_FAILURE_FIFO_SIZE</span><span class="p">);</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">work_struct</span> <span class="n">work</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="n">DEFINE_PER_CPU</span><span class="p">(</span><span class="k">struct</span> <span class="n">memory_failure_cpu</span><span class="p">,</span> <span class="n">memory_failure_cpu</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * memory_failure_queue - Schedule handling memory failure of a page.</span>
+<span class="cm"> * @pfn: Page Number of the corrupted page</span>
+<span class="cm"> * @trapno: Trap number reported in the signal to user space.</span>
+<span class="cm"> * @flags: Flags for memory failure handling</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function is called by the low level hardware error handler</span>
+<span class="cm"> * when it detects hardware memory corruption of a page. It schedules</span>
+<span class="cm"> * the recovering of error page, including dropping pages, killing</span>
+<span class="cm"> * processes etc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The function is primarily of use for corruptions that</span>
+<span class="cm"> * happen outside the current execution context (e.g. when</span>
+<span class="cm"> * detected by a background scrubber)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Can run in IRQ context.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">memory_failure_queue</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="kt">int</span> <span class="n">trapno</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">memory_failure_cpu</span> <span class="o">*</span><span class="n">mf_cpu</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">proc_flags</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">memory_failure_entry</span> <span class="n">entry</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">pfn</span> <span class="o">=</span>		<span class="n">pfn</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">trapno</span> <span class="o">=</span>	<span class="n">trapno</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">flags</span> <span class="o">=</span>	<span class="n">flags</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="n">mf_cpu</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">get_cpu_var</span><span class="p">(</span><span class="n">memory_failure_cpu</span><span class="p">);</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">proc_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">kfifo_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">fifo</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">entry</span><span class="p">))</span>
+		<span class="n">schedule_work_on</span><span class="p">(</span><span class="n">smp_processor_id</span><span class="p">(),</span> <span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;Memory failure: buffer overflow when queuing memory failure at 0x%#lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">pfn</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">proc_flags</span><span class="p">);</span>
+	<span class="n">put_cpu_var</span><span class="p">(</span><span class="n">memory_failure_cpu</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">memory_failure_queue</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">memory_failure_work_func</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">memory_failure_cpu</span> <span class="o">*</span><span class="n">mf_cpu</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">memory_failure_entry</span> <span class="n">entry</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span><span class="p">,</span> <span class="p">};</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">proc_flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">gotten</span><span class="p">;</span>
+
+	<span class="n">mf_cpu</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">__get_cpu_var</span><span class="p">(</span><span class="n">memory_failure_cpu</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">proc_flags</span><span class="p">);</span>
+		<span class="n">gotten</span> <span class="o">=</span> <span class="n">kfifo_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">fifo</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">entry</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">proc_flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gotten</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">memory_failure</span><span class="p">(</span><span class="n">entry</span><span class="p">.</span><span class="n">pfn</span><span class="p">,</span> <span class="n">entry</span><span class="p">.</span><span class="n">trapno</span><span class="p">,</span> <span class="n">entry</span><span class="p">.</span><span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">memory_failure_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">memory_failure_cpu</span> <span class="o">*</span><span class="n">mf_cpu</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cpu</span><span class="p">;</span>
+
+	<span class="n">for_each_possible_cpu</span><span class="p">(</span><span class="n">cpu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mf_cpu</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">per_cpu</span><span class="p">(</span><span class="n">memory_failure_cpu</span><span class="p">,</span> <span class="n">cpu</span><span class="p">);</span>
+		<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">INIT_KFIFO</span><span class="p">(</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">fifo</span><span class="p">);</span>
+		<span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mf_cpu</span><span class="o">-&gt;</span><span class="n">work</span><span class="p">,</span> <span class="n">memory_failure_work_func</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">core_initcall</span><span class="p">(</span><span class="n">memory_failure_init</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * unpoison_memory - Unpoison a previously poisoned page</span>
+<span class="cm"> * @pfn: Page number of the to be unpoisoned page</span>
+<span class="cm"> *</span>
+<span class="cm"> * Software-unpoison a page that has been poisoned by</span>
+<span class="cm"> * memory_failure() earlier.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is only done on the software-level, so it only works</span>
+<span class="cm"> * for linux injected failures, not real hardware failures</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 for success, otherwise -errno.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">unpoison_memory</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">freeit</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nr_pages</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pfn_valid</span><span class="p">(</span><span class="n">pfn</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENXIO</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">pfn_to_page</span><span class="p">(</span><span class="n">pfn</span><span class="p">);</span>
+	<span class="n">page</span> <span class="o">=</span> <span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE: Page was already unpoisoned %#lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">nr_pages</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">get_page_unless_zero</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Since HWPoisoned hugepage should have non-zero refcount,</span>
+<span class="cm">		 * race between memory failure and unpoison seems to happen.</span>
+<span class="cm">		 * In such case unpoison fails and memory failure runs</span>
+<span class="cm">		 * to the end.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE: Memory failure is now running on free hugepage %#lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">TestClearPageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+			<span class="n">atomic_long_sub</span><span class="p">(</span><span class="n">nr_pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE: Software-unpoisoned free page %#lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * This test is racy because PG_hwpoison is set outside of page lock.</span>
+<span class="cm">	 * That&#39;s acceptable because that won&#39;t trigger kernel panic. Instead,</span>
+<span class="cm">	 * the PG_hwpoison page will be caught and isolated on the entrance to</span>
+<span class="cm">	 * the free buddy page pool.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">TestClearPageHWPoison</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;MCE: Software-unpoisoned page %#lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="n">atomic_long_sub</span><span class="p">(</span><span class="n">nr_pages</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+		<span class="n">freeit</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+			<span class="n">clear_page_hwpoison_huge_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">freeit</span><span class="p">)</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">unpoison_memory</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="nf">new_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">private</span><span class="p">,</span> <span class="kt">int</span> <span class="o">**</span><span class="n">x</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">nid</span> <span class="o">=</span> <span class="n">page_to_nid</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">alloc_huge_page_node</span><span class="p">(</span><span class="n">page_hstate</span><span class="p">(</span><span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">)),</span>
+						   <span class="n">nid</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="k">return</span> <span class="n">alloc_pages_exact_node</span><span class="p">(</span><span class="n">nid</span><span class="p">,</span> <span class="n">GFP_HIGHUSER_MOVABLE</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Safely get reference count of an arbitrary page.</span>
+<span class="cm"> * Returns 0 for a free page, -EIO for a zero refcount page</span>
+<span class="cm"> * that is not free, and 1 for any other page type.</span>
+<span class="cm"> * For 1 the page is returned with increased page count, otherwise not.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">get_any_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">MF_COUNT_INCREASED</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The lock_memory_hotplug prevents a race with memory hotplug.</span>
+<span class="cm">	 * This is a big hammer, a better would be nicer.</span>
+<span class="cm">	 */</span>
+	<span class="n">lock_memory_hotplug</span><span class="p">();</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Isolate the page, so that it doesn&#39;t get reallocated if it</span>
+<span class="cm">	 * was free.</span>
+<span class="cm">	 */</span>
+	<span class="n">set_migratetype_isolate</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * When the target page is a free hugepage, just remove it</span>
+<span class="cm">	 * from free hugepage list.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">get_page_unless_zero</span><span class="p">(</span><span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;%s: %#lx free huge page</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">dequeue_hwpoisoned_huge_page</span><span class="p">(</span><span class="n">compound_head</span><span class="p">(</span><span class="n">p</span><span class="p">));</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">is_free_buddy_page</span><span class="p">(</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;%s: %#lx free buddy page</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+			<span class="cm">/* Set hwpoison bit while page is still isolated */</span>
+			<span class="n">SetPageHWPoison</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;%s: %#lx: unknown zero refcount page type %lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">__func__</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Not a free page */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">unset_migratetype_isolate</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">MIGRATE_MOVABLE</span><span class="p">);</span>
+	<span class="n">unlock_memory_hotplug</span><span class="p">();</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">soft_offline_huge_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span> <span class="o">=</span> <span class="n">page_to_pfn</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">hpage</span> <span class="o">=</span> <span class="n">compound_head</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">pagelist</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">get_any_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft offline: %#lx hugepage already poisoned</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Keep page count to indicate a given hugepage is isolated. */</span>
+
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hpage</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pagelist</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">migrate_huge_pages</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pagelist</span><span class="p">,</span> <span class="n">new_page</span><span class="p">,</span> <span class="n">MPOL_MF_MOVE_ALL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+				<span class="nb">true</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page1</span><span class="p">,</span> <span class="o">*</span><span class="n">page2</span><span class="p">;</span>
+		<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">page1</span><span class="p">,</span> <span class="n">page2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pagelist</span><span class="p">,</span> <span class="n">lru</span><span class="p">)</span>
+			<span class="n">put_page</span><span class="p">(</span><span class="n">page1</span><span class="p">);</span>
+
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft offline: %#lx: migration failed %d, type %lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">pfn</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="nl">done:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">hpage</span><span class="p">))</span>
+		<span class="n">atomic_long_add</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">compound_trans_order</span><span class="p">(</span><span class="n">hpage</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+	<span class="n">set_page_hwpoison_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="n">dequeue_hwpoisoned_huge_page</span><span class="p">(</span><span class="n">hpage</span><span class="p">);</span>
+	<span class="cm">/* keep elevated page count for bad page */</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * soft_offline_page - Soft offline a page.</span>
+<span class="cm"> * @page: page to offline</span>
+<span class="cm"> * @flags: flags. Same as memory_failure().</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns 0 on success, otherwise negated errno.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Soft offline a page, by migration or invalidation,</span>
+<span class="cm"> * without killing anything. This is for the case when</span>
+<span class="cm"> * a page is not corrupted yet (so it&#39;s still valid to access),</span>
+<span class="cm"> * but has had a number of corrected errors and is better taken</span>
+<span class="cm"> * out.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The actual policy on when to do that is maintained by</span>
+<span class="cm"> * user space.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This should never impact any application or cause data loss,</span>
+<span class="cm"> * however it might take some time.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This is not a 100% solution for all memory, but tries to be</span>
+<span class="cm"> * ``good enough&#39;&#39; for the majority of memory.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">soft_offline_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span> <span class="o">=</span> <span class="n">page_to_pfn</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHuge</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">soft_offline_huge_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">get_any_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Page cache page we can handle?</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Try to free it.</span>
+<span class="cm">		 */</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">shake_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * Did it turn free?</span>
+<span class="cm">		 */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">get_any_page</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">pfn</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">PageLRU</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft_offline: %#lx: unknown non LRU page type %lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">pfn</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">lock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">wait_on_page_writeback</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Synchronized using the page lock with memory_failure()</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHWPoison</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft offline: %#lx page already poisoned</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Try to invalidate first. This should work for</span>
+<span class="cm">	 * non dirty unmapped page cache pages.</span>
+<span class="cm">	 */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">invalidate_inode_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * RED-PEN would be better to keep it isolated here, but we</span>
+<span class="cm">	 * would need to fix isolation locking first.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft_offline: %#lx: invalidated</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">pfn</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">done</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Simple invalidation didn&#39;t work.</span>
+<span class="cm">	 * Try to migrate to a new page instead. migrate.c</span>
+<span class="cm">	 * handles a large number of cases for us.</span>
+<span class="cm">	 */</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">isolate_lru_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Drop page reference which is came from get_any_page()</span>
+<span class="cm">	 * successful isolate_lru_page() already took another one.</span>
+<span class="cm">	 */</span>
+	<span class="n">put_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">pagelist</span><span class="p">);</span>
+		<span class="n">inc_zone_page_state</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">NR_ISOLATED_ANON</span> <span class="o">+</span>
+					    <span class="n">page_is_file_cache</span><span class="p">(</span><span class="n">page</span><span class="p">));</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pagelist</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">migrate_pages</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pagelist</span><span class="p">,</span> <span class="n">new_page</span><span class="p">,</span> <span class="n">MPOL_MF_MOVE_ALL</span><span class="p">,</span>
+							<span class="mi">0</span><span class="p">,</span> <span class="n">MIGRATE_SYNC</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">putback_lru_pages</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pagelist</span><span class="p">);</span>
+			<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft offline: %#lx: migration failed %d, type %lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">pfn</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EIO</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">pr_info</span><span class="p">(</span><span class="s">&quot;soft offline: %#lx: isolation failed: %d, page count %d, type %lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">pfn</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span> <span class="n">page_count</span><span class="p">(</span><span class="n">page</span><span class="p">),</span> <span class="n">page</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+
+<span class="nl">done:</span>
+	<span class="n">atomic_long_add</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">mce_bad_pages</span><span class="p">);</span>
+	<span class="n">SetPageHWPoison</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="cm">/* keep elevated page count for bad page */</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

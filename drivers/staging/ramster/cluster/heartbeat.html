@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › staging › ramster › cluster › heartbeat.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../../index.html"></a><h1>heartbeat.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/* -*- mode: c; c-basic-offset: 8; -*-</span>
+<span class="cm"> * vim: noexpandtab sw=8 ts=8 sts=0:</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2004, 2005, 2012 Oracle.  All rights reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public</span>
+<span class="cm"> * License as published by the Free Software Foundation; either</span>
+<span class="cm"> * version 2 of the License, or (at your option) any later version.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</span>
+<span class="cm"> * General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public</span>
+<span class="cm"> * License along with this program; if not, write to the</span>
+<span class="cm"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330,</span>
+<span class="cm"> * Boston, MA 021110-1307, USA.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/configfs.h&gt;</span>
+
+<span class="cp">#include &quot;heartbeat.h&quot;</span>
+<span class="cp">#include &quot;tcp.h&quot;</span>
+<span class="cp">#include &quot;nodemanager.h&quot;</span>
+
+<span class="cp">#include &quot;masklog.h&quot;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The first heartbeat pass had one global thread that would serialize all hb</span>
+<span class="cm"> * callback calls.  This global serializing sem should only be removed once</span>
+<span class="cm"> * we&#39;ve made sure that all callees can deal with being called concurrently</span>
+<span class="cm"> * from multiple hb region threads.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DECLARE_RWSEM</span><span class="p">(</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * multiple hb threads are watching multiple regions.  A node is live</span>
+<span class="cm"> * whenever any of the threads sees activity from the node in its region.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">r2hb_live_node_bitmap</span><span class="p">[</span><span class="n">BITS_TO_LONGS</span><span class="p">(</span><span class="n">R2NM_MAX_NODES</span><span class="p">)];</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">r2hb_callback</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">r2hb_callbacks</span><span class="p">[</span><span class="n">R2HB_NUM_CB</span><span class="p">];</span>
+
+<span class="k">enum</span> <span class="n">r2hb_heartbeat_modes</span> <span class="p">{</span>
+	<span class="n">R2HB_HEARTBEAT_LOCAL</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+	<span class="n">R2HB_HEARTBEAT_GLOBAL</span><span class="p">,</span>
+	<span class="n">R2HB_HEARTBEAT_NUM_MODES</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="kt">char</span> <span class="o">*</span><span class="n">r2hb_heartbeat_mode_desc</span><span class="p">[</span><span class="n">R2HB_HEARTBEAT_NUM_MODES</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="s">&quot;local&quot;</span><span class="p">,</span>	<span class="cm">/* R2HB_HEARTBEAT_LOCAL */</span>
+		<span class="s">&quot;global&quot;</span><span class="p">,</span>	<span class="cm">/* R2HB_HEARTBEAT_GLOBAL */</span>
+<span class="p">};</span>
+
+<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">r2hb_dead_threshold</span> <span class="o">=</span> <span class="n">R2HB_DEFAULT_DEAD_THRESHOLD</span><span class="p">;</span>
+<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">r2hb_heartbeat_mode</span> <span class="o">=</span> <span class="n">R2HB_HEARTBEAT_LOCAL</span><span class="p">;</span>
+
+<span class="cm">/* Only sets a new threshold if there are no active regions.</span>
+<span class="cm"> *</span>
+<span class="cm"> * No locking or otherwise interesting code is required for reading</span>
+<span class="cm"> * r2hb_dead_threshold as it can&#39;t change once regions are active and</span>
+<span class="cm"> * it&#39;s not interesting to anyone until then anyway. */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">r2hb_dead_threshold_set</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">threshold</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">threshold</span> <span class="o">&gt;</span> <span class="n">R2HB_MIN_DEAD_THRESHOLD</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+		<span class="n">r2hb_dead_threshold</span> <span class="o">=</span> <span class="n">threshold</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">r2hb_global_hearbeat_mode_set</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">hb_mode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hb_mode</span> <span class="o">&lt;</span> <span class="n">R2HB_HEARTBEAT_NUM_MODES</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+		<span class="n">r2hb_heartbeat_mode</span> <span class="o">=</span> <span class="n">hb_mode</span><span class="p">;</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">r2hb_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">r2hb_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">r2hb_callbacks</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callbacks</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">r2hb_live_node_bitmap</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">r2hb_live_node_bitmap</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* if we&#39;re already in a callback then we&#39;re already serialized by the sem */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">r2hb_fill_node_map_from_callback</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span>
+					     <span class="kt">unsigned</span> <span class="n">bytes</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">bytes</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">BITS_TO_LONGS</span><span class="p">(</span><span class="n">R2NM_MAX_NODES</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)));</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">map</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">r2hb_live_node_bitmap</span><span class="p">,</span> <span class="n">bytes</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * get a map of all nodes that are heartbeating in any regions</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">r2hb_fill_node_map</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span><span class="n">map</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">bytes</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* callers want to serialize this map and callbacks so that they</span>
+<span class="cm">	 * can trust that they don&#39;t miss nodes coming to the party */</span>
+	<span class="n">down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+	<span class="n">r2hb_fill_node_map_from_callback</span><span class="p">(</span><span class="n">map</span><span class="p">,</span> <span class="n">bytes</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_live_lock</span><span class="p">);</span>
+	<span class="n">up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_fill_node_map</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * heartbeat configfs bits.  The heartbeat set is a default set under</span>
+<span class="cm"> * the cluster set in nodemanager.c.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/* heartbeat set */</span>
+
+<span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">config_group</span> <span class="n">hs_group</span><span class="p">;</span>
+	<span class="cm">/* some stuff? */</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="nf">to_r2hb_hb_group</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="n">group</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">group</span> <span class="o">?</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">group</span><span class="p">,</span> <span class="k">struct</span> <span class="n">r2hb_hb_group</span><span class="p">,</span> <span class="n">hs_group</span><span class="p">)</span>
+		<span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">config_item</span> <span class="n">r2hb_config_item</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">config_item</span> <span class="o">*</span><span class="nf">r2hb_hb_group_make_item</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+							  <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">strlen</span><span class="p">(</span><span class="n">name</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">R2HB_MAX_REGION_NAME_LEN</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENAMETOOLONG</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">free</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">config_item_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_config_item</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">r2hb_config_item</span><span class="p">;</span>
+<span class="nl">free:</span>
+	<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">r2hb_hb_group_drop_item</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+					   <span class="k">struct</span> <span class="n">config_item</span> <span class="o">*</span><span class="n">item</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r2hb_global_heartbeat_active</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_NOTICE</span> <span class="s">&quot;ramster: Heartbeat %s &quot;</span>
+			<span class="s">&quot;on region %s (%s)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="s">&quot;stopped/aborted&quot;</span><span class="p">,</span> <span class="n">config_item_name</span><span class="p">(</span><span class="n">item</span><span class="p">),</span>
+			<span class="s">&quot;no region&quot;</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">config_item_put</span><span class="p">(</span><span class="n">item</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">configfs_attribute</span> <span class="n">attr</span><span class="p">;</span>
+	<span class="kt">ssize_t</span> <span class="p">(</span><span class="o">*</span><span class="n">show</span><span class="p">)(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="p">);</span>
+	<span class="kt">ssize_t</span> <span class="p">(</span><span class="o">*</span><span class="n">store</span><span class="p">)(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="p">,</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="p">,</span> <span class="kt">size_t</span><span class="p">);</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_item</span> <span class="o">*</span><span class="n">item</span><span class="p">,</span>
+					 <span class="k">struct</span> <span class="n">configfs_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+					 <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">reg</span> <span class="o">=</span> <span class="n">to_r2hb_hb_group</span><span class="p">(</span><span class="n">to_config_group</span><span class="p">(</span><span class="n">item</span><span class="p">));</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span> <span class="o">*</span><span class="n">r2hb_hb_group_attr</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">attr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span><span class="p">,</span> <span class="n">attr</span><span class="p">);</span>
+	<span class="kt">ssize_t</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">r2hb_hb_group_attr</span><span class="o">-&gt;</span><span class="n">show</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">r2hb_hb_group_attr</span><span class="o">-&gt;</span><span class="n">show</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_store</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_item</span> <span class="o">*</span><span class="n">item</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">configfs_attribute</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span>
+					  <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">reg</span> <span class="o">=</span> <span class="n">to_r2hb_hb_group</span><span class="p">(</span><span class="n">to_config_group</span><span class="p">(</span><span class="n">item</span><span class="p">));</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span> <span class="o">*</span><span class="n">r2hb_hb_group_attr</span> <span class="o">=</span>
+		<span class="n">container_of</span><span class="p">(</span><span class="n">attr</span><span class="p">,</span> <span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span><span class="p">,</span> <span class="n">attr</span><span class="p">);</span>
+	<span class="kt">ssize_t</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">r2hb_hb_group_attr</span><span class="o">-&gt;</span><span class="n">store</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">r2hb_hb_group_attr</span><span class="o">-&gt;</span><span class="n">store</span><span class="p">(</span><span class="n">reg</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_threshold_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+						     <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="s">&quot;%u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">r2hb_dead_threshold</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_threshold_store</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+						    <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span>
+						    <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">kstrtoul</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="cm">/* this will validate ranges for us. */</span>
+	<span class="n">r2hb_dead_threshold_set</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">int</span><span class="p">)</span> <span class="n">tmp</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span>
+<span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_mode_show</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+				       <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">sprintf</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="s">&quot;%s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">r2hb_heartbeat_mode_desc</span><span class="p">[</span><span class="n">r2hb_heartbeat_mode</span><span class="p">]);</span>
+<span class="p">}</span>
+
+<span class="k">static</span>
+<span class="kt">ssize_t</span> <span class="nf">r2hb_hb_group_mode_store</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">group</span><span class="p">,</span>
+					<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">size_t</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="p">(</span><span class="n">page</span><span class="p">[</span><span class="n">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="sc">&#39;\n&#39;</span><span class="p">)</span> <span class="o">?</span> <span class="n">count</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">:</span> <span class="n">count</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">len</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">R2HB_HEARTBEAT_NUM_MODES</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">strnicmp</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">r2hb_heartbeat_mode_desc</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">len</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">r2hb_global_hearbeat_mode_set</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_NOTICE</span> <span class="s">&quot;ramster: Heartbeat mode &quot;</span>
+						<span class="s">&quot;set to %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">r2hb_heartbeat_mode_desc</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="k">return</span> <span class="n">count</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span> <span class="n">r2hb_hb_group_attr_threshold</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">attr</span>	<span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">ca_owner</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+		    <span class="p">.</span><span class="n">ca_name</span> <span class="o">=</span> <span class="s">&quot;dead_threshold&quot;</span><span class="p">,</span>
+		    <span class="p">.</span><span class="n">ca_mode</span> <span class="o">=</span> <span class="n">S_IRUGO</span> <span class="o">|</span> <span class="n">S_IWUSR</span> <span class="p">},</span>
+	<span class="p">.</span><span class="n">show</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_threshold_show</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">store</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_threshold_store</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">r2hb_hb_group_attribute</span> <span class="n">r2hb_hb_group_attr_mode</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">attr</span>   <span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">ca_owner</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">ca_name</span> <span class="o">=</span> <span class="s">&quot;mode&quot;</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">ca_mode</span> <span class="o">=</span> <span class="n">S_IRUGO</span> <span class="o">|</span> <span class="n">S_IWUSR</span> <span class="p">},</span>
+	<span class="p">.</span><span class="n">show</span>   <span class="o">=</span> <span class="n">r2hb_hb_group_mode_show</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">store</span>  <span class="o">=</span> <span class="n">r2hb_hb_group_mode_store</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">configfs_attribute</span> <span class="o">*</span><span class="n">r2hb_hb_group_attrs</span><span class="p">[]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="o">&amp;</span><span class="n">r2hb_hb_group_attr_threshold</span><span class="p">.</span><span class="n">attr</span><span class="p">,</span>
+	<span class="o">&amp;</span><span class="n">r2hb_hb_group_attr_mode</span><span class="p">.</span><span class="n">attr</span><span class="p">,</span>
+	<span class="nb">NULL</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">configfs_item_operations</span> <span class="n">r2hb_hearbeat_group_item_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">show_attribute</span>		<span class="o">=</span> <span class="n">r2hb_hb_group_show</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">store_attribute</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_store</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">configfs_group_operations</span> <span class="n">r2hb_hb_group_group_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">make_item</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_make_item</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">drop_item</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_drop_item</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">config_item_type</span> <span class="n">r2hb_hb_group_type</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">ct_group_ops</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">r2hb_hb_group_group_ops</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ct_item_ops</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">r2hb_hearbeat_group_item_ops</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ct_attrs</span>	<span class="o">=</span> <span class="n">r2hb_hb_group_attrs</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">ct_owner</span>	<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/* this is just here to avoid touching group in heartbeat.h which the</span>
+<span class="cm"> * entire damn world #includes */</span>
+<span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="nf">r2hb_alloc_hb_set</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">hs</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="n">ret</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">hs</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_hb_group</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hs</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">config_group_init_type_name</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hs</span><span class="o">-&gt;</span><span class="n">hs_group</span><span class="p">,</span> <span class="s">&quot;heartbeat&quot;</span><span class="p">,</span>
+				    <span class="o">&amp;</span><span class="n">r2hb_hb_group_type</span><span class="p">);</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">hs</span><span class="o">-&gt;</span><span class="n">hs_group</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">hs</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">r2hb_free_hb_set</span><span class="p">(</span><span class="k">struct</span> <span class="n">config_group</span> <span class="o">*</span><span class="n">group</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">r2hb_hb_group</span> <span class="o">*</span><span class="n">hs</span> <span class="o">=</span> <span class="n">to_r2hb_hb_group</span><span class="p">(</span><span class="n">group</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">hs</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* hb callback registration and issuing */</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">r2hb_callback</span> <span class="o">*</span><span class="nf">hbcall_from_type</span><span class="p">(</span><span class="k">enum</span> <span class="n">r2hb_callback_type</span> <span class="n">type</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">type</span> <span class="o">==</span> <span class="n">R2HB_NUM_CB</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">EINVAL</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">r2hb_callbacks</span><span class="p">[</span><span class="n">type</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">r2hb_setup_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">r2hb_callback_func</span> <span class="o">*</span><span class="n">hc</span><span class="p">,</span>
+			 <span class="k">enum</span> <span class="n">r2hb_callback_type</span> <span class="n">type</span><span class="p">,</span>
+			 <span class="n">r2hb_cb_func</span> <span class="o">*</span><span class="n">func</span><span class="p">,</span>
+			 <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span>
+			 <span class="kt">int</span> <span class="n">priority</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">);</span>
+	<span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_func</span> <span class="o">=</span> <span class="n">func</span><span class="p">;</span>
+	<span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_data</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_priority</span> <span class="o">=</span> <span class="n">priority</span><span class="p">;</span>
+	<span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_type</span> <span class="o">=</span> <span class="n">type</span><span class="p">;</span>
+	<span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_magic</span> <span class="o">=</span> <span class="n">R2HB_CB_MAGIC</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_setup_callback</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">r2hb_register_callback</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">region_uuid</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">r2hb_callback_func</span> <span class="o">*</span><span class="n">hc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">r2hb_callback_func</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">iter</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">r2hb_callback</span> <span class="o">*</span><span class="n">hbcall</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_magic</span> <span class="o">!=</span> <span class="n">R2HB_CB_MAGIC</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">));</span>
+
+	<span class="n">hbcall</span> <span class="o">=</span> <span class="n">hbcall_from_type</span><span class="p">(</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_type</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">hbcall</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">hbcall</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+
+	<span class="n">list_for_each</span><span class="p">(</span><span class="n">iter</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hbcall</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">iter</span><span class="p">,</span> <span class="k">struct</span> <span class="n">r2hb_callback_func</span><span class="p">,</span> <span class="n">hc_item</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_priority</span> <span class="o">&lt;</span> <span class="n">tmp</span><span class="o">-&gt;</span><span class="n">hc_priority</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">,</span> <span class="n">iter</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">))</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hbcall</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="n">mlog</span><span class="p">(</span><span class="n">ML_CLUSTER</span><span class="p">,</span> <span class="s">&quot;returning %d on behalf of %p for funcs %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">ret</span><span class="p">,</span> <span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">hc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_register_callback</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">r2hb_unregister_callback</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">region_uuid</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">r2hb_callback_func</span> <span class="o">*</span><span class="n">hc</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_magic</span> <span class="o">!=</span> <span class="n">R2HB_CB_MAGIC</span><span class="p">);</span>
+
+	<span class="n">mlog</span><span class="p">(</span><span class="n">ML_CLUSTER</span><span class="p">,</span> <span class="s">&quot;on behalf of %p for funcs %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	     <span class="n">__builtin_return_address</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">hc</span><span class="p">);</span>
+
+	<span class="cm">/* XXX Can this happen _with_ a region reference? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hc</span><span class="o">-&gt;</span><span class="n">hc_item</span><span class="p">);</span>
+
+	<span class="n">up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">r2hb_callback_sem</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_unregister_callback</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">r2hb_check_node_heartbeating_from_callback</span><span class="p">(</span><span class="n">u8</span> <span class="n">node_num</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">testing_map</span><span class="p">[</span><span class="n">BITS_TO_LONGS</span><span class="p">(</span><span class="n">R2NM_MAX_NODES</span><span class="p">)];</span>
+
+	<span class="n">r2hb_fill_node_map_from_callback</span><span class="p">(</span><span class="n">testing_map</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">testing_map</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">test_bit</span><span class="p">(</span><span class="n">node_num</span><span class="p">,</span> <span class="n">testing_map</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">mlog</span><span class="p">(</span><span class="n">ML_HEARTBEAT</span><span class="p">,</span>
+		     <span class="s">&quot;node (%u) does not have heartbeating enabled.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		     <span class="n">node_num</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_check_node_heartbeating_from_callback</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">r2hb_stop_all_regions</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">r2hb_stop_all_regions</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * this is just a hack until we get the plumbing which flips file systems</span>
+<span class="cm"> * read only and drops the hb ref instead of killing the node dead.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">r2hb_global_heartbeat_active</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">r2hb_heartbeat_mode</span> <span class="o">==</span> <span class="n">R2HB_HEARTBEAT_GLOBAL</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">r2hb_global_heartbeat_active</span><span class="p">);</span>
+
+<span class="cm">/* added for RAMster */</span>
+<span class="kt">void</span> <span class="nf">r2hb_manual_set_node_heartbeating</span><span class="p">(</span><span class="kt">int</span> <span class="n">node_num</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">node_num</span> <span class="o">&lt;</span> <span class="n">R2NM_MAX_NODES</span><span class="p">)</span>
+		<span class="n">set_bit</span><span class="p">(</span><span class="n">node_num</span><span class="p">,</span> <span class="n">r2hb_live_node_bitmap</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">r2hb_manual_set_node_heartbeating</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:4}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../../javascript/docco.min.js"></script>
+</html>

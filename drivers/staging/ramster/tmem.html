@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › staging › ramster › tmem.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>tmem.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * In-kernel transcendent memory (generic implementation)</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2009-2011, Dan Magenheimer, Oracle Corp.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The primary purpose of Transcedent Memory (&quot;tmem&quot;) is to map object-oriented</span>
+<span class="cm"> * &quot;handles&quot; (triples containing a pool id, and object id, and an index), to</span>
+<span class="cm"> * pages in a page-accessible memory (PAM).  Tmem references the PAM pages via</span>
+<span class="cm"> * an abstract &quot;pampd&quot; (PAM page-descriptor), which can be operated on by a</span>
+<span class="cm"> * set of functions (pamops).  Each pampd contains some representation of</span>
+<span class="cm"> * PAGE_SIZE bytes worth of data. Tmem must support potentially millions of</span>
+<span class="cm"> * pages and must be able to insert, find, and delete these pages at a</span>
+<span class="cm"> * potential frequency of thousands per second concurrently across many CPUs,</span>
+<span class="cm"> * (and, if used with KVM, across many vcpus across many guests).</span>
+<span class="cm"> * Tmem is tracked with a hierarchy of data structures, organized by</span>
+<span class="cm"> * the elements in a handle-tuple: pool_id, object_id, and page index.</span>
+<span class="cm"> * One or more &quot;clients&quot; (e.g. guests) each provide one or more tmem_pools.</span>
+<span class="cm"> * Each pool, contains a hash table of rb_trees of tmem_objs.  Each</span>
+<span class="cm"> * tmem_obj contains a radix-tree-like tree of pointers, with intermediate</span>
+<span class="cm"> * nodes called tmem_objnodes.  Each leaf pointer in this tree points to</span>
+<span class="cm"> * a pampd, which is accessible only through a small set of callbacks</span>
+<span class="cm"> * registered by the PAM implementation (see tmem_register_pamops). Tmem</span>
+<span class="cm"> * does all memory allocation via a set of callbacks registered by the tmem</span>
+<span class="cm"> * host implementation (e.g. see tmem_register_hostops).</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+<span class="cp">#include &lt;linux/delay.h&gt;</span>
+
+<span class="cp">#include &quot;tmem.h&quot;</span>
+
+<span class="cm">/* data structure sentinels used for debugging... see tmem.h */</span>
+<span class="cp">#define POOL_SENTINEL 0x87658765</span>
+<span class="cp">#define OBJ_SENTINEL 0x12345678</span>
+<span class="cp">#define OBJNODE_SENTINEL 0xfedcba09</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A tmem host implementation must use this function to register callbacks</span>
+<span class="cm"> * for memory allocation.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tmem_hostops</span> <span class="n">tmem_hostops</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">tmem_objnode_tree_init</span><span class="p">(</span><span class="kt">void</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">tmem_register_hostops</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_hostops</span> <span class="o">*</span><span class="n">m</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tmem_objnode_tree_init</span><span class="p">();</span>
+	<span class="n">tmem_hostops</span> <span class="o">=</span> <span class="o">*</span><span class="n">m</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A tmem host implementation must use this function to register</span>
+<span class="cm"> * callbacks for a page-accessible memory (PAM) implementation</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tmem_pamops</span> <span class="n">tmem_pamops</span><span class="p">;</span>
+
+<span class="kt">void</span> <span class="nf">tmem_register_pamops</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pamops</span> <span class="o">*</span><span class="n">m</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tmem_pamops</span> <span class="o">=</span> <span class="o">*</span><span class="n">m</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Oid&#39;s are potentially very sparse and tmem_objs may have an indeterminately</span>
+<span class="cm"> * short life, being added and deleted at a relatively high frequency.</span>
+<span class="cm"> * So an rb_tree is an ideal data structure to manage tmem_objs.  But because</span>
+<span class="cm"> * of the potentially huge number of tmem_objs, each pool manages a hashtable</span>
+<span class="cm"> * of rb_trees to reduce search, insert, delete, and rebalancing time.</span>
+<span class="cm"> * Each hashbucket also has a lock to manage concurrent access.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The following routines manage tmem_objs.  When any tmem_obj is accessed,</span>
+<span class="cm"> * the hashbucket lock must be held.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/* searches for object==oid in pool, returns locked object if found */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="nf">tmem_obj_find</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">rbnode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+
+	<span class="n">rbnode</span> <span class="o">=</span> <span class="n">hb</span><span class="o">-&gt;</span><span class="n">obj_rb_root</span><span class="p">.</span><span class="n">rb_node</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">rbnode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">RB_EMPTY_NODE</span><span class="p">(</span><span class="n">rbnode</span><span class="p">));</span>
+		<span class="n">obj</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">rbnode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_obj</span><span class="p">,</span> <span class="n">rb_tree_node</span><span class="p">);</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">tmem_oid_compare</span><span class="p">(</span><span class="n">oidp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">oid</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="mi">0</span>: <span class="cm">/* equal */</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="mi">1</span>:
+			<span class="n">rbnode</span> <span class="o">=</span> <span class="n">rbnode</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="mi">1</span>:
+			<span class="n">rbnode</span> <span class="o">=</span> <span class="n">rbnode</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">obj</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">tmem_pampd_destroy_all_in_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="p">);</span>
+
+<span class="cm">/* free an object that has no more pampds in it */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_obj_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">pool</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="cm">/* may be &quot;stump&quot; with no leaves */</span>
+		<span class="n">tmem_pampd_destroy_all_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_count</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">obj_count</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">obj_count</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">INVERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">tmem_oid_set_invalid</span><span class="p">(</span><span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">oid</span><span class="p">);</span>
+	<span class="n">rb_erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">rb_tree_node</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">obj_rb_root</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * initialize, and insert an tmem_object_root (called only if find failed)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_obj_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_root</span> <span class="o">*</span><span class="n">root</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">obj_rb_root</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">**</span><span class="n">new</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="n">root</span><span class="o">-&gt;</span><span class="n">rb_node</span><span class="p">),</span> <span class="o">*</span><span class="n">parent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">this</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">obj_count</span><span class="p">);</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">=</span> <span class="n">pool</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">oid</span> <span class="o">=</span> <span class="o">*</span><span class="n">oidp</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">new_obj</span><span class="p">)(</span><span class="n">obj</span><span class="p">);</span>
+	<span class="n">SET_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">*</span><span class="n">new</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">RB_EMPTY_NODE</span><span class="p">(</span><span class="o">*</span><span class="n">new</span><span class="p">));</span>
+		<span class="n">this</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="o">*</span><span class="n">new</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_obj</span><span class="p">,</span> <span class="n">rb_tree_node</span><span class="p">);</span>
+		<span class="n">parent</span> <span class="o">=</span> <span class="o">*</span><span class="n">new</span><span class="p">;</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">tmem_oid_compare</span><span class="p">(</span><span class="n">oidp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">this</span><span class="o">-&gt;</span><span class="n">oid</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="mi">0</span>:
+			<span class="n">BUG</span><span class="p">();</span> <span class="cm">/* already present; should never happen! */</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="mi">1</span>:
+			<span class="n">new</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="o">*</span><span class="n">new</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">rb_left</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">case</span> <span class="mi">1</span>:
+			<span class="n">new</span> <span class="o">=</span> <span class="o">&amp;</span><span class="p">(</span><span class="o">*</span><span class="n">new</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">rb_right</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">rb_link_node</span><span class="p">(</span><span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">rb_tree_node</span><span class="p">,</span> <span class="n">parent</span><span class="p">,</span> <span class="n">new</span><span class="p">);</span>
+	<span class="n">rb_insert_color</span><span class="p">(</span><span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">rb_tree_node</span><span class="p">,</span> <span class="n">root</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Tmem is managed as a set of tmem_pools with certain attributes, such as</span>
+<span class="cm"> * &quot;ephemeral&quot; vs &quot;persistent&quot;.  These attributes apply to all tmem_objs</span>
+<span class="cm"> * and all pampds that belong to a tmem_pool.  A tmem_pool is created</span>
+<span class="cm"> * or deleted relatively rarely (for example, when a filesystem is</span>
+<span class="cm"> * mounted or unmounted.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/* flush all data from a pool and, optionally, free it */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_pool_flush</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="n">bool</span> <span class="n">destroy</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">rb_node</span> <span class="o">*</span><span class="n">rbnode</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">TMEM_HASH_BUCKETS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">,</span> <span class="n">hb</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">rbnode</span> <span class="o">=</span> <span class="n">rb_first</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">obj_rb_root</span><span class="p">);</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">rbnode</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">obj</span> <span class="o">=</span> <span class="n">rb_entry</span><span class="p">(</span><span class="n">rbnode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_obj</span><span class="p">,</span> <span class="n">rb_tree_node</span><span class="p">);</span>
+			<span class="n">rbnode</span> <span class="o">=</span> <span class="n">rb_next</span><span class="p">(</span><span class="n">rbnode</span><span class="p">);</span>
+			<span class="n">tmem_pampd_destroy_all_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">);</span>
+			<span class="n">tmem_obj_free</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">hb</span><span class="p">);</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_free</span><span class="p">)(</span><span class="n">obj</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">destroy</span><span class="p">)</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_list</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A tmem_obj contains a radix-tree-like tree in which the intermediate</span>
+<span class="cm"> * nodes are called tmem_objnodes.  (The kernel lib/radix-tree.c implementation</span>
+<span class="cm"> * is very specialized and tuned for specific uses and is not particularly</span>
+<span class="cm"> * suited for use from this code, though some code from the core algorithms has</span>
+<span class="cm"> * been reused, thus the copyright notices below).  Each tmem_objnode contains</span>
+<span class="cm"> * a set of pointers which point to either a set of intermediate tmem_objnodes</span>
+<span class="cm"> * or a set of of pampds.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Portions Copyright (C) 2001 Momchil Velikov</span>
+<span class="cm"> * Portions Copyright (C) 2001 Christoph Hellwig</span>
+<span class="cm"> * Portions Copyright (C) 2005 SGI, Christoph Lameter &lt;clameter@sgi.com&gt;</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">tmem_objnode_tree_path</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">objnode</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/* objnode height_to_maxindex translation */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">OBJNODE_TREE_MAX_PATH</span> <span class="o">+</span> <span class="mi">1</span><span class="p">];</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_objnode_tree_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ht</span><span class="p">,</span> <span class="n">tmp</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">ht</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">ht</span> <span class="o">&lt;</span> <span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">tmem_objnode_tree_h2max</span><span class="p">);</span> <span class="n">ht</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">ht</span> <span class="o">*</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">tmp</span> <span class="o">&gt;=</span> <span class="n">OBJNODE_TREE_INDEX_BITS</span><span class="p">)</span>
+			<span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">ht</span><span class="p">]</span> <span class="o">=</span> <span class="o">~</span><span class="mi">0UL</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">ht</span><span class="p">]</span> <span class="o">=</span>
+			    <span class="p">(</span><span class="o">~</span><span class="mi">0UL</span> <span class="o">&gt;&gt;</span> <span class="p">(</span><span class="n">OBJNODE_TREE_INDEX_BITS</span> <span class="o">-</span> <span class="n">tmp</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="nf">tmem_objnode_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">objnode</span><span class="p">;</span>
+
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">POOL</span><span class="p">);</span>
+	<span class="n">objnode</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">objnode_alloc</span><span class="p">)(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">objnode</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span> <span class="o">=</span> <span class="n">obj</span><span class="p">;</span>
+	<span class="n">SET_SENTINEL</span><span class="p">(</span><span class="n">objnode</span><span class="p">,</span> <span class="n">OBJNODE</span><span class="p">);</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">));</span>
+	<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_count</span><span class="o">++</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">objnode</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_objnode_free</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">objnode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">objnode</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">OBJNODE_TREE_MAP_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">objnode</span><span class="p">,</span> <span class="n">OBJNODE</span><span class="p">);</span>
+	<span class="n">INVERT_SENTINEL</span><span class="p">(</span><span class="n">objnode</span><span class="p">,</span> <span class="n">OBJNODE</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">pool</span> <span class="o">=</span> <span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">POOL</span><span class="p">);</span>
+	<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_count</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">obj</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">objnode_free</span><span class="p">)(</span><span class="n">objnode</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * lookup index in object and return associated pampd (or NULL if not found)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="o">**</span><span class="nf">__tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">height</span><span class="p">,</span> <span class="n">shift</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="n">slot</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">POOL</span><span class="p">);</span>
+
+	<span class="n">height</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">])</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">height</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">shift</span> <span class="o">=</span> <span class="p">(</span><span class="n">height</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">height</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">slot</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="p">)</span>
+			<span class="p">((</span><span class="o">*</span><span class="n">slot</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">slots</span> <span class="o">+</span>
+			 <span class="p">((</span><span class="n">index</span> <span class="o">&gt;&gt;</span> <span class="n">shift</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">OBJNODE_TREE_MAP_MASK</span><span class="p">));</span>
+		<span class="n">shift</span> <span class="o">-=</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+		<span class="n">height</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span> <span class="o">?</span> <span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="n">slot</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="n">slot</span><span class="p">;</span>
+
+	<span class="n">slot</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="p">)</span><span class="n">__tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span> <span class="o">?</span> <span class="o">*</span><span class="n">slot</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">tmem_pampd_replace_in_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span>
+					<span class="kt">void</span> <span class="o">*</span><span class="n">new_pampd</span><span class="p">,</span> <span class="n">bool</span> <span class="n">no_free</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="n">slot</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">ret</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">slot</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">**</span><span class="p">)</span><span class="n">__tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="o">*</span><span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">void</span> <span class="o">*</span><span class="n">old_pampd</span> <span class="o">=</span> <span class="o">*</span><span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="n">slot</span><span class="p">;</span>
+		<span class="o">*</span><span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="p">)</span><span class="n">slot</span> <span class="o">=</span> <span class="n">new_pampd</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">no_free</span><span class="p">)</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">old_pampd</span><span class="p">,</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span>
+						<span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">false</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">new_pampd</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tmem_pampd_add_to_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span>
+					<span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">objnode</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">newnode</span><span class="p">,</span> <span class="o">*</span><span class="n">slot</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">height</span><span class="p">,</span> <span class="n">shift</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* if necessary, extend the tree to be higher  */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">])</span> <span class="p">{</span>
+		<span class="n">height</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">height</span><span class="p">])</span>
+			<span class="k">while</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">height</span><span class="p">])</span>
+				<span class="n">height</span><span class="o">++</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">=</span> <span class="n">height</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">insert</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">do</span> <span class="p">{</span>
+			<span class="n">newnode</span> <span class="o">=</span> <span class="n">tmem_objnode_alloc</span><span class="p">(</span><span class="n">obj</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">newnode</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+				<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">newnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+			<span class="n">newnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="n">newnode</span><span class="p">;</span>
+			<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="o">++</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">height</span> <span class="o">&gt;</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">insert:</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+	<span class="n">height</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">;</span>
+	<span class="n">shift</span> <span class="o">=</span> <span class="p">(</span><span class="n">height</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">height</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* add a child objnode.  */</span>
+			<span class="n">slot</span> <span class="o">=</span> <span class="n">tmem_objnode_alloc</span><span class="p">(</span><span class="n">obj</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">slot</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+				<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">objnode</span><span class="p">)</span> <span class="p">{</span>
+
+				<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">offset</span><span class="p">]</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+				<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span><span class="o">++</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span>
+				<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="cm">/* go down a level */</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;&gt;</span> <span class="n">shift</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">OBJNODE_TREE_MAP_MASK</span><span class="p">;</span>
+		<span class="n">objnode</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">offset</span><span class="p">];</span>
+		<span class="n">shift</span> <span class="o">-=</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+		<span class="n">height</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">objnode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">offset</span><span class="p">]</span> <span class="o">=</span> <span class="n">pampd</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="n">pampd</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span><span class="o">++</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="nf">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode_tree_path</span> <span class="n">path</span><span class="p">[</span><span class="n">OBJNODE_TREE_MAX_PATH</span> <span class="o">+</span> <span class="mi">1</span><span class="p">];</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode_tree_path</span> <span class="o">*</span><span class="n">pathp</span> <span class="o">=</span> <span class="n">path</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">slot</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">height</span><span class="p">,</span> <span class="n">shift</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">offset</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">OBJ</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">ASSERT_SENTINEL</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">POOL</span><span class="p">);</span>
+	<span class="n">height</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;</span> <span class="n">tmem_objnode_tree_h2max</span><span class="p">[</span><span class="n">height</span><span class="p">])</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">slot</span> <span class="o">=</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">height</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">shift</span> <span class="o">=</span> <span class="p">(</span><span class="n">height</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+	<span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">slot</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="n">pathp</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;&gt;</span> <span class="n">shift</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">OBJNODE_TREE_MAP_MASK</span><span class="p">;</span>
+		<span class="n">pathp</span><span class="o">-&gt;</span><span class="n">offset</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+		<span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span> <span class="o">=</span> <span class="n">slot</span><span class="p">;</span>
+		<span class="n">slot</span> <span class="o">=</span> <span class="n">slot</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">offset</span><span class="p">];</span>
+		<span class="n">shift</span> <span class="o">-=</span> <span class="n">OBJNODE_TREE_MAP_SHIFT</span><span class="p">;</span>
+		<span class="n">height</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">height</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">pathp</span><span class="o">-&gt;</span><span class="n">offset</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span><span class="o">--</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots_in_use</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span> <span class="o">==</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">while</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+				  <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="o">-&gt;</span><span class="n">slots_in_use</span> <span class="o">==</span> <span class="mi">1</span> <span class="o">&amp;&amp;</span>
+				  <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="p">{</span>
+					<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">to_free</span> <span class="o">=</span>
+						<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">;</span>
+
+					<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span>
+							<span class="n">to_free</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+					<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="o">--</span><span class="p">;</span>
+					<span class="n">to_free</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+					<span class="n">to_free</span><span class="o">-&gt;</span><span class="n">slots_in_use</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+					<span class="n">tmem_objnode_free</span><span class="p">(</span><span class="n">to_free</span><span class="p">);</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">tmem_objnode_free</span><span class="p">(</span><span class="n">pathp</span><span class="o">-&gt;</span><span class="n">objnode</span><span class="p">);</span> <span class="cm">/* 0 slots used, free it */</span>
+		<span class="n">pathp</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">slot</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">slot</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* recursively walk the objnode_tree destroying pampds and objnodes */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_objnode_node_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span>
+					<span class="k">struct</span> <span class="n">tmem_objnode</span> <span class="o">*</span><span class="n">objnode</span><span class="p">,</span>
+					<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">ht</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ht</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">OBJNODE_TREE_MAP_SIZE</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ht</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span><span class="o">--</span><span class="p">;</span>
+				<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+						<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+				<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">tmem_objnode_node_destroy</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">ht</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+			<span class="n">tmem_objnode_free</span><span class="p">(</span><span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+			<span class="n">objnode</span><span class="o">-&gt;</span><span class="n">slots</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">tmem_pampd_destroy_all_in_obj</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span><span class="o">--</span><span class="p">;</span>
+		<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">,</span>
+					<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">tmem_objnode_node_destroy</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">,</span>
+					<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span><span class="p">);</span>
+		<span class="n">tmem_objnode_free</span><span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span><span class="p">);</span>
+		<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_height</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">obj</span><span class="o">-&gt;</span><span class="n">objnode_tree_root</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free_obj</span><span class="p">)(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">obj</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Tmem is operated on by a set of well-defined actions:</span>
+<span class="cm"> * &quot;put&quot;, &quot;get&quot;, &quot;flush&quot;, &quot;flush_object&quot;, &quot;new pool&quot; and &quot;destroy pool&quot;.</span>
+<span class="cm"> * (The tmem ABI allows for subpages and exchanges but these operations</span>
+<span class="cm"> * are not included in this implementation.)</span>
+<span class="cm"> *</span>
+<span class="cm"> * These &quot;tmem core&quot; operations are implemented in the following functions.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * &quot;Put&quot; a page, e.g. copy a page from the kernel into newly allocated</span>
+<span class="cm"> * PAM space (if such space is available).  Tmem_put is complicated by</span>
+<span class="cm"> * a corner case: What if a page with matching handle already exists in</span>
+<span class="cm"> * tmem?  To guarantee coherency, one of two actions is necessary: Either</span>
+<span class="cm"> * the data for the page must be overwritten, or the page must be</span>
+<span class="cm"> * &quot;flushed&quot; so that the data is not accessible to a subsequent &quot;get&quot;.</span>
+<span class="cm"> * Since these &quot;duplicate puts&quot; are relatively rare, this implementation</span>
+<span class="cm"> * always flushes for simplicity.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span>
+		<span class="kt">char</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="n">bool</span> <span class="n">raw</span><span class="p">,</span> <span class="kt">int</span> <span class="n">ephemeral</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">objfound</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">objnew</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">pampd_del</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">objfound</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">objfound</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">pampd</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* if found, is a dup put, flush the old one */</span>
+			<span class="n">pampd_del</span> <span class="o">=</span> <span class="n">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">pampd_del</span> <span class="o">!=</span> <span class="n">pampd</span><span class="p">);</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">objnew</span> <span class="o">=</span> <span class="n">obj</span><span class="p">;</span>
+				<span class="n">objfound</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">pampd</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">obj</span> <span class="o">=</span> <span class="n">objnew</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_alloc</span><span class="p">)(</span><span class="n">pool</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">tmem_obj_init</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">hb</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(((</span><span class="n">objnew</span> <span class="o">!=</span> <span class="n">obj</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">objfound</span> <span class="o">!=</span> <span class="n">obj</span><span class="p">))</span> <span class="o">||</span> <span class="p">(</span><span class="n">objnew</span> <span class="o">==</span> <span class="n">objfound</span><span class="p">));</span>
+	<span class="n">pampd</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">create</span><span class="p">)(</span><span class="n">data</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">raw</span><span class="p">,</span> <span class="n">ephemeral</span><span class="p">,</span>
+					<span class="n">obj</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">oid</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">pampd</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">free</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">tmem_pampd_add_to_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">pampd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">))</span>
+		<span class="cm">/* may have partially built objnode tree (&quot;stump&quot;) */</span>
+		<span class="k">goto</span> <span class="n">delete_and_free</span><span class="p">;</span>
+	<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+<span class="nl">delete_and_free:</span>
+	<span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+<span class="nl">free:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pampd</span><span class="p">)</span>
+		<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">objnew</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tmem_obj_free</span><span class="p">(</span><span class="n">objnew</span><span class="p">,</span> <span class="n">hb</span><span class="p">);</span>
+		<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_free</span><span class="p">)(</span><span class="n">objnew</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">tmem_localify_get_pampd</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span>
+				<span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">**</span><span class="n">ret_obj</span><span class="p">,</span>
+				<span class="kt">void</span> <span class="o">**</span><span class="n">saved_hb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">obj</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">))</span>
+		<span class="n">pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="o">*</span><span class="n">ret_obj</span> <span class="o">=</span> <span class="n">obj</span><span class="p">;</span>
+	<span class="o">*</span><span class="n">saved_hb</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">hb</span><span class="p">;</span>
+	<span class="cm">/* note, hashbucket remains locked */</span>
+	<span class="k">return</span> <span class="n">pampd</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">tmem_localify_finish</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span>
+			  <span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">saved_hb</span><span class="p">,</span> <span class="n">bool</span> <span class="n">delete</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="p">)</span><span class="n">saved_hb</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">spin_is_locked</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pampd</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+		<span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">tmem_pampd_replace_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">pampd</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">delete</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+		<span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">tmem_repatriate</span><span class="p">(</span><span class="kt">void</span> <span class="o">**</span><span class="n">ppampd</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span>
+				<span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span> <span class="n">bool</span> <span class="n">free</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">old_pampd</span> <span class="o">=</span> <span class="o">*</span><span class="n">ppampd</span><span class="p">,</span> <span class="o">*</span><span class="n">new_pampd</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">intransit</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">is_ephemeral</span><span class="p">(</span><span class="n">pool</span><span class="p">))</span>
+		<span class="n">new_pampd</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">repatriate_preload</span><span class="p">)(</span>
+				<span class="n">old_pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">intransit</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">intransit</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">new_pampd</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="o">*</span><span class="n">ppampd</span> <span class="o">=</span> <span class="n">new_pampd</span><span class="p">;</span>
+	<span class="cm">/* must release the hb-&gt;lock else repatriate can&#39;t sleep */</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">intransit</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">repatriate</span><span class="p">)(</span><span class="n">old_pampd</span><span class="p">,</span> <span class="n">new_pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span>
+						<span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">data</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * &quot;Get&quot; a page, e.g. if one can be found, copy the tmem page with the</span>
+<span class="cm"> * matching handle from PAM space to the kernel.  By tmem definition,</span>
+<span class="cm"> * when a &quot;get&quot; is successful on an ephemeral page, the page is &quot;flushed&quot;,</span>
+<span class="cm"> * and when a &quot;get&quot; is successful on a persistent page, the page is retained</span>
+<span class="cm"> * in tmem.  Note that to preserve</span>
+<span class="cm"> * coherency, &quot;get&quot; can never be skipped if tmem contains the data.</span>
+<span class="cm"> * That is, if a get is done with a certain handle and fails, any</span>
+<span class="cm"> * subsequent &quot;get&quot; must also fail (unless of course there is a</span>
+<span class="cm"> * &quot;put&quot; done with the same handle).</span>
+
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_get</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span>
+		<span class="kt">char</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">size_t</span> <span class="o">*</span><span class="n">size</span><span class="p">,</span> <span class="n">bool</span> <span class="n">raw</span><span class="p">,</span> <span class="kt">int</span> <span class="n">get_and_free</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">ephemeral</span> <span class="o">=</span> <span class="n">is_ephemeral</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">free</span> <span class="o">=</span> <span class="p">(</span><span class="n">get_and_free</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="o">||</span> <span class="p">((</span><span class="n">get_and_free</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">ephemeral</span><span class="p">);</span>
+	<span class="n">bool</span> <span class="n">lock_held</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">**</span><span class="n">ppampd</span><span class="p">;</span>
+
+<span class="nl">again:</span>
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">lock_held</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">ppampd</span> <span class="o">=</span> <span class="n">__tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ppampd</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">is_remote</span><span class="p">(</span><span class="o">*</span><span class="n">ppampd</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">tmem_repatriate</span><span class="p">(</span><span class="n">ppampd</span><span class="p">,</span> <span class="n">hb</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span>
+					<span class="n">index</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">data</span><span class="p">);</span>
+		<span class="n">lock_held</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* note hb-&gt;lock has been unlocked */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">==</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* rare I think, but should cond_resched()??? */</span>
+			<span class="n">usleep_range</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">1000</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">again</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">)</span>
+				<span class="n">pr_err</span><span class="p">(</span><span class="s">&quot;UNTESTED case in tmem_get, ret=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+						<span class="n">ret</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">free</span><span class="p">)</span>
+		<span class="n">pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_lookup_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pampd</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">free</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">tmem_obj_free</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">hb</span><span class="p">);</span>
+			<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_free</span><span class="p">)(</span><span class="n">obj</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+			<span class="n">obj</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">free</span><span class="p">)</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">get_data_and_free</span><span class="p">)(</span>
+				<span class="n">data</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">raw</span><span class="p">,</span> <span class="n">pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">get_data</span><span class="p">)(</span>
+				<span class="n">data</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">raw</span><span class="p">,</span> <span class="n">pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">lock_held</span><span class="p">)</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If a page in tmem matches the handle, &quot;flush&quot; this page from tmem such</span>
+<span class="cm"> * that any subsequent &quot;get&quot; does not succeed (unless, of course, there</span>
+<span class="cm"> * was another &quot;put&quot; with the same handle).</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_flush_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">index</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">pampd</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_delete_from_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">pampd</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">free</span><span class="p">)(</span><span class="n">pampd</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">oidp</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="nb">true</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span><span class="o">-&gt;</span><span class="n">pampd_count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">tmem_obj_free</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">hb</span><span class="p">);</span>
+		<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_free</span><span class="p">)(</span><span class="n">obj</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If a page in tmem matches the handle, replace the page so that any</span>
+<span class="cm"> * subsequent &quot;get&quot; gets the new page.  Returns the new page if</span>
+<span class="cm"> * there was a page to replace, else returns NULL.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_replace</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">,</span>
+			<span class="kt">uint32_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">new_pampd</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">new_pampd</span> <span class="o">=</span> <span class="n">tmem_pampd_replace_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">new_pampd</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">tmem_pamops</span><span class="p">.</span><span class="n">replace_in_obj</span><span class="p">)(</span><span class="n">new_pampd</span><span class="p">,</span> <span class="n">obj</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * &quot;Flush&quot; all pages in tmem matching this oid.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_flush_object</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tmem_oid</span> <span class="o">*</span><span class="n">oidp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">tmem_obj</span> <span class="o">*</span><span class="n">obj</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="n">tmem_oid_hash</span><span class="p">(</span><span class="n">oidp</span><span class="p">)];</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">obj</span> <span class="o">=</span> <span class="n">tmem_obj_find</span><span class="p">(</span><span class="n">hb</span><span class="p">,</span> <span class="n">oidp</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">obj</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">tmem_pampd_destroy_all_in_obj</span><span class="p">(</span><span class="n">obj</span><span class="p">);</span>
+	<span class="n">tmem_obj_free</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">hb</span><span class="p">);</span>
+	<span class="p">(</span><span class="o">*</span><span class="n">tmem_hostops</span><span class="p">.</span><span class="n">obj_free</span><span class="p">)(</span><span class="n">obj</span><span class="p">,</span> <span class="n">pool</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * &quot;Flush&quot; all pages (and tmem_objs) from this tmem_pool and disable</span>
+<span class="cm"> * all subsequent access to this tmem_pool.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">tmem_destroy_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="n">tmem_pool_flush</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">tmem_global_pool_list</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Create a new tmem_pool with the provided flag and return</span>
+<span class="cm"> * a pool id provided by the tmem host implementation.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">tmem_new_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">tmem_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">persistent</span> <span class="o">=</span> <span class="n">flags</span> <span class="o">&amp;</span> <span class="n">TMEM_POOL_PERSIST</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">shared</span> <span class="o">=</span> <span class="n">flags</span> <span class="o">&amp;</span> <span class="n">TMEM_POOL_SHARED</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tmem_hashbucket</span> <span class="o">*</span><span class="n">hb</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">hashbucket</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">TMEM_HASH_BUCKETS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">,</span> <span class="n">hb</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">hb</span><span class="o">-&gt;</span><span class="n">obj_rb_root</span> <span class="o">=</span> <span class="n">RB_ROOT</span><span class="p">;</span>
+		<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_list</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">obj_count</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">SET_SENTINEL</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">POOL</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tmem_global_pool_list</span><span class="p">);</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">persistent</span> <span class="o">=</span> <span class="n">persistent</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">shared</span> <span class="o">=</span> <span class="n">shared</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

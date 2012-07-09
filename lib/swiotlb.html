@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » lib › swiotlb.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>swiotlb.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Dynamic DMA mapping support.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This implementation is a fallback for platforms that do not support</span>
+<span class="cm"> * I/O TLBs (aka DMA address translation hardware).</span>
+<span class="cm"> * Copyright (C) 2000 Asit Mallick &lt;Asit.K.Mallick@intel.com&gt;</span>
+<span class="cm"> * Copyright (C) 2000 Goutham Rao &lt;goutham.rao@intel.com&gt;</span>
+<span class="cm"> * Copyright (C) 2000, 2003 Hewlett-Packard Co</span>
+<span class="cm"> *	David Mosberger-Tang &lt;davidm@hpl.hp.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * 03/05/07 davidm	Switch from PCI-DMA to generic device DMA API.</span>
+<span class="cm"> * 00/12/13 davidm	Rename to swiotlb.c and add mark_clean() to avoid</span>
+<span class="cm"> *			unnecessary i-cache flushing.</span>
+<span class="cm"> * 04/07/.. ak		Better overflow handling. Assorted fixes.</span>
+<span class="cm"> * 05/09/10 linville	Add support for syncing ranges, support syncing for</span>
+<span class="cm"> *			DMA_BIDIRECTIONAL mappings, miscellaneous cleanup.</span>
+<span class="cm"> * 08/12/11 beckyb	Add highmem support</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/cache.h&gt;</span>
+<span class="cp">#include &lt;linux/dma-mapping.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/string.h&gt;</span>
+<span class="cp">#include &lt;linux/swiotlb.h&gt;</span>
+<span class="cp">#include &lt;linux/pfn.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/ctype.h&gt;</span>
+<span class="cp">#include &lt;linux/highmem.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+
+<span class="cp">#include &lt;asm/io.h&gt;</span>
+<span class="cp">#include &lt;asm/dma.h&gt;</span>
+<span class="cp">#include &lt;asm/scatterlist.h&gt;</span>
+
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/bootmem.h&gt;</span>
+<span class="cp">#include &lt;linux/iommu-helper.h&gt;</span>
+
+<span class="cp">#define OFFSET(val,align) ((unsigned long)	\</span>
+<span class="cp">	                   ( (val) &amp; ( (align) - 1)))</span>
+
+<span class="cp">#define SLABS_PER_PAGE (1 &lt;&lt; (PAGE_SHIFT - IO_TLB_SHIFT))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Minimum IO TLB size to bother booting with.  Systems with mainly</span>
+<span class="cm"> * 64bit capable cards will only lightly use the swiotlb.  If we can&#39;t</span>
+<span class="cm"> * allocate a contiguous 1MB, we&#39;re probably in trouble anyway.</span>
+<span class="cm"> */</span>
+<span class="cp">#define IO_TLB_MIN_SLABS ((1&lt;&lt;20) &gt;&gt; IO_TLB_SHIFT)</span>
+
+<span class="kt">int</span> <span class="n">swiotlb_force</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Used to do a quick range check in swiotlb_tbl_unmap_single and</span>
+<span class="cm"> * swiotlb_tbl_sync_single_*, to see if the memory was in fact allocated by this</span>
+<span class="cm"> * API.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">char</span> <span class="o">*</span><span class="n">io_tlb_start</span><span class="p">,</span> <span class="o">*</span><span class="n">io_tlb_end</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The number of IO TLB blocks (in groups of 64) between io_tlb_start and</span>
+<span class="cm"> * io_tlb_end.  This is command line adjustable via setup_io_tlb_npages.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">io_tlb_nslabs</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * When the IOMMU overflows we return a fallback buffer. This sets the size.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">io_tlb_overflow</span> <span class="o">=</span> <span class="mi">32</span><span class="o">*</span><span class="mi">1024</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span><span class="n">io_tlb_overflow_buffer</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a free list describing the number of free entries available from</span>
+<span class="cm"> * each index</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">io_tlb_list</span><span class="p">;</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">io_tlb_index</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We need to save away the original address corresponding to a mapped entry</span>
+<span class="cm"> * for the sync operations.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">phys_addr_t</span> <span class="o">*</span><span class="n">io_tlb_orig_addr</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Protect the above data structures in the map and unmap calls</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">io_tlb_lock</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">late_alloc</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span>
+<span class="nf">setup_io_tlb_npages</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">str</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">isdigit</span><span class="p">(</span><span class="o">*</span><span class="n">str</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">simple_strtoul</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">str</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="cm">/* avoid tail segment of size &lt; IO_TLB_SEGSIZE */</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">str</span> <span class="o">==</span> <span class="sc">&#39;,&#39;</span><span class="p">)</span>
+		<span class="o">++</span><span class="n">str</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">(</span><span class="n">str</span><span class="p">,</span> <span class="s">&quot;force&quot;</span><span class="p">))</span>
+		<span class="n">swiotlb_force</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">__setup</span><span class="p">(</span><span class="s">&quot;swiotlb=&quot;</span><span class="p">,</span> <span class="n">setup_io_tlb_npages</span><span class="p">);</span>
+<span class="cm">/* make io_tlb_overflow tunable too? */</span>
+
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">swiotlb_nr_tbl</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">io_tlb_nslabs</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_nr_tbl</span><span class="p">);</span>
+<span class="cm">/* Note that this doesn&#39;t work with highmem page */</span>
+<span class="k">static</span> <span class="n">dma_addr_t</span> <span class="nf">swiotlb_virt_to_bus</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span>
+				      <span class="k">volatile</span> <span class="kt">void</span> <span class="o">*</span><span class="n">address</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">phys_to_dma</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">address</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">swiotlb_print_info</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">bytes</span> <span class="o">=</span> <span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="n">phys_addr_t</span> <span class="n">pstart</span><span class="p">,</span> <span class="n">pend</span><span class="p">;</span>
+
+	<span class="n">pstart</span> <span class="o">=</span> <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">io_tlb_start</span><span class="p">);</span>
+	<span class="n">pend</span> <span class="o">=</span> <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">io_tlb_end</span><span class="p">);</span>
+
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="s">&quot;software IO TLB [mem %#010llx-%#010llx] (%luMB) mapped at [%p-%p]</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+	       <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">pstart</span><span class="p">,</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">pend</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
+	       <span class="n">bytes</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">io_tlb_start</span><span class="p">,</span> <span class="n">io_tlb_end</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">swiotlb_init_with_tbl</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">tlb</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nslabs</span><span class="p">,</span> <span class="kt">int</span> <span class="n">verbose</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">i</span><span class="p">,</span> <span class="n">bytes</span><span class="p">;</span>
+
+	<span class="n">bytes</span> <span class="o">=</span> <span class="n">nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+
+	<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">nslabs</span><span class="p">;</span>
+	<span class="n">io_tlb_start</span> <span class="o">=</span> <span class="n">tlb</span><span class="p">;</span>
+	<span class="n">io_tlb_end</span> <span class="o">=</span> <span class="n">io_tlb_start</span> <span class="o">+</span> <span class="n">bytes</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Allocate and initialize the free list array.  This array is used</span>
+<span class="cm">	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE</span>
+<span class="cm">	 * between io_tlb_start and io_tlb_end.</span>
+<span class="cm">	 */</span>
+	<span class="n">io_tlb_list</span> <span class="o">=</span> <span class="n">alloc_bootmem_pages</span><span class="p">(</span><span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">)));</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">io_tlb_nslabs</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+ 		<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">IO_TLB_SEGSIZE</span> <span class="o">-</span> <span class="n">OFFSET</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">);</span>
+	<span class="n">io_tlb_index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">io_tlb_orig_addr</span> <span class="o">=</span> <span class="n">alloc_bootmem_pages</span><span class="p">(</span><span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">)));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Get the overflow emergency buffer</span>
+<span class="cm">	 */</span>
+	<span class="n">io_tlb_overflow_buffer</span> <span class="o">=</span> <span class="n">alloc_bootmem_low_pages</span><span class="p">(</span><span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_overflow</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_overflow_buffer</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot allocate SWIOTLB overflow buffer!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">verbose</span><span class="p">)</span>
+		<span class="n">swiotlb_print_info</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Statically reserve bounce buffer space and initialize bounce buffer data</span>
+<span class="cm"> * structures for the software IO TLB used to implement the DMA API.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="n">__init</span>
+<span class="nf">swiotlb_init_with_default_size</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">default_size</span><span class="p">,</span> <span class="kt">int</span> <span class="n">verbose</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">bytes</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_nslabs</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="p">(</span><span class="n">default_size</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">bytes</span> <span class="o">=</span> <span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Get IO TLB memory from the low pages</span>
+<span class="cm">	 */</span>
+	<span class="n">io_tlb_start</span> <span class="o">=</span> <span class="n">alloc_bootmem_low_pages</span><span class="p">(</span><span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">bytes</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_start</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;Cannot allocate SWIOTLB buffer&quot;</span><span class="p">);</span>
+
+	<span class="n">swiotlb_init_with_tbl</span><span class="p">(</span><span class="n">io_tlb_start</span><span class="p">,</span> <span class="n">io_tlb_nslabs</span><span class="p">,</span> <span class="n">verbose</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span>
+<span class="nf">swiotlb_init</span><span class="p">(</span><span class="kt">int</span> <span class="n">verbose</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">swiotlb_init_with_default_size</span><span class="p">(</span><span class="mi">64</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="mi">20</span><span class="p">),</span> <span class="n">verbose</span><span class="p">);</span>	<span class="cm">/* default to 64MB */</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Systems with larger DMA zones (those that don&#39;t support ISA) can</span>
+<span class="cm"> * initialize the swiotlb later using the slab allocator if needed.</span>
+<span class="cm"> * This should be just like above, but with some error catching.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span>
+<span class="nf">swiotlb_late_init_with_default_size</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">default_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">i</span><span class="p">,</span> <span class="n">bytes</span><span class="p">,</span> <span class="n">req_nslabs</span> <span class="o">=</span> <span class="n">io_tlb_nslabs</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">order</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_nslabs</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="p">(</span><span class="n">default_size</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Get IO TLB memory from the low pages</span>
+<span class="cm">	 */</span>
+	<span class="n">order</span> <span class="o">=</span> <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+	<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">SLABS_PER_PAGE</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">;</span>
+	<span class="n">bytes</span> <span class="o">=</span> <span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">((</span><span class="n">SLABS_PER_PAGE</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">IO_TLB_MIN_SLABS</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">io_tlb_start</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_DMA</span> <span class="o">|</span> <span class="n">__GFP_NOWARN</span><span class="p">,</span>
+							<span class="n">order</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">io_tlb_start</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">order</span><span class="o">--</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_start</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">cleanup1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">order</span> <span class="o">!=</span> <span class="n">get_order</span><span class="p">(</span><span class="n">bytes</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;Warning: only able to allocate %ld MB &quot;</span>
+		       <span class="s">&quot;for software IO TLB</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">);</span>
+		<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">SLABS_PER_PAGE</span> <span class="o">&lt;&lt;</span> <span class="n">order</span><span class="p">;</span>
+		<span class="n">bytes</span> <span class="o">=</span> <span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">io_tlb_end</span> <span class="o">=</span> <span class="n">io_tlb_start</span> <span class="o">+</span> <span class="n">bytes</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">io_tlb_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">bytes</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Allocate and initialize the free list array.  This array is used</span>
+<span class="cm">	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE</span>
+<span class="cm">	 * between io_tlb_start and io_tlb_end.</span>
+<span class="cm">	 */</span>
+	<span class="n">io_tlb_list</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span>
+	                              <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">)));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_list</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">cleanup2</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">io_tlb_nslabs</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+ 		<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">IO_TLB_SEGSIZE</span> <span class="o">-</span> <span class="n">OFFSET</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">);</span>
+	<span class="n">io_tlb_index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">io_tlb_orig_addr</span> <span class="o">=</span> <span class="p">(</span><span class="n">phys_addr_t</span> <span class="o">*</span><span class="p">)</span>
+		<span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="p">,</span>
+				 <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span>
+					   <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">)));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_orig_addr</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">cleanup3</span><span class="p">;</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">io_tlb_orig_addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">));</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Get the overflow emergency buffer</span>
+<span class="cm">	 */</span>
+	<span class="n">io_tlb_overflow_buffer</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">GFP_DMA</span><span class="p">,</span>
+	                                          <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_overflow</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_overflow_buffer</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">cleanup4</span><span class="p">;</span>
+
+	<span class="n">swiotlb_print_info</span><span class="p">();</span>
+
+	<span class="n">late_alloc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">cleanup4:</span>
+	<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_orig_addr</span><span class="p">,</span>
+		   <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">)));</span>
+	<span class="n">io_tlb_orig_addr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="nl">cleanup3:</span>
+	<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_list</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span>
+	                                                 <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">)));</span>
+	<span class="n">io_tlb_list</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="nl">cleanup2:</span>
+	<span class="n">io_tlb_end</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_start</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+	<span class="n">io_tlb_start</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="nl">cleanup1:</span>
+	<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="n">req_nslabs</span><span class="p">;</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">swiotlb_free</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">io_tlb_overflow_buffer</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">late_alloc</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_overflow_buffer</span><span class="p">,</span>
+			   <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_overflow</span><span class="p">));</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_orig_addr</span><span class="p">,</span>
+			   <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">)));</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_list</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span>
+								 <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">)));</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">io_tlb_start</span><span class="p">,</span>
+			   <span class="n">get_order</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">));</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">free_bootmem_late</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">io_tlb_overflow_buffer</span><span class="p">),</span>
+				  <span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_overflow</span><span class="p">));</span>
+		<span class="n">free_bootmem_late</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">io_tlb_orig_addr</span><span class="p">),</span>
+				  <span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">phys_addr_t</span><span class="p">)));</span>
+		<span class="n">free_bootmem_late</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">io_tlb_list</span><span class="p">),</span>
+				  <span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">)));</span>
+		<span class="n">free_bootmem_late</span><span class="p">(</span><span class="n">__pa</span><span class="p">(</span><span class="n">io_tlb_start</span><span class="p">),</span>
+				  <span class="n">PAGE_ALIGN</span><span class="p">(</span><span class="n">io_tlb_nslabs</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">));</span>
+	<span class="p">}</span>
+	<span class="n">io_tlb_nslabs</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">is_swiotlb_buffer</span><span class="p">(</span><span class="n">phys_addr_t</span> <span class="n">paddr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">paddr</span> <span class="o">&gt;=</span> <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">io_tlb_start</span><span class="p">)</span> <span class="o">&amp;&amp;</span>
+		<span class="n">paddr</span> <span class="o">&lt;</span> <span class="n">virt_to_phys</span><span class="p">(</span><span class="n">io_tlb_end</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Bounce: copy the swiotlb buffer back to the original dma location</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">swiotlb_bounce</span><span class="p">(</span><span class="n">phys_addr_t</span> <span class="n">phys</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dma_addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+		    <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">pfn</span> <span class="o">=</span> <span class="n">PFN_DOWN</span><span class="p">(</span><span class="n">phys</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageHighMem</span><span class="p">(</span><span class="n">pfn_to_page</span><span class="p">(</span><span class="n">pfn</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="cm">/* The buffer does not have a mapping.  Map it in and copy */</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">offset</span> <span class="o">=</span> <span class="n">phys</span> <span class="o">&amp;</span> <span class="o">~</span><span class="n">PAGE_MASK</span><span class="p">;</span>
+		<span class="kt">char</span> <span class="o">*</span><span class="n">buffer</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">sz</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+		<span class="k">while</span> <span class="p">(</span><span class="n">size</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">sz</span> <span class="o">=</span> <span class="n">min_t</span><span class="p">(</span><span class="kt">size_t</span><span class="p">,</span> <span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+
+			<span class="n">local_irq_save</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+			<span class="n">buffer</span> <span class="o">=</span> <span class="n">kmap_atomic</span><span class="p">(</span><span class="n">pfn_to_page</span><span class="p">(</span><span class="n">pfn</span><span class="p">));</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_TO_DEVICE</span><span class="p">)</span>
+				<span class="n">memcpy</span><span class="p">(</span><span class="n">dma_addr</span><span class="p">,</span> <span class="n">buffer</span> <span class="o">+</span> <span class="n">offset</span><span class="p">,</span> <span class="n">sz</span><span class="p">);</span>
+			<span class="k">else</span>
+				<span class="n">memcpy</span><span class="p">(</span><span class="n">buffer</span> <span class="o">+</span> <span class="n">offset</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">sz</span><span class="p">);</span>
+			<span class="n">kunmap_atomic</span><span class="p">(</span><span class="n">buffer</span><span class="p">);</span>
+			<span class="n">local_irq_restore</span><span class="p">(</span><span class="n">flags</span><span class="p">);</span>
+
+			<span class="n">size</span> <span class="o">-=</span> <span class="n">sz</span><span class="p">;</span>
+			<span class="n">pfn</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">dma_addr</span> <span class="o">+=</span> <span class="n">sz</span><span class="p">;</span>
+			<span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_TO_DEVICE</span><span class="p">)</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">dma_addr</span><span class="p">,</span> <span class="n">phys_to_virt</span><span class="p">(</span><span class="n">phys</span><span class="p">),</span> <span class="n">size</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">memcpy</span><span class="p">(</span><span class="n">phys_to_virt</span><span class="p">(</span><span class="n">phys</span><span class="p">),</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_bounce</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">swiotlb_tbl_map_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">tbl_dma_addr</span><span class="p">,</span>
+			     <span class="n">phys_addr_t</span> <span class="n">phys</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+			     <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">dma_addr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">nslots</span><span class="p">,</span> <span class="n">stride</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">wrap</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset_slots</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max_slots</span><span class="p">;</span>
+
+	<span class="n">mask</span> <span class="o">=</span> <span class="n">dma_get_seg_boundary</span><span class="p">(</span><span class="n">hwdev</span><span class="p">);</span>
+
+	<span class="n">tbl_dma_addr</span> <span class="o">&amp;=</span> <span class="n">mask</span><span class="p">;</span>
+
+	<span class="n">offset_slots</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">tbl_dma_addr</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm"> 	 * Carefully handle integer overflow which can occur when mask == ~0UL.</span>
+<span class="cm"> 	 */</span>
+	<span class="n">max_slots</span> <span class="o">=</span> <span class="n">mask</span> <span class="o">+</span> <span class="mi">1</span>
+		    <span class="o">?</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">mask</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span>
+		    <span class="o">:</span> <span class="mi">1UL</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">BITS_PER_LONG</span> <span class="o">-</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * For mappings greater than a page, we limit the stride (and</span>
+<span class="cm">	 * hence alignment) to a page size.</span>
+<span class="cm">	 */</span>
+	<span class="n">nslots</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">stride</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">PAGE_SHIFT</span> <span class="o">-</span> <span class="n">IO_TLB_SHIFT</span><span class="p">));</span>
+	<span class="k">else</span>
+		<span class="n">stride</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">nslots</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Find suitable number of IO TLB entries size that will fit this</span>
+<span class="cm">	 * request and allocate a buffer from that IO TLB pool.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_tlb_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">index</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">io_tlb_index</span><span class="p">,</span> <span class="n">stride</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">io_tlb_nslabs</span><span class="p">)</span>
+		<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">wrap</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">while</span> <span class="p">(</span><span class="n">iommu_is_span_boundary</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">nslots</span><span class="p">,</span> <span class="n">offset_slots</span><span class="p">,</span>
+					      <span class="n">max_slots</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">index</span> <span class="o">+=</span> <span class="n">stride</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">io_tlb_nslabs</span><span class="p">)</span>
+				<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">==</span> <span class="n">wrap</span><span class="p">)</span>
+				<span class="k">goto</span> <span class="n">not_found</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/*</span>
+<span class="cm">		 * If we find a slot that indicates we have &#39;nslots&#39; number of</span>
+<span class="cm">		 * contiguous buffers, we allocate the buffers from that slot</span>
+<span class="cm">		 * and mark the entries as &#39;0&#39; indicating unavailable.</span>
+<span class="cm">		 */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">io_tlb_list</span><span class="p">[</span><span class="n">index</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">nslots</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+			<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">index</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="p">(</span><span class="kt">int</span><span class="p">)</span> <span class="p">(</span><span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span><span class="p">);</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+				<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">index</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="p">(</span><span class="n">OFFSET</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">)</span> <span class="o">!=</span> <span class="n">IO_TLB_SEGSIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">];</span> <span class="n">i</span><span class="o">--</span><span class="p">)</span>
+				<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="o">++</span><span class="n">count</span><span class="p">;</span>
+			<span class="n">dma_addr</span> <span class="o">=</span> <span class="n">io_tlb_start</span> <span class="o">+</span> <span class="p">(</span><span class="n">index</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+
+			<span class="cm">/*</span>
+<span class="cm">			 * Update the indices to avoid searching in the next</span>
+<span class="cm">			 * round.</span>
+<span class="cm">			 */</span>
+			<span class="n">io_tlb_index</span> <span class="o">=</span> <span class="p">((</span><span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">io_tlb_nslabs</span>
+					<span class="o">?</span> <span class="p">(</span><span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span><span class="p">)</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+
+			<span class="k">goto</span> <span class="n">found</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">index</span> <span class="o">+=</span> <span class="n">stride</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&gt;=</span> <span class="n">io_tlb_nslabs</span><span class="p">)</span>
+			<span class="n">index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">index</span> <span class="o">!=</span> <span class="n">wrap</span><span class="p">);</span>
+
+<span class="nl">not_found:</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_tlb_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="nl">found:</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_tlb_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Save away the mapping from the original address to the DMA address.</span>
+<span class="cm">	 * This is needed when we sync the memory.  Then we sync the buffer if</span>
+<span class="cm">	 * needed.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">nslots</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">io_tlb_orig_addr</span><span class="p">[</span><span class="n">index</span><span class="o">+</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">phys</span> <span class="o">+</span> <span class="p">(</span><span class="n">i</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_TO_DEVICE</span> <span class="o">||</span> <span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">)</span>
+		<span class="n">swiotlb_bounce</span><span class="p">(</span><span class="n">phys</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">dma_addr</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_tbl_map_single</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Allocates bounce buffer and returns its kernel virtual address.</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="o">*</span>
+<span class="nf">map_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">phys_addr_t</span> <span class="n">phys</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+	   <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dma_addr_t</span> <span class="n">start_dma_addr</span> <span class="o">=</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">io_tlb_start</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">swiotlb_tbl_map_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">start_dma_addr</span><span class="p">,</span> <span class="n">phys</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * dma_addr is the kernel virtual address of the bounce buffer to unmap.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span>
+<span class="nf">swiotlb_tbl_unmap_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dma_addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+			<span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">count</span><span class="p">,</span> <span class="n">nslots</span> <span class="o">=</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">-</span> <span class="n">io_tlb_start</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="n">phys_addr_t</span> <span class="n">phys</span> <span class="o">=</span> <span class="n">io_tlb_orig_addr</span><span class="p">[</span><span class="n">index</span><span class="p">];</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * First, sync the memory before unmapping the entry</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">phys</span> <span class="o">&amp;&amp;</span> <span class="p">((</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">)</span> <span class="o">||</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">)))</span>
+		<span class="n">swiotlb_bounce</span><span class="p">(</span><span class="n">phys</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Return the buffer to the free list by setting the corresponding</span>
+<span class="cm">	 * entries to indicate the number of contiguous entries available.</span>
+<span class="cm">	 * While returning the entries to the free list, we merge the entries</span>
+<span class="cm">	 * with slots below and above the pool being returned.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_tlb_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">{</span>
+		<span class="n">count</span> <span class="o">=</span> <span class="p">((</span><span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">ALIGN</span><span class="p">(</span><span class="n">index</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">)</span> <span class="o">?</span>
+			 <span class="n">io_tlb_list</span><span class="p">[</span><span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span><span class="p">]</span> <span class="o">:</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Step 1: return the slots to the free list, merging the</span>
+<span class="cm">		 * slots with superceeding slots</span>
+<span class="cm">		 */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="n">nslots</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="n">index</span><span class="p">;</span> <span class="n">i</span><span class="o">--</span><span class="p">)</span>
+			<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="o">++</span><span class="n">count</span><span class="p">;</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * Step 2: merge the returned slots with the preceding slots,</span>
+<span class="cm">		 * if available (non zero)</span>
+<span class="cm">		 */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">index</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="p">(</span><span class="n">OFFSET</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">IO_TLB_SEGSIZE</span><span class="p">)</span> <span class="o">!=</span> <span class="n">IO_TLB_SEGSIZE</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">];</span> <span class="n">i</span><span class="o">--</span><span class="p">)</span>
+			<span class="n">io_tlb_list</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="o">++</span><span class="n">count</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">io_tlb_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_tbl_unmap_single</span><span class="p">);</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_tbl_sync_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">dma_addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+			<span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+			<span class="k">enum</span> <span class="n">dma_sync_target</span> <span class="n">target</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">-</span> <span class="n">io_tlb_start</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">;</span>
+	<span class="n">phys_addr_t</span> <span class="n">phys</span> <span class="o">=</span> <span class="n">io_tlb_orig_addr</span><span class="p">[</span><span class="n">index</span><span class="p">];</span>
+
+	<span class="n">phys</span> <span class="o">+=</span> <span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma_addr</span> <span class="o">&amp;</span> <span class="p">((</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IO_TLB_SHIFT</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">target</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">SYNC_FOR_CPU</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_FROM_DEVICE</span> <span class="o">||</span> <span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">))</span>
+			<span class="n">swiotlb_bounce</span><span class="p">(</span><span class="n">phys</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">!=</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">SYNC_FOR_DEVICE</span>:
+		<span class="k">if</span> <span class="p">(</span><span class="n">likely</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_TO_DEVICE</span> <span class="o">||</span> <span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">))</span>
+			<span class="n">swiotlb_bounce</span><span class="p">(</span><span class="n">phys</span><span class="p">,</span> <span class="n">dma_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">!=</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+		<span class="k">break</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_tbl_sync_single</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span>
+<span class="nf">swiotlb_alloc_coherent</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+		       <span class="n">dma_addr_t</span> <span class="o">*</span><span class="n">dma_handle</span><span class="p">,</span> <span class="n">gfp_t</span> <span class="n">flags</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">order</span> <span class="o">=</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+	<span class="n">u64</span> <span class="n">dma_mask</span> <span class="o">=</span> <span class="n">DMA_BIT_MASK</span><span class="p">(</span><span class="mi">32</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">hwdev</span> <span class="o">&amp;&amp;</span> <span class="n">hwdev</span><span class="o">-&gt;</span><span class="n">coherent_dma_mask</span><span class="p">)</span>
+		<span class="n">dma_mask</span> <span class="o">=</span> <span class="n">hwdev</span><span class="o">-&gt;</span><span class="n">coherent_dma_mask</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">__get_free_pages</span><span class="p">(</span><span class="n">flags</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&amp;&amp;</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">ret</span><span class="p">)</span> <span class="o">+</span> <span class="n">size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">&gt;</span> <span class="n">dma_mask</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * The allocated memory isn&#39;t reachable by the device.</span>
+<span class="cm">		 */</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">ret</span><span class="p">,</span> <span class="n">order</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/*</span>
+<span class="cm">		 * We are either out of memory or the device can&#39;t DMA to</span>
+<span class="cm">		 * GFP_DMA memory; fall back on map_single(), which</span>
+<span class="cm">		 * will grab memory from the lowest available address range.</span>
+<span class="cm">		 */</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">map_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ret</span><span class="p">)</span>
+			<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">ret</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+	<span class="n">dev_addr</span> <span class="o">=</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+	<span class="cm">/* Confirm address can be DMA&#39;d by device */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dev_addr</span> <span class="o">+</span> <span class="n">size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">&gt;</span> <span class="n">dma_mask</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="s">&quot;hwdev DMA mask = 0x%016Lx, dev_addr = 0x%016Lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dma_mask</span><span class="p">,</span>
+		       <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">dev_addr</span><span class="p">);</span>
+
+		<span class="cm">/* DMA_TO_DEVICE to avoid memcpy in unmap_single */</span>
+		<span class="n">swiotlb_tbl_unmap_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">ret</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="o">*</span><span class="n">dma_handle</span> <span class="o">=</span> <span class="n">dev_addr</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_alloc_coherent</span><span class="p">);</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_free_coherent</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">vaddr</span><span class="p">,</span>
+		      <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">phys_addr_t</span> <span class="n">paddr</span> <span class="o">=</span> <span class="n">dma_to_phys</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">);</span>
+
+	<span class="n">WARN_ON</span><span class="p">(</span><span class="n">irqs_disabled</span><span class="p">());</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">is_swiotlb_buffer</span><span class="p">(</span><span class="n">paddr</span><span class="p">))</span>
+		<span class="n">free_pages</span><span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span><span class="n">vaddr</span><span class="p">,</span> <span class="n">get_order</span><span class="p">(</span><span class="n">size</span><span class="p">));</span>
+	<span class="k">else</span>
+		<span class="cm">/* DMA_TO_DEVICE to avoid memcpy in swiotlb_tbl_unmap_single */</span>
+		<span class="n">swiotlb_tbl_unmap_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">vaddr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">DMA_TO_DEVICE</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_free_coherent</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">swiotlb_full</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+	     <span class="kt">int</span> <span class="n">do_panic</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Ran out of IOMMU space for this operation. This is very bad.</span>
+<span class="cm">	 * Unfortunately the drivers cannot handle this operation properly.</span>
+<span class="cm">	 * unless they check for dma_mapping_error (most don&#39;t)</span>
+<span class="cm">	 * When the mapping is small enough return a static buffer to limit</span>
+<span class="cm">	 * the damage, or panic when the transfer is too big.</span>
+<span class="cm">	 */</span>
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;DMA: Out of SW-IOMMU space for %zu bytes at &quot;</span>
+	       <span class="s">&quot;device %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dev</span> <span class="o">?</span> <span class="n">dev_name</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="o">:</span> <span class="s">&quot;?&quot;</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&lt;=</span> <span class="n">io_tlb_overflow</span> <span class="o">||</span> <span class="o">!</span><span class="n">do_panic</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_BIDIRECTIONAL</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;DMA: Random memory could be DMA accessed</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;DMA: Random memory could be DMA written</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_TO_DEVICE</span><span class="p">)</span>
+		<span class="n">panic</span><span class="p">(</span><span class="s">&quot;DMA: Random memory could be DMA read</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Map a single buffer of the indicated size for DMA in streaming mode.  The</span>
+<span class="cm"> * physical address to use is returned.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Once the device is given the dma address, the device owns this memory until</span>
+<span class="cm"> * either swiotlb_unmap_page or swiotlb_dma_sync_single is performed.</span>
+<span class="cm"> */</span>
+<span class="n">dma_addr_t</span> <span class="nf">swiotlb_map_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">dev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span>
+			    <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span>
+			    <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+			    <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">phys_addr_t</span> <span class="n">phys</span> <span class="o">=</span> <span class="n">page_to_phys</span><span class="p">(</span><span class="n">page</span><span class="p">)</span> <span class="o">+</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">dma_addr_t</span> <span class="n">dev_addr</span> <span class="o">=</span> <span class="n">phys_to_dma</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">phys</span><span class="p">);</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">map</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_NONE</span><span class="p">);</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * If the address happens to be in the device&#39;s DMA window,</span>
+<span class="cm">	 * we can safely return the device addr and not worry about bounce</span>
+<span class="cm">	 * buffering it.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">dma_capable</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">swiotlb_force</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">dev_addr</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Oh well, have to allocate and map a bounce buffer.</span>
+<span class="cm">	 */</span>
+	<span class="n">map</span> <span class="o">=</span> <span class="n">map_single</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">phys</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">map</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">swiotlb_full</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">map</span> <span class="o">=</span> <span class="n">io_tlb_overflow_buffer</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">dev_addr</span> <span class="o">=</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">map</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Ensure that the address returned is DMA&#39;ble</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dma_capable</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">swiotlb_tbl_unmap_single</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">map</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+		<span class="n">dev_addr</span> <span class="o">=</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">io_tlb_overflow_buffer</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">dev_addr</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_map_page</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Unmap a single streaming mode DMA translation.  The dma_addr and size must</span>
+<span class="cm"> * match what was provided for in a previous swiotlb_map_page call.  All</span>
+<span class="cm"> * other usages are undefined.</span>
+<span class="cm"> *</span>
+<span class="cm"> * After this call, reads by the cpu to the buffer are guaranteed to see</span>
+<span class="cm"> * whatever the device wrote there.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">unmap_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">,</span>
+			 <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">phys_addr_t</span> <span class="n">paddr</span> <span class="o">=</span> <span class="n">dma_to_phys</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_NONE</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_swiotlb_buffer</span><span class="p">(</span><span class="n">paddr</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">swiotlb_tbl_unmap_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">phys_to_virt</span><span class="p">(</span><span class="n">paddr</span><span class="p">),</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">!=</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * phys_to_virt doesn&#39;t work with hihgmem page but we could</span>
+<span class="cm">	 * call dma_mark_clean() with hihgmem page here. However, we</span>
+<span class="cm">	 * are fine since dma_mark_clean() is null on POWERPC. We can</span>
+<span class="cm">	 * make dma_mark_clean() take a physical address if necessary.</span>
+<span class="cm">	 */</span>
+	<span class="n">dma_mark_clean</span><span class="p">(</span><span class="n">phys_to_virt</span><span class="p">(</span><span class="n">paddr</span><span class="p">),</span> <span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">swiotlb_unmap_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">,</span>
+			<span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unmap_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">swiotlb_unmap_page</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Make physical memory consistent for a single streaming mode DMA translation</span>
+<span class="cm"> * after a transfer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * If you perform a swiotlb_map_page() but wish to interrogate the buffer</span>
+<span class="cm"> * using the cpu, yet do not wish to teardown the dma mapping, you must</span>
+<span class="cm"> * call this function before doing so.  At the next point you give the dma</span>
+<span class="cm"> * address back to the card, you must first perform a</span>
+<span class="cm"> * swiotlb_dma_sync_for_device, and then the device again owns the buffer</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">swiotlb_sync_single</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">,</span>
+		    <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+		    <span class="k">enum</span> <span class="n">dma_sync_target</span> <span class="n">target</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">phys_addr_t</span> <span class="n">paddr</span> <span class="o">=</span> <span class="n">dma_to_phys</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">);</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_NONE</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">is_swiotlb_buffer</span><span class="p">(</span><span class="n">paddr</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">swiotlb_tbl_sync_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">phys_to_virt</span><span class="p">(</span><span class="n">paddr</span><span class="p">),</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span>
+				       <span class="n">target</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">dir</span> <span class="o">!=</span> <span class="n">DMA_FROM_DEVICE</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">dma_mark_clean</span><span class="p">(</span><span class="n">phys_to_virt</span><span class="p">(</span><span class="n">paddr</span><span class="p">),</span> <span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_sync_single_for_cpu</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">,</span>
+			    <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">swiotlb_sync_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="n">SYNC_FOR_CPU</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_sync_single_for_cpu</span><span class="p">);</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_sync_single_for_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dev_addr</span><span class="p">,</span>
+			       <span class="kt">size_t</span> <span class="n">size</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">swiotlb_sync_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="n">SYNC_FOR_DEVICE</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_sync_single_for_device</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Map a set of buffers described by scatterlist in streaming mode for DMA.</span>
+<span class="cm"> * This is the scatter-gather version of the above swiotlb_map_page</span>
+<span class="cm"> * interface.  Here the scatter gather list elements are each tagged with the</span>
+<span class="cm"> * appropriate dma address and length.  They are obtained via</span>
+<span class="cm"> * sg_dma_{address,length}(SG).</span>
+<span class="cm"> *</span>
+<span class="cm"> * NOTE: An implementation may be able to use a smaller number of</span>
+<span class="cm"> *       DMA address/length pairs than there are SG table elements.</span>
+<span class="cm"> *       (for example via virtual mapping capabilities)</span>
+<span class="cm"> *       The routine returns the number of addr/length pairs actually</span>
+<span class="cm"> *       used, at most nents.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Device ownership issues as mentioned above for swiotlb_map_page are the</span>
+<span class="cm"> * same here.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span>
+<span class="nf">swiotlb_map_sg_attrs</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sgl</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span>
+		     <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_NONE</span><span class="p">);</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sgl</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">phys_addr_t</span> <span class="n">paddr</span> <span class="o">=</span> <span class="n">sg_phys</span><span class="p">(</span><span class="n">sg</span><span class="p">);</span>
+		<span class="n">dma_addr_t</span> <span class="n">dev_addr</span> <span class="o">=</span> <span class="n">phys_to_dma</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">paddr</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">swiotlb_force</span> <span class="o">||</span>
+		    <span class="o">!</span><span class="n">dma_capable</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dev_addr</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">))</span> <span class="p">{</span>
+			<span class="kt">void</span> <span class="o">*</span><span class="n">map</span> <span class="o">=</span> <span class="n">map_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg_phys</span><span class="p">(</span><span class="n">sg</span><span class="p">),</span>
+					       <span class="n">sg</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">map</span><span class="p">)</span> <span class="p">{</span>
+				<span class="cm">/* Don&#39;t panic here, we expect map_sg users</span>
+<span class="cm">				   to do proper error handling. */</span>
+				<span class="n">swiotlb_full</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+				<span class="n">swiotlb_unmap_sg_attrs</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sgl</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span>
+						       <span class="n">attrs</span><span class="p">);</span>
+				<span class="n">sgl</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">dma_length</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="p">}</span>
+			<span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">map</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_address</span> <span class="o">=</span> <span class="n">dev_addr</span><span class="p">;</span>
+		<span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_length</span> <span class="o">=</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">length</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">nelems</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_map_sg_attrs</span><span class="p">);</span>
+
+<span class="kt">int</span>
+<span class="nf">swiotlb_map_sg</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sgl</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span>
+	       <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">swiotlb_map_sg_attrs</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sgl</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_map_sg</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Unmap a set of streaming mode DMA translations.  Again, cpu read rules</span>
+<span class="cm"> * concerning calls here are the same as for swiotlb_unmap_page() above.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span>
+<span class="nf">swiotlb_unmap_sg_attrs</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sgl</span><span class="p">,</span>
+		       <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dma_attrs</span> <span class="o">*</span><span class="n">attrs</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">dir</span> <span class="o">==</span> <span class="n">DMA_NONE</span><span class="p">);</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sgl</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+		<span class="n">unmap_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_address</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_length</span><span class="p">,</span> <span class="n">dir</span><span class="p">);</span>
+
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_unmap_sg_attrs</span><span class="p">);</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_unmap_sg</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sgl</span><span class="p">,</span> <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span>
+		 <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">swiotlb_unmap_sg_attrs</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sgl</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_unmap_sg</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Make physical memory consistent for a set of streaming mode DMA translations</span>
+<span class="cm"> * after a transfer.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The same as swiotlb_sync_single_* but for a scatter-gather list, same rules</span>
+<span class="cm"> * and usage.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">swiotlb_sync_sg</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sgl</span><span class="p">,</span>
+		<span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">,</span>
+		<span class="k">enum</span> <span class="n">dma_sync_target</span> <span class="n">target</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">for_each_sg</span><span class="p">(</span><span class="n">sgl</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+		<span class="n">swiotlb_sync_single</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_address</span><span class="p">,</span>
+				    <span class="n">sg</span><span class="o">-&gt;</span><span class="n">dma_length</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="n">target</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_sync_sg_for_cpu</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">,</span>
+			<span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">swiotlb_sync_sg</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="n">SYNC_FOR_CPU</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_sync_sg_for_cpu</span><span class="p">);</span>
+
+<span class="kt">void</span>
+<span class="nf">swiotlb_sync_sg_for_device</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="k">struct</span> <span class="n">scatterlist</span> <span class="o">*</span><span class="n">sg</span><span class="p">,</span>
+			   <span class="kt">int</span> <span class="n">nelems</span><span class="p">,</span> <span class="k">enum</span> <span class="n">dma_data_direction</span> <span class="n">dir</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">swiotlb_sync_sg</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">sg</span><span class="p">,</span> <span class="n">nelems</span><span class="p">,</span> <span class="n">dir</span><span class="p">,</span> <span class="n">SYNC_FOR_DEVICE</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_sync_sg_for_device</span><span class="p">);</span>
+
+<span class="kt">int</span>
+<span class="nf">swiotlb_dma_mapping_error</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">dma_addr_t</span> <span class="n">dma_addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">dma_addr</span> <span class="o">==</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">io_tlb_overflow_buffer</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_dma_mapping_error</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Return whether the given device DMA address mask can be supported</span>
+<span class="cm"> * properly.  For example, if your device can only drive the low 24-bits</span>
+<span class="cm"> * during bus mastering, then you would pass 0x00ffffff as the mask to</span>
+<span class="cm"> * this function.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span>
+<span class="nf">swiotlb_dma_supported</span><span class="p">(</span><span class="k">struct</span> <span class="n">device</span> <span class="o">*</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">u64</span> <span class="n">mask</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">swiotlb_virt_to_bus</span><span class="p">(</span><span class="n">hwdev</span><span class="p">,</span> <span class="n">io_tlb_end</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">mask</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">swiotlb_dma_supported</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>

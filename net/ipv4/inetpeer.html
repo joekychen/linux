@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › ipv4 › inetpeer.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>inetpeer.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> *		INETPEER - A storage for permanent information about peers</span>
+<span class="cm"> *</span>
+<span class="cm"> *  This source is covered by the GNU GPL, the same as all kernel sources.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Authors:	Andrey V. Savochkin &lt;saw@msu.ru&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/interrupt.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/random.h&gt;</span>
+<span class="cp">#include &lt;linux/timer.h&gt;</span>
+<span class="cp">#include &lt;linux/time.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/net.h&gt;</span>
+<span class="cp">#include &lt;linux/workqueue.h&gt;</span>
+<span class="cp">#include &lt;net/ip.h&gt;</span>
+<span class="cp">#include &lt;net/inetpeer.h&gt;</span>
+<span class="cp">#include &lt;net/secure_seq.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *  Theory of operations.</span>
+<span class="cm"> *  We keep one entry for each peer IP address.  The nodes contains long-living</span>
+<span class="cm"> *  information about the peer which doesn&#39;t depend on routes.</span>
+<span class="cm"> *  At this moment this information consists only of ID field for the next</span>
+<span class="cm"> *  outgoing IP packet.  This field is incremented with each packet as encoded</span>
+<span class="cm"> *  in inet_getid() function (include/net/inetpeer.h).</span>
+<span class="cm"> *  At the moment of writing this notes identifier of IP packets is generated</span>
+<span class="cm"> *  to be unpredictable using this code only for packets subjected</span>
+<span class="cm"> *  (actually or potentially) to defragmentation.  I.e. DF packets less than</span>
+<span class="cm"> *  PMTU in size uses a constant ID and do not use this code (see</span>
+<span class="cm"> *  ip_select_ident() in include/net/ip.h).</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Route cache entries hold references to our nodes.</span>
+<span class="cm"> *  New cache entries get references via lookup by destination IP address in</span>
+<span class="cm"> *  the avl tree.  The reference is grabbed only when it&#39;s needed i.e. only</span>
+<span class="cm"> *  when we try to output IP packet which needs an unpredictable ID (see</span>
+<span class="cm"> *  __ip_select_ident() in net/ipv4/route.c).</span>
+<span class="cm"> *  Nodes are removed only when reference counter goes to 0.</span>
+<span class="cm"> *  When it&#39;s happened the node may be removed when a sufficient amount of</span>
+<span class="cm"> *  time has been passed since its last use.  The less-recently-used entry can</span>
+<span class="cm"> *  also be removed if the pool is overloaded i.e. if the total amount of</span>
+<span class="cm"> *  entries is greater-or-equal than the threshold.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Node pool is organised as an AVL tree.</span>
+<span class="cm"> *  Such an implementation has been chosen not just for fun.  It&#39;s a way to</span>
+<span class="cm"> *  prevent easy and efficient DoS attacks by creating hash collisions.  A huge</span>
+<span class="cm"> *  amount of long living nodes in a single hash slot would significantly delay</span>
+<span class="cm"> *  lookups performed with disabled BHs.</span>
+<span class="cm"> *</span>
+<span class="cm"> *  Serialisation issues.</span>
+<span class="cm"> *  1.  Nodes may appear in the tree only with the pool lock held.</span>
+<span class="cm"> *  2.  Nodes may disappear from the tree only with the pool lock held</span>
+<span class="cm"> *      AND reference count being 0.</span>
+<span class="cm"> *  3.  Global variable peer_total is modified under the pool lock.</span>
+<span class="cm"> *  4.  struct inet_peer fields modification:</span>
+<span class="cm"> *		avl_left, avl_right, avl_parent, avl_height: pool lock</span>
+<span class="cm"> *		refcnt: atomically against modifications on other CPU;</span>
+<span class="cm"> *		   usually under some other lock to prevent node disappearing</span>
+<span class="cm"> *		daddr: unchangeable</span>
+<span class="cm"> *		ip_id_count: atomic value (no lock needed)</span>
+<span class="cm"> */</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">kmem_cache</span> <span class="o">*</span><span class="n">peer_cachep</span> <span class="n">__read_mostly</span><span class="p">;</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">gc_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">const</span> <span class="kt">int</span> <span class="n">gc_delay</span> <span class="o">=</span> <span class="mi">60</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">delayed_work</span> <span class="n">gc_work</span><span class="p">;</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">gc_lock</span><span class="p">);</span>
+
+<span class="cp">#define node_height(x) x-&gt;avl_height</span>
+
+<span class="cp">#define peer_avl_empty ((struct inet_peer *)&amp;peer_fake_node)</span>
+<span class="cp">#define peer_avl_empty_rcu ((struct inet_peer __rcu __force *)&amp;peer_fake_node)</span>
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">peer_fake_node</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">avl_left</span>	<span class="o">=</span> <span class="n">peer_avl_empty_rcu</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">avl_right</span>	<span class="o">=</span> <span class="n">peer_avl_empty_rcu</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">avl_height</span>	<span class="o">=</span> <span class="mi">0</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">*</span><span class="n">root</span><span class="p">;</span>
+	<span class="n">seqlock_t</span>	<span class="n">lock</span><span class="p">;</span>
+	<span class="kt">int</span>		<span class="n">total</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="n">v4_peers</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">root</span>		<span class="o">=</span> <span class="n">peer_avl_empty_rcu</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">lock</span>		<span class="o">=</span> <span class="n">__SEQLOCK_UNLOCKED</span><span class="p">(</span><span class="n">v4_peers</span><span class="p">.</span><span class="n">lock</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">total</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="n">v6_peers</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">root</span>		<span class="o">=</span> <span class="n">peer_avl_empty_rcu</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">lock</span>		<span class="o">=</span> <span class="n">__SEQLOCK_UNLOCKED</span><span class="p">(</span><span class="n">v6_peers</span><span class="p">.</span><span class="n">lock</span><span class="p">),</span>
+	<span class="p">.</span><span class="n">total</span>		<span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cp">#define PEER_MAXDEPTH 40 </span><span class="cm">/* sufficient for about 2^27 nodes */</span><span class="cp"></span>
+
+<span class="cm">/* Exported for sysctl_net_ipv4.  */</span>
+<span class="kt">int</span> <span class="n">inet_peer_threshold</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="mi">65536</span> <span class="o">+</span> <span class="mi">128</span><span class="p">;</span>	<span class="cm">/* start to throw entries more</span>
+<span class="cm">					 * aggressively at this stage */</span>
+<span class="kt">int</span> <span class="n">inet_peer_minttl</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="mi">120</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>	<span class="cm">/* TTL under high load: 120 sec */</span>
+<span class="kt">int</span> <span class="n">inet_peer_maxttl</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="mi">10</span> <span class="o">*</span> <span class="mi">60</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>	<span class="cm">/* usual time to live: 10 min */</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">inetpeer_gc_worker</span><span class="p">(</span><span class="k">struct</span> <span class="n">work_struct</span> <span class="o">*</span><span class="n">work</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+	<span class="n">list_replace_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">,</span> <span class="n">gc_list</span><span class="p">)</span> <span class="p">{</span>
+
+		<span class="k">if</span><span class="p">(</span><span class="n">need_resched</span><span class="p">())</span>
+			<span class="n">cond_resched</span><span class="p">();</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span> <span class="o">!=</span> <span class="n">peer_avl_empty</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span> <span class="o">=</span> <span class="n">peer_avl_empty</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_right</span> <span class="o">!=</span> <span class="n">peer_avl_empty</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">list</span><span class="p">);</span>
+			<span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_right</span> <span class="o">=</span> <span class="n">peer_avl_empty</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">n</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inet_peer</span><span class="p">,</span> <span class="n">gc_list</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">);</span>
+			<span class="n">kmem_cache_free</span><span class="p">(</span><span class="n">peer_cachep</span><span class="p">,</span> <span class="n">p</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+	<span class="n">list_splice</span><span class="p">(</span><span class="o">&amp;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gc_list</span><span class="p">);</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+
+	<span class="n">schedule_delayed_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_work</span><span class="p">,</span> <span class="n">gc_delay</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Called from ip_output.c:ip_init  */</span>
+<span class="kt">void</span> <span class="n">__init</span> <span class="nf">inet_initpeers</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sysinfo</span> <span class="n">si</span><span class="p">;</span>
+
+	<span class="cm">/* Use the straight interface to information about memory. */</span>
+	<span class="n">si_meminfo</span><span class="p">(</span><span class="o">&amp;</span><span class="n">si</span><span class="p">);</span>
+	<span class="cm">/* The values below were suggested by Alexey Kuznetsov</span>
+<span class="cm">	 * &lt;kuznet@ms2.inr.ac.ru&gt;.  I don&#39;t have any opinion about the values</span>
+<span class="cm">	 * myself.  --SAW</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">si</span><span class="p">.</span><span class="n">totalram</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="mi">32768</span><span class="o">*</span><span class="mi">1024</span><span class="p">)</span><span class="o">/</span><span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">inet_peer_threshold</span> <span class="o">&gt;&gt;=</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* max pool size about 1MB on IA32 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">si</span><span class="p">.</span><span class="n">totalram</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="mi">16384</span><span class="o">*</span><span class="mi">1024</span><span class="p">)</span><span class="o">/</span><span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">inet_peer_threshold</span> <span class="o">&gt;&gt;=</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* about 512KB */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">si</span><span class="p">.</span><span class="n">totalram</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="mi">8192</span><span class="o">*</span><span class="mi">1024</span><span class="p">)</span><span class="o">/</span><span class="n">PAGE_SIZE</span><span class="p">)</span>
+		<span class="n">inet_peer_threshold</span> <span class="o">&gt;&gt;=</span> <span class="mi">2</span><span class="p">;</span> <span class="cm">/* about 128KB */</span>
+
+	<span class="n">peer_cachep</span> <span class="o">=</span> <span class="n">kmem_cache_create</span><span class="p">(</span><span class="s">&quot;inet_peer_cache&quot;</span><span class="p">,</span>
+			<span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer</span><span class="p">),</span>
+			<span class="mi">0</span><span class="p">,</span> <span class="n">SLAB_HWCACHE_ALIGN</span> <span class="o">|</span> <span class="n">SLAB_PANIC</span><span class="p">,</span>
+			<span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="n">INIT_DELAYED_WORK_DEFERRABLE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_work</span><span class="p">,</span> <span class="n">inetpeer_gc_worker</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">addr_compare</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">inetpeer_addr</span> <span class="o">*</span><span class="n">a</span><span class="p">,</span>
+			<span class="k">const</span> <span class="k">struct</span> <span class="n">inetpeer_addr</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="p">(</span><span class="n">a</span><span class="o">-&gt;</span><span class="n">family</span> <span class="o">==</span> <span class="n">AF_INET</span> <span class="o">?</span> <span class="mi">1</span> <span class="o">:</span> <span class="mi">4</span><span class="p">);</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">n</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">a</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a6</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a6</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">__force</span> <span class="n">u32</span><span class="p">)</span><span class="n">a</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a6</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">__force</span> <span class="n">u32</span><span class="p">)</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a6</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+			<span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cp">#define rcu_deref_locked(X, BASE)				\</span>
+<span class="cp">	rcu_dereference_protected(X, lockdep_is_held(&amp;(BASE)-&gt;lock.lock))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called with local BH disabled and the pool lock held.</span>
+<span class="cm"> */</span>
+<span class="cp">#define lookup(_daddr, _stack, _base)				\</span>
+<span class="cp">({								\</span>
+<span class="cp">	struct inet_peer *u;					\</span>
+<span class="cp">	struct inet_peer __rcu **v;				\</span>
+<span class="cp">								\</span>
+<span class="cp">	stackptr = _stack;					\</span>
+<span class="cp">	*stackptr++ = &amp;_base-&gt;root;				\</span>
+<span class="cp">	for (u = rcu_deref_locked(_base-&gt;root, _base);		\</span>
+<span class="cp">	     u != peer_avl_empty; ) {				\</span>
+<span class="cp">		int cmp = addr_compare(_daddr, &amp;u-&gt;daddr);	\</span>
+<span class="cp">		if (cmp == 0)					\</span>
+<span class="cp">			break;					\</span>
+<span class="cp">		if (cmp == -1)					\</span>
+<span class="cp">			v = &amp;u-&gt;avl_left;			\</span>
+<span class="cp">		else						\</span>
+<span class="cp">			v = &amp;u-&gt;avl_right;			\</span>
+<span class="cp">		*stackptr++ = v;				\</span>
+<span class="cp">		u = rcu_deref_locked(*v, _base);		\</span>
+<span class="cp">	}							\</span>
+<span class="cp">	u;							\</span>
+<span class="cp">})</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Called with rcu_read_lock()</span>
+<span class="cm"> * Because we hold no lock against a writer, its quite possible we fall</span>
+<span class="cm"> * in an endless loop.</span>
+<span class="cm"> * But every pointer we follow is guaranteed to be valid thanks to RCU.</span>
+<span class="cm"> * We exit from this function if number of links exceeds PEER_MAXDEPTH</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="nf">lookup_rcu</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">inetpeer_addr</span> <span class="o">*</span><span class="n">daddr</span><span class="p">,</span>
+				    <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">u</span> <span class="o">=</span> <span class="n">rcu_dereference</span><span class="p">(</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">u</span> <span class="o">!=</span> <span class="n">peer_avl_empty</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">cmp</span> <span class="o">=</span> <span class="n">addr_compare</span><span class="p">(</span><span class="n">daddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cmp</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* Before taking a reference, check if this entry was</span>
+<span class="cm">			 * deleted (refcnt=-1)</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">atomic_add_unless</span><span class="p">(</span><span class="o">&amp;</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+				<span class="n">u</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="k">return</span> <span class="n">u</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">cmp</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+			<span class="n">u</span> <span class="o">=</span> <span class="n">rcu_dereference</span><span class="p">(</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">u</span> <span class="o">=</span> <span class="n">rcu_dereference</span><span class="p">(</span><span class="n">u</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">++</span><span class="n">count</span> <span class="o">==</span> <span class="n">PEER_MAXDEPTH</span><span class="p">))</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Called with local BH disabled and the pool lock held. */</span>
+<span class="cp">#define lookup_rightempty(start, base)				\</span>
+<span class="cp">({								\</span>
+<span class="cp">	struct inet_peer *u;					\</span>
+<span class="cp">	struct inet_peer __rcu **v;				\</span>
+<span class="cp">	*stackptr++ = &amp;start-&gt;avl_left;				\</span>
+<span class="cp">	v = &amp;start-&gt;avl_left;					\</span>
+<span class="cp">	for (u = rcu_deref_locked(*v, base);			\</span>
+<span class="cp">	     u-&gt;avl_right != peer_avl_empty_rcu; ) {		\</span>
+<span class="cp">		v = &amp;u-&gt;avl_right;				\</span>
+<span class="cp">		*stackptr++ = v;				\</span>
+<span class="cp">		u = rcu_deref_locked(*v, base);			\</span>
+<span class="cp">	}							\</span>
+<span class="cp">	u;							\</span>
+<span class="cp">})</span>
+
+<span class="cm">/* Called with local BH disabled and the pool lock held.</span>
+<span class="cm"> * Variable names are the proof of operation correctness.</span>
+<span class="cm"> * Look into mm/map_avl.c for more detail description of the ideas.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">peer_avl_rebalance</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">**</span><span class="n">stack</span><span class="p">[],</span>
+			       <span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">***</span><span class="n">stackend</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">**</span><span class="n">nodep</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">node</span><span class="p">,</span> <span class="o">*</span><span class="n">l</span><span class="p">,</span> <span class="o">*</span><span class="n">r</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">lh</span><span class="p">,</span> <span class="n">rh</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="n">stackend</span> <span class="o">&gt;</span> <span class="n">stack</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">nodep</span> <span class="o">=</span> <span class="o">*--</span><span class="n">stackend</span><span class="p">;</span>
+		<span class="n">node</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="o">*</span><span class="n">nodep</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="n">l</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="n">lh</span> <span class="o">=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">l</span><span class="p">);</span>
+		<span class="n">rh</span> <span class="o">=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lh</span> <span class="o">&gt;</span> <span class="n">rh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* l: RH+2 */</span>
+			<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">ll</span><span class="p">,</span> <span class="o">*</span><span class="n">lr</span><span class="p">,</span> <span class="o">*</span><span class="n">lrl</span><span class="p">,</span> <span class="o">*</span><span class="n">lrr</span><span class="p">;</span>
+			<span class="kt">int</span> <span class="n">lrh</span><span class="p">;</span>
+			<span class="n">ll</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+			<span class="n">lr</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+			<span class="n">lrh</span> <span class="o">=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">lr</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">lrh</span> <span class="o">&lt;=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">ll</span><span class="p">))</span> <span class="p">{</span>	<span class="cm">/* ll: RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">lr</span><span class="p">);</span>	<span class="cm">/* lr: RH or RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>	<span class="cm">/* r: RH */</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">lrh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* RH+1 or RH+2 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">ll</span><span class="p">);</span>       <span class="cm">/* ll: RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>	<span class="cm">/* node: RH+1 or RH+2 */</span>
+				<span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="o">*</span><span class="n">nodep</span><span class="p">,</span> <span class="n">l</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span> <span class="cm">/* ll: RH, lr: RH+1 */</span>
+				<span class="n">lrl</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">lr</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span><span class="cm">/* lrl: RH or RH-1 */</span>
+				<span class="n">lrr</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">lr</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span><span class="cm">/* lrr: RH or RH-1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">lrr</span><span class="p">);</span>	<span class="cm">/* lrr: RH or RH-1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>	<span class="cm">/* r: RH */</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">rh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* node: RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">ll</span><span class="p">);</span>	<span class="cm">/* ll: RH */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">lrl</span><span class="p">);</span>	<span class="cm">/* lrl: RH or RH-1 */</span>
+				<span class="n">l</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">rh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>	<span class="cm">/* l: RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">lr</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">l</span><span class="p">);</span>	<span class="cm">/* l: RH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">lr</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>	<span class="cm">/* node: RH+1 */</span>
+				<span class="n">lr</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">rh</span> <span class="o">+</span> <span class="mi">2</span><span class="p">;</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="o">*</span><span class="n">nodep</span><span class="p">,</span> <span class="n">lr</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">rh</span> <span class="o">&gt;</span> <span class="n">lh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* r: LH+2 */</span>
+			<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">rr</span><span class="p">,</span> <span class="o">*</span><span class="n">rl</span><span class="p">,</span> <span class="o">*</span><span class="n">rlr</span><span class="p">,</span> <span class="o">*</span><span class="n">rll</span><span class="p">;</span>
+			<span class="kt">int</span> <span class="n">rlh</span><span class="p">;</span>
+			<span class="n">rr</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+			<span class="n">rl</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+			<span class="n">rlh</span> <span class="o">=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">rl</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">rlh</span> <span class="o">&lt;=</span> <span class="n">node_height</span><span class="p">(</span><span class="n">rr</span><span class="p">))</span> <span class="p">{</span>	<span class="cm">/* rr: LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">rl</span><span class="p">);</span>	<span class="cm">/* rl: LH or LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">l</span><span class="p">);</span>	<span class="cm">/* l: LH */</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">rlh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* LH+1 or LH+2 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">rr</span><span class="p">);</span>	<span class="cm">/* rr: LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>	<span class="cm">/* node: LH+1 or LH+2 */</span>
+				<span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="o">*</span><span class="n">nodep</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span> <span class="cm">/* rr: RH, rl: RH+1 */</span>
+				<span class="n">rlr</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">rl</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span><span class="cm">/* rlr: LH or LH-1 */</span>
+				<span class="n">rll</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="n">rl</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span><span class="cm">/* rll: LH or LH-1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">rll</span><span class="p">);</span>	<span class="cm">/* rll: LH or LH-1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">l</span><span class="p">);</span>	<span class="cm">/* l: LH */</span>
+				<span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">lh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* node: LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">rr</span><span class="p">);</span>	<span class="cm">/* rr: LH */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">rlr</span><span class="p">);</span>	<span class="cm">/* rlr: LH or LH-1 */</span>
+				<span class="n">r</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">lh</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>	<span class="cm">/* r: LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">rl</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>	<span class="cm">/* r: LH+1 */</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="n">rl</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">,</span> <span class="n">node</span><span class="p">);</span>	<span class="cm">/* node: LH+1 */</span>
+				<span class="n">rl</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">lh</span> <span class="o">+</span> <span class="mi">2</span><span class="p">;</span>
+				<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="o">*</span><span class="n">nodep</span><span class="p">,</span> <span class="n">rl</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">node</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="p">(</span><span class="n">lh</span> <span class="o">&gt;</span> <span class="n">rh</span> <span class="o">?</span> <span class="n">lh</span> <span class="o">:</span> <span class="n">rh</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/* Called with local BH disabled and the pool lock held. */</span>
+<span class="cp">#define link_to_pool(n, base)					\</span>
+<span class="cp">do {								\</span>
+<span class="cp">	n-&gt;avl_height = 1;					\</span>
+<span class="cp">	n-&gt;avl_left = peer_avl_empty_rcu;			\</span>
+<span class="cp">	n-&gt;avl_right = peer_avl_empty_rcu;			\</span>
+<span class="cp">	</span><span class="cm">/* lockless readers can catch us now */</span><span class="cp">			\</span>
+<span class="cp">	rcu_assign_pointer(**--stackptr, n);			\</span>
+<span class="cp">	peer_avl_rebalance(stack, stackptr, base);		\</span>
+<span class="cp">} while (0)</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">inetpeer_free_rcu</span><span class="p">(</span><span class="k">struct</span> <span class="n">rcu_head</span> <span class="o">*</span><span class="n">head</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">kmem_cache_free</span><span class="p">(</span><span class="n">peer_cachep</span><span class="p">,</span> <span class="n">container_of</span><span class="p">(</span><span class="n">head</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inet_peer</span><span class="p">,</span> <span class="n">rcu</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">unlink_from_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">**</span><span class="n">stack</span><span class="p">[</span><span class="n">PEER_MAXDEPTH</span><span class="p">])</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">***</span><span class="n">stackptr</span><span class="p">,</span> <span class="o">***</span><span class="n">delp</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">daddr</span><span class="p">,</span> <span class="n">stack</span><span class="p">,</span> <span class="n">base</span><span class="p">)</span> <span class="o">!=</span> <span class="n">p</span><span class="p">)</span>
+		<span class="n">BUG</span><span class="p">();</span>
+	<span class="n">delp</span> <span class="o">=</span> <span class="n">stackptr</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="cm">/* *delp[0] == p */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span> <span class="o">==</span> <span class="n">peer_avl_empty_rcu</span><span class="p">)</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">delp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">;</span>
+		<span class="o">--</span><span class="n">stackptr</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* look for a node to insert instead of p */</span>
+		<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">t</span><span class="p">;</span>
+		<span class="n">t</span> <span class="o">=</span> <span class="n">lookup_rightempty</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">rcu_deref_locked</span><span class="p">(</span><span class="o">*</span><span class="n">stackptr</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">base</span><span class="p">)</span> <span class="o">!=</span> <span class="n">t</span><span class="p">);</span>
+		<span class="o">**--</span><span class="n">stackptr</span> <span class="o">=</span> <span class="n">t</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">;</span>
+		<span class="cm">/* t is removed, t-&gt;daddr &gt; x-&gt;daddr for any</span>
+<span class="cm">		 * x in p-&gt;avl_left subtree.</span>
+<span class="cm">		 * Put t in the old place of p. */</span>
+		<span class="n">RCU_INIT_POINTER</span><span class="p">(</span><span class="o">*</span><span class="n">delp</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">t</span><span class="p">);</span>
+		<span class="n">t</span><span class="o">-&gt;</span><span class="n">avl_left</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">;</span>
+		<span class="n">t</span><span class="o">-&gt;</span><span class="n">avl_right</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_right</span><span class="p">;</span>
+		<span class="n">t</span><span class="o">-&gt;</span><span class="n">avl_height</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_height</span><span class="p">;</span>
+		<span class="n">BUG_ON</span><span class="p">(</span><span class="n">delp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">);</span>
+		<span class="n">delp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">t</span><span class="o">-&gt;</span><span class="n">avl_left</span><span class="p">;</span> <span class="cm">/* was &amp;p-&gt;avl_left */</span>
+	<span class="p">}</span>
+	<span class="n">peer_avl_rebalance</span><span class="p">(</span><span class="n">stack</span><span class="p">,</span> <span class="n">stackptr</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+	<span class="n">base</span><span class="o">-&gt;</span><span class="n">total</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">rcu</span><span class="p">,</span> <span class="n">inetpeer_free_rcu</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="nf">family_to_base</span><span class="p">(</span><span class="kt">int</span> <span class="n">family</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">family</span> <span class="o">==</span> <span class="n">AF_INET</span> <span class="o">?</span> <span class="o">&amp;</span><span class="n">v4_peers</span> <span class="o">:</span> <span class="o">&amp;</span><span class="n">v6_peers</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* perform garbage collect on all items stacked during a lookup */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">inet_peer_gc</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">**</span><span class="n">stack</span><span class="p">[</span><span class="n">PEER_MAXDEPTH</span><span class="p">],</span>
+			<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">***</span><span class="n">stackptr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="o">*</span><span class="n">gchead</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">__u32</span> <span class="n">delta</span><span class="p">,</span> <span class="n">ttl</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">cnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">total</span> <span class="o">&gt;=</span> <span class="n">inet_peer_threshold</span><span class="p">)</span>
+		<span class="n">ttl</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="cm">/* be aggressive */</span>
+	<span class="k">else</span>
+		<span class="n">ttl</span> <span class="o">=</span> <span class="n">inet_peer_maxttl</span>
+				<span class="o">-</span> <span class="p">(</span><span class="n">inet_peer_maxttl</span> <span class="o">-</span> <span class="n">inet_peer_minttl</span><span class="p">)</span> <span class="o">/</span> <span class="n">HZ</span> <span class="o">*</span>
+					<span class="n">base</span><span class="o">-&gt;</span><span class="n">total</span> <span class="o">/</span> <span class="n">inet_peer_threshold</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="n">stackptr</span><span class="o">--</span><span class="p">;</span> <span class="cm">/* last stack slot is peer_avl_empty */</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">stackptr</span> <span class="o">&gt;</span> <span class="n">stack</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">stackptr</span><span class="o">--</span><span class="p">;</span>
+		<span class="n">p</span> <span class="o">=</span> <span class="n">rcu_deref_locked</span><span class="p">(</span><span class="o">**</span><span class="n">stackptr</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">smp_rmb</span><span class="p">();</span>
+			<span class="n">delta</span> <span class="o">=</span> <span class="p">(</span><span class="n">__u32</span><span class="p">)</span><span class="n">jiffies</span> <span class="o">-</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">dtime</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">delta</span> <span class="o">&gt;=</span> <span class="n">ttl</span> <span class="o">&amp;&amp;</span>
+			    <span class="n">atomic_cmpxchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_next</span> <span class="o">=</span> <span class="n">gchead</span><span class="p">;</span>
+				<span class="n">gchead</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">while</span> <span class="p">((</span><span class="n">p</span> <span class="o">=</span> <span class="n">gchead</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gchead</span> <span class="o">=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_next</span><span class="p">;</span>
+		<span class="n">cnt</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">unlink_from_pool</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">stack</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">cnt</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="nf">inet_getpeer</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">inetpeer_addr</span> <span class="o">*</span><span class="n">daddr</span><span class="p">,</span> <span class="kt">int</span> <span class="n">create</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="n">__rcu</span> <span class="o">**</span><span class="n">stack</span><span class="p">[</span><span class="n">PEER_MAXDEPTH</span><span class="p">],</span> <span class="o">***</span><span class="n">stackptr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span> <span class="o">=</span> <span class="n">family_to_base</span><span class="p">(</span><span class="n">daddr</span><span class="o">-&gt;</span><span class="n">family</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">sequence</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">invalidated</span><span class="p">,</span> <span class="n">gccnt</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/* Attempt a lockless lookup first.</span>
+<span class="cm">	 * Because of a concurrent writer, we might not find an existing entry.</span>
+<span class="cm">	 */</span>
+	<span class="n">rcu_read_lock</span><span class="p">();</span>
+	<span class="n">sequence</span> <span class="o">=</span> <span class="n">read_seqbegin</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">p</span> <span class="o">=</span> <span class="n">lookup_rcu</span><span class="p">(</span><span class="n">daddr</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+	<span class="n">invalidated</span> <span class="o">=</span> <span class="n">read_seqretry</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span> <span class="n">sequence</span><span class="p">);</span>
+	<span class="n">rcu_read_unlock</span><span class="p">();</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+
+	<span class="cm">/* If no writer did a change during our lookup, we can return early. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">create</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">invalidated</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* retry an exact lookup, taking the lock before.</span>
+<span class="cm">	 * At least, nodes should be hot in our cache.</span>
+<span class="cm">	 */</span>
+	<span class="n">write_seqlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="nl">relookup:</span>
+	<span class="n">p</span> <span class="o">=</span> <span class="n">lookup</span><span class="p">(</span><span class="n">daddr</span><span class="p">,</span> <span class="n">stack</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">!=</span> <span class="n">peer_avl_empty</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+		<span class="n">write_sequnlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gccnt</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gccnt</span> <span class="o">=</span> <span class="n">inet_peer_gc</span><span class="p">(</span><span class="n">base</span><span class="p">,</span> <span class="n">stack</span><span class="p">,</span> <span class="n">stackptr</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gccnt</span> <span class="o">&amp;&amp;</span> <span class="n">create</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">relookup</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">p</span> <span class="o">=</span> <span class="n">create</span> <span class="o">?</span> <span class="n">kmem_cache_alloc</span><span class="p">(</span><span class="n">peer_cachep</span><span class="p">,</span> <span class="n">GFP_ATOMIC</span><span class="p">)</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">daddr</span> <span class="o">=</span> <span class="o">*</span><span class="n">daddr</span><span class="p">;</span>
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">ip_id_count</span><span class="p">,</span>
+				<span class="p">(</span><span class="n">daddr</span><span class="o">-&gt;</span><span class="n">family</span> <span class="o">==</span> <span class="n">AF_INET</span><span class="p">)</span> <span class="o">?</span>
+					<span class="n">secure_ip_id</span><span class="p">(</span><span class="n">daddr</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a4</span><span class="p">)</span> <span class="o">:</span>
+					<span class="n">secure_ipv6_id</span><span class="p">(</span><span class="n">daddr</span><span class="o">-&gt;</span><span class="n">addr</span><span class="p">.</span><span class="n">a6</span><span class="p">));</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">tcp_ts_stamp</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">metrics</span><span class="p">[</span><span class="n">RTAX_LOCK</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">INETPEER_METRICS_NEW</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">rate_tokens</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">rate_last</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">pmtu_expires</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">p</span><span class="o">-&gt;</span><span class="n">pmtu_orig</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">redirect_learned</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">redirect_learned</span><span class="p">));</span>
+		<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">);</span>
+
+		<span class="cm">/* Link the node. */</span>
+		<span class="n">link_to_pool</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">base</span><span class="p">);</span>
+		<span class="n">base</span><span class="o">-&gt;</span><span class="n">total</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">write_sequnlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">p</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">inet_getpeer</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">inet_putpeer</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">p</span><span class="o">-&gt;</span><span class="n">dtime</span> <span class="o">=</span> <span class="p">(</span><span class="n">__u32</span><span class="p">)</span><span class="n">jiffies</span><span class="p">;</span>
+	<span class="n">smp_mb__before_atomic_dec</span><span class="p">();</span>
+	<span class="n">atomic_dec</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">refcnt</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">inet_putpeer</span><span class="p">);</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *	Check transmit rate limitation for given message.</span>
+<span class="cm"> *	The rate information is held in the inet_peer entries now.</span>
+<span class="cm"> *	This function is generic and could be used for other purposes</span>
+<span class="cm"> *	too. It uses a Token bucket filter as suggested by Alexey Kuznetsov.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	Note that the same inet_peer fields are modified by functions in</span>
+<span class="cm"> *	route.c too, but these work for packet destinations while xrlim_allow</span>
+<span class="cm"> *	works for icmp destinations. This means the rate limiting information</span>
+<span class="cm"> *	for one &quot;ip object&quot; is shared - and these ICMPs are twice limited:</span>
+<span class="cm"> *	by source and by destination.</span>
+<span class="cm"> *</span>
+<span class="cm"> *	RFC 1812: 4.3.2.8 SHOULD be able to limit error message rate</span>
+<span class="cm"> *			  SHOULD allow setting of rate limits</span>
+<span class="cm"> *</span>
+<span class="cm"> * 	Shared between ICMPv4 and ICMPv6.</span>
+<span class="cm"> */</span>
+<span class="cp">#define XRLIM_BURST_FACTOR 6</span>
+<span class="n">bool</span> <span class="nf">inet_peer_xrlim_allow</span><span class="p">(</span><span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">peer</span><span class="p">,</span> <span class="kt">int</span> <span class="n">timeout</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">now</span><span class="p">,</span> <span class="n">token</span><span class="p">;</span>
+	<span class="n">bool</span> <span class="n">rc</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">peer</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+
+	<span class="n">token</span> <span class="o">=</span> <span class="n">peer</span><span class="o">-&gt;</span><span class="n">rate_tokens</span><span class="p">;</span>
+	<span class="n">now</span> <span class="o">=</span> <span class="n">jiffies</span><span class="p">;</span>
+	<span class="n">token</span> <span class="o">+=</span> <span class="n">now</span> <span class="o">-</span> <span class="n">peer</span><span class="o">-&gt;</span><span class="n">rate_last</span><span class="p">;</span>
+	<span class="n">peer</span><span class="o">-&gt;</span><span class="n">rate_last</span> <span class="o">=</span> <span class="n">now</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">token</span> <span class="o">&gt;</span> <span class="n">XRLIM_BURST_FACTOR</span> <span class="o">*</span> <span class="n">timeout</span><span class="p">)</span>
+		<span class="n">token</span> <span class="o">=</span> <span class="n">XRLIM_BURST_FACTOR</span> <span class="o">*</span> <span class="n">timeout</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">token</span> <span class="o">&gt;=</span> <span class="n">timeout</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">token</span> <span class="o">-=</span> <span class="n">timeout</span><span class="p">;</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">peer</span><span class="o">-&gt;</span><span class="n">rate_tokens</span> <span class="o">=</span> <span class="n">token</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">inet_peer_xrlim_allow</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">inetpeer_inval_rcu</span><span class="p">(</span><span class="k">struct</span> <span class="n">rcu_head</span> <span class="o">*</span><span class="n">head</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">head</span><span class="p">,</span> <span class="k">struct</span> <span class="n">inet_peer</span><span class="p">,</span> <span class="n">gc_rcu</span><span class="p">);</span>
+
+	<span class="n">spin_lock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">gc_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gc_list</span><span class="p">);</span>
+	<span class="n">spin_unlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_lock</span><span class="p">);</span>
+
+	<span class="n">schedule_delayed_work</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gc_work</span><span class="p">,</span> <span class="n">gc_delay</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">inetpeer_invalidate_tree</span><span class="p">(</span><span class="kt">int</span> <span class="n">family</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inet_peer</span> <span class="o">*</span><span class="n">old</span><span class="p">,</span> <span class="o">*</span><span class="n">new</span><span class="p">,</span> <span class="o">*</span><span class="n">prev</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">inet_peer_base</span> <span class="o">*</span><span class="n">base</span> <span class="o">=</span> <span class="n">family_to_base</span><span class="p">(</span><span class="n">family</span><span class="p">);</span>
+
+	<span class="n">write_seqlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">old</span> <span class="o">=</span> <span class="n">base</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">old</span> <span class="o">==</span> <span class="n">peer_avl_empty_rcu</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">new</span> <span class="o">=</span> <span class="n">peer_avl_empty_rcu</span><span class="p">;</span>
+
+	<span class="n">prev</span> <span class="o">=</span> <span class="n">cmpxchg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">root</span><span class="p">,</span> <span class="n">old</span><span class="p">,</span> <span class="n">new</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">prev</span> <span class="o">==</span> <span class="n">old</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">base</span><span class="o">-&gt;</span><span class="n">total</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">call_rcu</span><span class="p">(</span><span class="o">&amp;</span><span class="n">prev</span><span class="o">-&gt;</span><span class="n">gc_rcu</span><span class="p">,</span> <span class="n">inetpeer_inval_rcu</span><span class="p">);</span>
+	<span class="p">}</span>
+
+<span class="nl">out:</span>
+	<span class="n">write_sequnlock_bh</span><span class="p">(</span><span class="o">&amp;</span><span class="n">base</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">inetpeer_invalidate_tree</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

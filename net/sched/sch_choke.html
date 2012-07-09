@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » net › sched › sch_choke.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>sch_choke.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * net/sched/sch_choke.c	CHOKE scheduler</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (c) 2011 Stephen Hemminger &lt;shemminger@vyatta.com&gt;</span>
+<span class="cm"> * Copyright (c) 2011 Eric Dumazet &lt;eric.dumazet@gmail.com&gt;</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is free software; you can redistribute it and/or</span>
+<span class="cm"> * modify it under the terms of the GNU General Public License</span>
+<span class="cm"> * version 2 as published by the Free Software Foundation.</span>
+<span class="cm"> *</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/skbuff.h&gt;</span>
+<span class="cp">#include &lt;linux/reciprocal_div.h&gt;</span>
+<span class="cp">#include &lt;linux/vmalloc.h&gt;</span>
+<span class="cp">#include &lt;net/pkt_sched.h&gt;</span>
+<span class="cp">#include &lt;net/inet_ecn.h&gt;</span>
+<span class="cp">#include &lt;net/red.h&gt;</span>
+<span class="cp">#include &lt;net/flow_keys.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm">   CHOKe stateless AQM for fair bandwidth allocation</span>
+<span class="cm">   =================================================</span>
+
+<span class="cm">   CHOKe (CHOose and Keep for responsive flows, CHOose and Kill for</span>
+<span class="cm">   unresponsive flows) is a variant of RED that penalizes misbehaving flows but</span>
+<span class="cm">   maintains no flow state. The difference from RED is an additional step</span>
+<span class="cm">   during the enqueuing process. If average queue size is over the</span>
+<span class="cm">   low threshold (qmin), a packet is chosen at random from the queue.</span>
+<span class="cm">   If both the new and chosen packet are from the same flow, both</span>
+<span class="cm">   are dropped. Unlike RED, CHOKe is not really a &quot;classful&quot; qdisc because it</span>
+<span class="cm">   needs to access packets in queue randomly. It has a minimal class</span>
+<span class="cm">   interface to allow overriding the builtin flow classifier with</span>
+<span class="cm">   filters.</span>
+
+<span class="cm">   Source:</span>
+<span class="cm">   R. Pan, B. Prabhakar, and K. Psounis, &quot;CHOKe, A Stateless</span>
+<span class="cm">   Active Queue Management Scheme for Approximating Fair Bandwidth Allocation&quot;,</span>
+<span class="cm">   IEEE INFOCOM, 2000.</span>
+
+<span class="cm">   A. Tang, J. Wang, S. Low, &quot;Understanding CHOKe: Throughput and Spatial</span>
+<span class="cm">   Characteristics&quot;, IEEE/ACM Transactions on Networking, 2004</span>
+
+<span class="cm"> */</span>
+
+<span class="cm">/* Upper bound on size of sk_buff table (packets) */</span>
+<span class="cp">#define CHOKE_MAX_QUEUE	(128*1024 - 1)</span>
+
+<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="p">{</span>
+<span class="cm">/* Parameters */</span>
+	<span class="n">u32</span>		 <span class="n">limit</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">char</span>	 <span class="n">flags</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">red_parms</span> <span class="n">parms</span><span class="p">;</span>
+
+<span class="cm">/* Variables */</span>
+	<span class="k">struct</span> <span class="n">red_vars</span>  <span class="n">vars</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tcf_proto</span> <span class="o">*</span><span class="n">filter_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="p">{</span>
+		<span class="n">u32</span>	<span class="n">prob_drop</span><span class="p">;</span>	<span class="cm">/* Early probability drops */</span>
+		<span class="n">u32</span>	<span class="n">prob_mark</span><span class="p">;</span>	<span class="cm">/* Early probability marks */</span>
+		<span class="n">u32</span>	<span class="n">forced_drop</span><span class="p">;</span>	<span class="cm">/* Forced drops, qavg &gt; max_thresh */</span>
+		<span class="n">u32</span>	<span class="n">forced_mark</span><span class="p">;</span>	<span class="cm">/* Forced marks, qavg &gt; max_thresh */</span>
+		<span class="n">u32</span>	<span class="n">pdrop</span><span class="p">;</span>          <span class="cm">/* Drops due to queue limits */</span>
+		<span class="n">u32</span>	<span class="n">other</span><span class="p">;</span>          <span class="cm">/* Drops due to drop() calls */</span>
+		<span class="n">u32</span>	<span class="n">matched</span><span class="p">;</span>	<span class="cm">/* Drops to flow match */</span>
+	<span class="p">}</span> <span class="n">stats</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>	 <span class="n">head</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span>	 <span class="n">tail</span><span class="p">;</span>
+
+	<span class="kt">unsigned</span> <span class="kt">int</span>	 <span class="n">tab_mask</span><span class="p">;</span> <span class="cm">/* size - 1 */</span>
+
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">**</span><span class="n">tab</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="cm">/* deliver a random number between 0 and N - 1 */</span>
+<span class="k">static</span> <span class="n">u32</span> <span class="nf">random_N</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">N</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">reciprocal_divide</span><span class="p">(</span><span class="n">random32</span><span class="p">(),</span> <span class="n">N</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* number of elements in queue including holes */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">choke_len</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Is ECN parameter configured */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">use_ecn</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">TC_RED_ECN</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Should packets over max just be dropped (versus marked) */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">use_harddrop</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">TC_RED_HARDDROP</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* Move head pointer forward to skip over holes */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_zap_head_holes</span><span class="p">(</span><span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Move tail pointer backwards to reuse holes */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_zap_tail_holes</span><span class="p">(</span><span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Drop packet from queue array by creating a &quot;hole&quot; */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_drop_by_idx</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">idx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">idx</span><span class="p">];</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">idx</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">)</span>
+		<span class="n">choke_zap_head_holes</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">idx</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="n">choke_zap_tail_holes</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+	<span class="n">qdisc_tree_decrease_qlen</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="o">--</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="n">choke_skb_cb</span> <span class="p">{</span>
+	<span class="n">u16</span>			<span class="n">classid</span><span class="p">;</span>
+	<span class="n">u8</span>			<span class="n">keys_valid</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">flow_keys</span>	<span class="n">keys</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">choke_skb_cb</span> <span class="o">*</span><span class="nf">choke_skb_cb</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">qdisc_cb_private_validate</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">choke_skb_cb</span><span class="p">));</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">choke_skb_cb</span> <span class="o">*</span><span class="p">)</span><span class="n">qdisc_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">choke_set_classid</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="n">u16</span> <span class="n">classid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">classid</span> <span class="o">=</span> <span class="n">classid</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="n">u16</span> <span class="nf">choke_get_classid</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">classid</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Compare flow of two packets</span>
+<span class="cm"> *  Returns true only if source and destination address and port match.</span>
+<span class="cm"> *          false for special cases</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">choke_match_flow</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb1</span><span class="p">,</span>
+			     <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb2</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">skb1</span><span class="o">-&gt;</span><span class="n">protocol</span> <span class="o">!=</span> <span class="n">skb2</span><span class="o">-&gt;</span><span class="n">protocol</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb1</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys_valid</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb1</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys_valid</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">skb_flow_dissect</span><span class="p">(</span><span class="n">skb1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb1</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb2</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys_valid</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb2</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys_valid</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">skb_flow_dissect</span><span class="p">(</span><span class="n">skb2</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb2</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="o">!</span><span class="n">memcmp</span><span class="p">(</span><span class="o">&amp;</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb1</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">,</span>
+		       <span class="o">&amp;</span><span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb2</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys</span><span class="p">,</span>
+		       <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">flow_keys</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Classify flow using either:</span>
+<span class="cm"> *  1. pre-existing classification result in skb</span>
+<span class="cm"> *  2. fast internal classification</span>
+<span class="cm"> *  3. use TC filter based classification</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">choke_classify</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">int</span> <span class="o">*</span><span class="n">qerr</span><span class="p">)</span>
+
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tcf_result</span> <span class="n">res</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">result</span><span class="p">;</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">tc_classify</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">res</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#ifdef CONFIG_NET_CLS_ACT</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">result</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="n">TC_ACT_STOLEN</span>:
+		<span class="k">case</span> <span class="n">TC_ACT_QUEUED</span>:
+			<span class="o">*</span><span class="n">qerr</span> <span class="o">=</span> <span class="n">NET_XMIT_SUCCESS</span> <span class="o">|</span> <span class="n">__NET_XMIT_STOLEN</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">TC_ACT_SHOT</span>:
+			<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="p">}</span>
+<span class="cp">#endif</span>
+		<span class="n">choke_set_classid</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">classid</span><span class="p">));</span>
+		<span class="k">return</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Select a packet at random from queue</span>
+<span class="cm"> * HACK: since queue can have holes from previous deletion; retry several</span>
+<span class="cm"> *   times to find a random skb but then just give up and return the head</span>
+<span class="cm"> * Will return NULL if queue is empty (q-&gt;head == q-&gt;tail)</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">choke_peek_random</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span>
+					 <span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">pidx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">retrys</span> <span class="o">=</span> <span class="mi">3</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="o">*</span><span class="n">pidx</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">+</span> <span class="n">random_N</span><span class="p">(</span><span class="n">choke_len</span><span class="p">(</span><span class="n">q</span><span class="p">)))</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+		<span class="n">skb</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="o">*</span><span class="n">pidx</span><span class="p">];</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">skb</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">--</span><span class="n">retrys</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="o">*</span><span class="n">pidx</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">];</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Compare new packet with random packet in queue</span>
+<span class="cm"> * returns true if matched and sets *pidx</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">bool</span> <span class="nf">choke_match_random</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">nskb</span><span class="p">,</span>
+			       <span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="n">pidx</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">oskb</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+
+	<span class="n">oskb</span> <span class="o">=</span> <span class="n">choke_peek_random</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">pidx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">choke_get_classid</span><span class="p">(</span><span class="n">nskb</span><span class="p">)</span> <span class="o">==</span> <span class="n">choke_get_classid</span><span class="p">(</span><span class="n">oskb</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">choke_match_flow</span><span class="p">(</span><span class="n">oskb</span><span class="p">,</span> <span class="n">nskb</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_enqueue</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">red_parms</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="n">NET_XMIT_SUCCESS</span> <span class="o">|</span> <span class="n">__NET_XMIT_BYPASS</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* If using external classifiers, get result and record it. */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">choke_classify</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ret</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">other_drop</span><span class="p">;</span>	<span class="cm">/* Packet was eaten by filter */</span>
+	<span class="p">}</span>
+
+	<span class="n">choke_skb_cb</span><span class="p">(</span><span class="n">skb</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">keys_valid</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="cm">/* Compute average queue usage (see RED) */</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span> <span class="o">=</span> <span class="n">red_calc_qavg</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">,</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">red_is_idling</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">))</span>
+		<span class="n">red_end_of_idle_period</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+
+	<span class="cm">/* Is queue small? */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span> <span class="o">&lt;=</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">qth_min</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qcount</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span> <span class="p">{</span>
+		<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">idx</span><span class="p">;</span>
+
+		<span class="cm">/* Draw a packet at random from queue and compare flow */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">choke_match_random</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">skb</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">idx</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">matched</span><span class="o">++</span><span class="p">;</span>
+			<span class="n">choke_drop_by_idx</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">idx</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">congestion_drop</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="cm">/* Queue is large, always mark/drop */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span> <span class="o">&gt;</span> <span class="n">p</span><span class="o">-&gt;</span><span class="n">qth_max</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qcount</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+			<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">overlimits</span><span class="o">++</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">use_harddrop</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">use_ecn</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">||</span>
+			    <span class="o">!</span><span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_drop</span><span class="o">++</span><span class="p">;</span>
+				<span class="k">goto</span> <span class="n">congestion_drop</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_mark</span><span class="o">++</span><span class="p">;</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qcount</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">red_mark_probability</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qavg</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qcount</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qR</span> <span class="o">=</span> <span class="n">red_random</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+				<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">overlimits</span><span class="o">++</span><span class="p">;</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">use_ecn</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">||</span> <span class="o">!</span><span class="n">INET_ECN_set_ce</span><span class="p">(</span><span class="n">skb</span><span class="p">))</span> <span class="p">{</span>
+					<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_drop</span><span class="o">++</span><span class="p">;</span>
+					<span class="k">goto</span> <span class="n">congestion_drop</span><span class="p">;</span>
+				<span class="p">}</span>
+
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_mark</span><span class="o">++</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">.</span><span class="n">qR</span> <span class="o">=</span> <span class="n">red_random</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Admit new packet */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">]</span> <span class="o">=</span> <span class="n">skb</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+		<span class="o">++</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">;</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">+=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">NET_XMIT_SUCCESS</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">pdrop</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+
+<span class="nl">congestion_drop:</span>
+	<span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">NET_XMIT_CN</span><span class="p">;</span>
+
+<span class="nl">other_drop:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span> <span class="o">&amp;</span> <span class="n">__NET_XMIT_BYPASS</span><span class="p">)</span>
+		<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">drops</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">kfree_skb</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">choke_dequeue</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">red_is_idling</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">))</span>
+			<span class="n">red_start_of_idle_period</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">skb</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">];</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">choke_zap_head_holes</span><span class="p">(</span><span class="n">q</span><span class="p">);</span>
+	<span class="o">--</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">;</span>
+	<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+	<span class="n">qdisc_bstats_update</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">skb</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">skb</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="nf">choke_drop</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">len</span><span class="p">;</span>
+
+	<span class="n">len</span> <span class="o">=</span> <span class="n">qdisc_queue_drop</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">other</span><span class="o">++</span><span class="p">;</span>
+	<span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">red_is_idling</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">))</span>
+			<span class="n">red_start_of_idle_period</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">len</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_reset</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="n">red_restart</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">nla_policy</span> <span class="n">choke_policy</span><span class="p">[</span><span class="n">TCA_CHOKE_MAX</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">[</span><span class="n">TCA_CHOKE_PARMS</span><span class="p">]</span>	<span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">tc_red_qopt</span><span class="p">)</span> <span class="p">},</span>
+	<span class="p">[</span><span class="n">TCA_CHOKE_STAB</span><span class="p">]</span>	<span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">RED_STAB_SIZE</span> <span class="p">},</span>
+	<span class="p">[</span><span class="n">TCA_CHOKE_MAX_P</span><span class="p">]</span>	<span class="o">=</span> <span class="p">{</span> <span class="p">.</span><span class="n">type</span> <span class="o">=</span> <span class="n">NLA_U32</span> <span class="p">},</span>
+<span class="p">};</span>
+
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_free</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">addr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">addr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">is_vmalloc_addr</span><span class="p">(</span><span class="n">addr</span><span class="p">))</span>
+			<span class="n">vfree</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+		<span class="k">else</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_change</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_MAX</span> <span class="o">+</span> <span class="mi">1</span><span class="p">];</span>
+	<span class="k">const</span> <span class="k">struct</span> <span class="n">tc_red_qopt</span> <span class="o">*</span><span class="n">ctl</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">**</span><span class="n">old</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">mask</span><span class="p">;</span>
+	<span class="n">u32</span> <span class="n">max_P</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">opt</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">nla_parse_nested</span><span class="p">(</span><span class="n">tb</span><span class="p">,</span> <span class="n">TCA_CHOKE_MAX</span><span class="p">,</span> <span class="n">opt</span><span class="p">,</span> <span class="n">choke_policy</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_PARMS</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span> <span class="o">||</span>
+	    <span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_STAB</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">max_P</span> <span class="o">=</span> <span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_MAX_P</span><span class="p">]</span> <span class="o">?</span> <span class="n">nla_get_u32</span><span class="p">(</span><span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_MAX_P</span><span class="p">])</span> <span class="o">:</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">ctl</span> <span class="o">=</span> <span class="n">nla_data</span><span class="p">(</span><span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_PARMS</span><span class="p">]);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">&gt;</span> <span class="n">CHOKE_MAX_QUEUE</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">mask</span> <span class="o">=</span> <span class="n">roundup_pow_of_two</span><span class="p">(</span><span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">mask</span> <span class="o">!=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">**</span><span class="n">ntab</span><span class="p">;</span>
+
+		<span class="n">ntab</span> <span class="o">=</span> <span class="n">kcalloc</span><span class="p">(</span><span class="n">mask</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ntab</span><span class="p">)</span>
+			<span class="n">ntab</span> <span class="o">=</span> <span class="n">vzalloc</span><span class="p">((</span><span class="n">mask</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ntab</span><span class="p">)</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+		<span class="n">sch_tree_lock</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+		<span class="n">old</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">old</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">oqlen</span> <span class="o">=</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">,</span> <span class="n">tail</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+			<span class="k">while</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">!=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">];</span>
+
+				<span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span><span class="p">;</span>
+				<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">skb</span><span class="p">)</span>
+					<span class="k">continue</span><span class="p">;</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">tail</span> <span class="o">&lt;</span> <span class="n">mask</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">ntab</span><span class="p">[</span><span class="n">tail</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="n">skb</span><span class="p">;</span>
+					<span class="k">continue</span><span class="p">;</span>
+				<span class="p">}</span>
+				<span class="n">sch</span><span class="o">-&gt;</span><span class="n">qstats</span><span class="p">.</span><span class="n">backlog</span> <span class="o">-=</span> <span class="n">qdisc_pkt_len</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+				<span class="o">--</span><span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">;</span>
+				<span class="n">qdisc_drop</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">sch</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="n">qdisc_tree_decrease_qlen</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">oqlen</span> <span class="o">-</span> <span class="n">sch</span><span class="o">-&gt;</span><span class="n">q</span><span class="p">.</span><span class="n">qlen</span><span class="p">);</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span> <span class="o">=</span> <span class="n">tail</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tab_mask</span> <span class="o">=</span> <span class="n">mask</span><span class="p">;</span>
+		<span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span> <span class="o">=</span> <span class="n">ntab</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">sch_tree_lock</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">;</span>
+	<span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span> <span class="o">=</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">;</span>
+
+	<span class="n">red_set_parms</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">qth_min</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">qth_max</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">Wlog</span><span class="p">,</span>
+		      <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">Plog</span><span class="p">,</span> <span class="n">ctl</span><span class="o">-&gt;</span><span class="n">Scell_log</span><span class="p">,</span>
+		      <span class="n">nla_data</span><span class="p">(</span><span class="n">tb</span><span class="p">[</span><span class="n">TCA_CHOKE_STAB</span><span class="p">]),</span>
+		      <span class="n">max_P</span><span class="p">);</span>
+	<span class="n">red_set_vars</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">==</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span>
+		<span class="n">red_end_of_idle_period</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">vars</span><span class="p">);</span>
+
+	<span class="n">sch_tree_unlock</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="n">choke_free</span><span class="p">(</span><span class="n">old</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opt</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">choke_change</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="n">opt</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_dump</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">nlattr</span> <span class="o">*</span><span class="n">opts</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">tc_red_qopt</span> <span class="n">opt</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">limit</span>		<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">limit</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">flags</span>		<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">qth_min</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">qth_min</span> <span class="o">&gt;&gt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">Wlog</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">qth_max</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">qth_max</span> <span class="o">&gt;&gt;</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">Wlog</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">Wlog</span>		<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">Wlog</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">Plog</span>		<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">Plog</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">Scell_log</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">Scell_log</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="n">opts</span> <span class="o">=</span> <span class="n">nla_nest_start</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">TCA_OPTIONS</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">opts</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">nla_put_failure</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">nla_put</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">TCA_CHOKE_PARMS</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">opt</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">opt</span><span class="p">)</span> <span class="o">||</span>
+	    <span class="n">nla_put_u32</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">TCA_CHOKE_MAX_P</span><span class="p">,</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">parms</span><span class="p">.</span><span class="n">max_P</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">nla_put_failure</span><span class="p">;</span>
+	<span class="k">return</span> <span class="n">nla_nest_end</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">opts</span><span class="p">);</span>
+
+<span class="nl">nla_put_failure:</span>
+	<span class="n">nla_nest_cancel</span><span class="p">(</span><span class="n">skb</span><span class="p">,</span> <span class="n">opts</span><span class="p">);</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">EMSGSIZE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_dump_stats</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">gnet_dump</span> <span class="o">*</span><span class="n">d</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">tc_choke_xstats</span> <span class="n">st</span> <span class="o">=</span> <span class="p">{</span>
+		<span class="p">.</span><span class="n">early</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_drop</span> <span class="o">+</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_drop</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">marked</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">prob_mark</span> <span class="o">+</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">forced_mark</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">pdrop</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">pdrop</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">other</span>	<span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">other</span><span class="p">,</span>
+		<span class="p">.</span><span class="n">matched</span> <span class="o">=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">stats</span><span class="p">.</span><span class="n">matched</span><span class="p">,</span>
+	<span class="p">};</span>
+
+	<span class="k">return</span> <span class="n">gnet_stats_copy_app</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">st</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">st</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="n">tcf_destroy_chain</span><span class="p">(</span><span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">);</span>
+	<span class="n">choke_free</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="nf">choke_leaf</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">choke_get</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="n">u32</span> <span class="n">classid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_put</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">q</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">choke_bind</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">parent</span><span class="p">,</span>
+				<span class="n">u32</span> <span class="n">classid</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">tcf_proto</span> <span class="o">**</span><span class="nf">choke_find_tcf</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cl</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">return</span> <span class="o">&amp;</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">filter_list</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">choke_dump_class</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cl</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="n">skb</span><span class="p">,</span> <span class="k">struct</span> <span class="n">tcmsg</span> <span class="o">*</span><span class="n">tcm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">tcm</span><span class="o">-&gt;</span><span class="n">tcm_handle</span> <span class="o">|=</span> <span class="n">TC_H_MIN</span><span class="p">(</span><span class="n">cl</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">choke_walk</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">,</span> <span class="k">struct</span> <span class="n">qdisc_walker</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">stop</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">fn</span><span class="p">(</span><span class="n">sch</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">arg</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">arg</span><span class="o">-&gt;</span><span class="n">stop</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">arg</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">Qdisc_class_ops</span> <span class="n">choke_class_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">leaf</span>		<span class="o">=</span>	<span class="n">choke_leaf</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">get</span>		<span class="o">=</span>	<span class="n">choke_get</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">put</span>		<span class="o">=</span>	<span class="n">choke_put</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">tcf_chain</span>	<span class="o">=</span>	<span class="n">choke_find_tcf</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">bind_tcf</span>	<span class="o">=</span>	<span class="n">choke_bind</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unbind_tcf</span>	<span class="o">=</span>	<span class="n">choke_put</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump</span>		<span class="o">=</span>	<span class="n">choke_dump_class</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">walk</span>		<span class="o">=</span>	<span class="n">choke_walk</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">sk_buff</span> <span class="o">*</span><span class="nf">choke_peek_head</span><span class="p">(</span><span class="k">struct</span> <span class="n">Qdisc</span> <span class="o">*</span><span class="n">sch</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">choke_sched_data</span> <span class="o">*</span><span class="n">q</span> <span class="o">=</span> <span class="n">qdisc_priv</span><span class="p">(</span><span class="n">sch</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span> <span class="o">!=</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tail</span><span class="p">)</span> <span class="o">?</span> <span class="n">q</span><span class="o">-&gt;</span><span class="n">tab</span><span class="p">[</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">head</span><span class="p">]</span> <span class="o">:</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">Qdisc_ops</span> <span class="n">choke_qdisc_ops</span> <span class="n">__read_mostly</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">id</span>		<span class="o">=</span>	<span class="s">&quot;choke&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">priv_size</span>	<span class="o">=</span>	<span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">choke_sched_data</span><span class="p">),</span>
+
+	<span class="p">.</span><span class="n">enqueue</span>	<span class="o">=</span>	<span class="n">choke_enqueue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dequeue</span>	<span class="o">=</span>	<span class="n">choke_dequeue</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">peek</span>		<span class="o">=</span>	<span class="n">choke_peek_head</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">drop</span>		<span class="o">=</span>	<span class="n">choke_drop</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">init</span>		<span class="o">=</span>	<span class="n">choke_init</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">destroy</span>	<span class="o">=</span>	<span class="n">choke_destroy</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">reset</span>		<span class="o">=</span>	<span class="n">choke_reset</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">change</span>		<span class="o">=</span>	<span class="n">choke_change</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump</span>		<span class="o">=</span>	<span class="n">choke_dump</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">dump_stats</span>	<span class="o">=</span>	<span class="n">choke_dump_stats</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span>	<span class="n">THIS_MODULE</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">choke_module_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">register_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">choke_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">choke_module_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">unregister_qdisc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">choke_qdisc_ops</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">choke_module_init</span><span class="p">)</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">choke_module_exit</span><span class="p">)</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

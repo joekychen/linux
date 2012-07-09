@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » fs › lockd › svclock.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>svclock.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * linux/fs/lockd/svclock.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * Handling of server-side locks, mostly of the blocked variety.</span>
+<span class="cm"> * This is the ugliest part of lockd because we tread on very thin ice.</span>
+<span class="cm"> * GRANT and CANCEL calls may get stuck, meet in mid-flight, etc.</span>
+<span class="cm"> * IMNSHO introducing the grant callback into the NLM protocol was one</span>
+<span class="cm"> * of the worst ideas Sun ever had. Except maybe for the idea of doing</span>
+<span class="cm"> * NFS file locking at all.</span>
+<span class="cm"> *</span>
+<span class="cm"> * I&#39;m trying hard to avoid race conditions by protecting most accesses</span>
+<span class="cm"> * to a file&#39;s list of blocked locks through a semaphore. The global</span>
+<span class="cm"> * list of blocked locks is not protected in this fashion however.</span>
+<span class="cm"> * Therefore, some functions (such as the RPC callback for the async grant</span>
+<span class="cm"> * call) move blocked locks towards the head of the list *while some other</span>
+<span class="cm"> * process might be traversing it*. This should not be a problem in</span>
+<span class="cm"> * practice, because this will only cause functions traversing the list</span>
+<span class="cm"> * to visit some blocks twice.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 1996, Olaf Kirch &lt;okir@monad.swb.de&gt;</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/sched.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/clnt.h&gt;</span>
+<span class="cp">#include &lt;linux/sunrpc/svc.h&gt;</span>
+<span class="cp">#include &lt;linux/lockd/nlm.h&gt;</span>
+<span class="cp">#include &lt;linux/lockd/lockd.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+
+<span class="cp">#define NLMDBG_FACILITY		NLMDBG_SVCLOCK</span>
+
+<span class="cp">#ifdef CONFIG_LOCKD_V4</span>
+<span class="cp">#define nlm_deadlock	nlm4_deadlock</span>
+<span class="cp">#else</span>
+<span class="cp">#define nlm_deadlock	nlm_lck_denied</span>
+<span class="cp">#endif</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span>	<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span>	<span class="n">nlmsvc_remove_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">nlmsvc_setgrantargs</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_rqst</span> <span class="o">*</span><span class="n">call</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="n">nlmsvc_freegrantargs</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_rqst</span> <span class="o">*</span><span class="n">call</span><span class="p">);</span>
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">rpc_call_ops</span> <span class="n">nlmsvc_grant_ops</span><span class="p">;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * The list of blocked locks to retry</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">nlm_blocked</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_SPINLOCK</span><span class="p">(</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+
+<span class="cp">#ifdef LOCKD_DEBUG</span>
+<span class="k">static</span> <span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="nf">nlmdbg_cookie2a</span><span class="p">(</span><span class="k">const</span> <span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * We can get away with a static buffer because we&#39;re only</span>
+<span class="cm">	 * called with BKL held.</span>
+<span class="cm">	 */</span>
+	<span class="k">static</span> <span class="kt">char</span> <span class="n">buf</span><span class="p">[</span><span class="mi">2</span><span class="o">*</span><span class="n">NLM_MAXCOOKIELEN</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">);</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="n">buf</span><span class="p">;</span>
+
+	<span class="n">len</span><span class="o">--</span><span class="p">;</span>	<span class="cm">/* allow for trailing \0 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span> <span class="mi">3</span><span class="p">)</span>
+		<span class="k">return</span> <span class="s">&quot;???&quot;</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span> <span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">cookie</span><span class="o">-&gt;</span><span class="n">len</span> <span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">strcpy</span><span class="p">(</span><span class="n">p</span><span class="o">-</span><span class="mi">3</span><span class="p">,</span> <span class="s">&quot;...&quot;</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">sprintf</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">&quot;%02x&quot;</span><span class="p">,</span> <span class="n">cookie</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+		<span class="n">p</span> <span class="o">+=</span> <span class="mi">2</span><span class="p">;</span>
+		<span class="n">len</span> <span class="o">-=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="sc">&#39;\0&#39;</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">buf</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#endif</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Insert a blocked lock into the global list</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">nlmsvc_insert_block_locked</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">when</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_insert_block(%p, %ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">when</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">pos</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">when</span> <span class="o">!=</span> <span class="n">NLM_NEVER</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">((</span><span class="n">when</span> <span class="o">+=</span> <span class="n">jiffies</span><span class="p">)</span> <span class="o">==</span> <span class="n">NLM_NEVER</span><span class="p">)</span>
+			<span class="n">when</span> <span class="o">++</span><span class="p">;</span>
+		<span class="n">list_for_each</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">b</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_block</span><span class="p">,</span> <span class="n">b_list</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">b</span><span class="o">-&gt;</span><span class="n">b_when</span><span class="p">,</span><span class="n">when</span><span class="p">)</span> <span class="o">||</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">b_when</span> <span class="o">==</span> <span class="n">NLM_NEVER</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="cm">/* On normal exit from the loop, pos == &amp;nlm_blocked,</span>
+<span class="cm">		 * so we will be adding to the end of the list - good</span>
+<span class="cm">		 */</span>
+	<span class="p">}</span>
+
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">,</span> <span class="n">pos</span><span class="p">);</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_when</span> <span class="o">=</span> <span class="n">when</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_insert_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">when</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="n">nlmsvc_insert_block_locked</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">when</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Remove a block from the global list</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span>
+<span class="nf">nlmsvc_remove_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+		<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find a block for a given lock</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span>
+<span class="nf">nlmsvc_lookup_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">file_lock</span>	<span class="o">*</span><span class="n">fl</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_lookup_block f=%p pd=%d %Ld-%Ld ty=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">,</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">,</span> <span class="n">b_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">fl</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">;</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: check f=%p pd=%d %Ld-%Ld ty=%d cookie=%s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="p">,</span> <span class="n">fl</span><span class="o">-&gt;</span><span class="n">fl_pid</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">fl</span><span class="o">-&gt;</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">fl</span><span class="o">-&gt;</span><span class="n">fl_end</span><span class="p">,</span> <span class="n">fl</span><span class="o">-&gt;</span><span class="n">fl_type</span><span class="p">,</span>
+				<span class="n">nlmdbg_cookie2a</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">cookie</span><span class="p">));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span> <span class="o">==</span> <span class="n">file</span> <span class="o">&amp;&amp;</span> <span class="n">nlm_compare_locks</span><span class="p">(</span><span class="n">fl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">block</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">int</span> <span class="nf">nlm_cookie_match</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">a</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">a</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">!=</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">memcmp</span><span class="p">(</span><span class="n">a</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">a</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">))</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Find a block with a given NLM cookie.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span>
+<span class="nf">nlmsvc_find_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">;</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">,</span> <span class="n">b_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">nlm_cookie_match</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">cookie</span><span class="p">,</span><span class="n">cookie</span><span class="p">))</span>
+			<span class="k">goto</span> <span class="n">found</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="nl">found:</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;nlmsvc_find_block(%s): block=%p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">nlmdbg_cookie2a</span><span class="p">(</span><span class="n">cookie</span><span class="p">),</span> <span class="n">block</span><span class="p">);</span>
+	<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">block</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Create a block and initialize it.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note: we explicitly set the cookie of the grant reply to that of</span>
+<span class="cm"> * the blocked lock request. The spec explicitly mentions that the client</span>
+<span class="cm"> * should _not_ rely on the callback containing the same cookie as the</span>
+<span class="cm"> * request, but (as I found out later) that&#39;s because some implementations</span>
+<span class="cm"> * do just this. Never mind the standards comittees, they support our</span>
+<span class="cm"> * logging industries.</span>
+<span class="cm"> *</span>
+<span class="cm"> * 10 years later: I hope we can safely ignore these old and broken</span>
+<span class="cm"> * clients by now. Let&#39;s fix this so we can uniquely identify an incoming</span>
+<span class="cm"> * GRANTED_RES message by cookie, without having to rely on the client&#39;s IP</span>
+<span class="cm"> * address. --okir</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span>
+<span class="nf">nlmsvc_create_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_host</span> <span class="o">*</span><span class="n">host</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">nlm_rqst</span>		<span class="o">*</span><span class="n">call</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">nlm_get_host</span><span class="p">(</span><span class="n">host</span><span class="p">);</span>
+	<span class="n">call</span> <span class="o">=</span> <span class="n">nlm_alloc_call</span><span class="p">(</span><span class="n">host</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">call</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* Allocate memory for block, and initialize arguments */</span>
+	<span class="n">block</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">block</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">failed</span><span class="p">;</span>
+	<span class="n">kref_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flist</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">nlmsvc_setgrantargs</span><span class="p">(</span><span class="n">call</span><span class="p">,</span> <span class="n">lock</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">failed_free</span><span class="p">;</span>
+
+	<span class="cm">/* Set notifier function for VFS, and init args */</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">|=</span> <span class="n">FL_SLEEP</span><span class="p">;</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_lmops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">nlmsvc_lock_operations</span><span class="p">;</span>
+	<span class="n">nlmclnt_next_cookie</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">cookie</span><span class="p">);</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: created block %p...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+
+	<span class="cm">/* Create and initialize the block */</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_daemon</span> <span class="o">=</span> <span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_server</span><span class="p">;</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_host</span>   <span class="o">=</span> <span class="n">host</span><span class="p">;</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span>   <span class="o">=</span> <span class="n">file</span><span class="p">;</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_count</span><span class="o">++</span><span class="p">;</span>
+
+	<span class="cm">/* Add to file&#39;s list of blocks */</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flist</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_blocks</span><span class="p">);</span>
+
+	<span class="cm">/* Set up RPC arguments for callback */</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span> <span class="o">=</span> <span class="n">call</span><span class="p">;</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_flags</span>   <span class="o">=</span> <span class="n">RPC_TASK_ASYNC</span><span class="p">;</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_block</span> <span class="o">=</span> <span class="n">block</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">block</span><span class="p">;</span>
+
+<span class="nl">failed_free:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="nl">failed:</span>
+	<span class="n">nlmsvc_release_call</span><span class="p">(</span><span class="n">call</span><span class="p">);</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Delete a block.</span>
+<span class="cm"> * It is the caller&#39;s responsibility to check whether the file</span>
+<span class="cm"> * can be closed hereafter.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">nlmsvc_unlink_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">status</span><span class="p">;</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: unlinking block %p...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+
+	<span class="cm">/* Remove block from list */</span>
+	<span class="n">status</span> <span class="o">=</span> <span class="n">posix_unblock_lock</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">);</span>
+	<span class="n">nlmsvc_remove_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_free_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">kref</span> <span class="o">*</span><span class="n">kref</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span> <span class="o">=</span> <span class="n">container_of</span><span class="p">(</span><span class="n">kref</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_block</span><span class="p">,</span> <span class="n">b_count</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">nlm_file</span>		<span class="o">*</span><span class="n">file</span> <span class="o">=</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: freeing block %p...</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+
+	<span class="cm">/* Remove block from file&#39;s list of blocks */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="n">list_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flist</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+
+	<span class="n">nlmsvc_freegrantargs</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="p">);</span>
+	<span class="n">nlmsvc_release_call</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="p">);</span>
+	<span class="n">nlm_release_file</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_release_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+		<span class="n">kref_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">,</span> <span class="n">nlmsvc_free_block</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Loop over all blocks and delete blocks held by</span>
+<span class="cm"> * a matching host.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">nlmsvc_traverse_blocks</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_host</span> <span class="o">*</span><span class="n">host</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span>
+			<span class="n">nlm_host_match_fn_t</span> <span class="n">match</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+
+<span class="nl">restart:</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_blocks</span><span class="p">,</span> <span class="n">b_flist</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">match</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_host</span><span class="p">,</span> <span class="n">host</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="cm">/* Do not destroy blocks that are not on</span>
+<span class="cm">		 * the global retry list - why? */</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">))</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+		<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">restart</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Initialize arguments for GRANTED call. The nlm_rqst structure</span>
+<span class="cm"> * has been cleared already.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">nlmsvc_setgrantargs</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_rqst</span> <span class="o">*</span><span class="n">call</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">locks_copy_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">);</span>
+	<span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fh</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fh</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fh</span><span class="p">));</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">caller</span> <span class="o">=</span> <span class="n">utsname</span><span class="p">()</span><span class="o">-&gt;</span><span class="n">nodename</span><span class="p">;</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+
+	<span class="cm">/* set default data area */</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">call</span><span class="o">-&gt;</span><span class="n">a_owner</span><span class="p">;</span>
+	<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">svid</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span> <span class="o">&gt;</span> <span class="n">NLMCLNT_OHSIZE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">void</span> <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">data</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="p">(</span><span class="n">u8</span> <span class="o">*</span><span class="p">)</span> <span class="n">data</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">memcpy</span><span class="p">(</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_freegrantargs</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_rqst</span> <span class="o">*</span><span class="n">call</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span> <span class="o">!=</span> <span class="n">call</span><span class="o">-&gt;</span><span class="n">a_owner</span><span class="p">)</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">oh</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+
+	<span class="n">locks_release_private</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Deferred lock request handling for non-blocking lock</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">__be32</span>
+<span class="nf">nlmsvc_defer_lock_rqst</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">__be32</span> <span class="n">status</span> <span class="o">=</span> <span class="n">nlm_lck_denied_nolocks</span><span class="p">;</span>
+
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">|=</span> <span class="n">B_QUEUED</span><span class="p">;</span>
+
+	<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">NLM_TIMEOUT</span><span class="p">);</span>
+
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_cache_req</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">.</span><span class="n">defer</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span> <span class="o">=</span>
+			<span class="n">rqstp</span><span class="o">-&gt;</span><span class="n">rq_chandle</span><span class="p">.</span><span class="n">defer</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_cache_req</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="n">status</span> <span class="o">=</span> <span class="n">nlm_drop_reply</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_defer_lock_rqst block %p flags %d status %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">,</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">status</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Attempt to establish a lock, and if it can&#39;t be granted, block it</span>
+<span class="cm"> * if required.</span>
+<span class="cm"> */</span>
+<span class="n">__be32</span>
+<span class="nf">nlmsvc_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span>
+	    <span class="k">struct</span> <span class="n">nlm_host</span> <span class="o">*</span><span class="n">host</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="kt">int</span> <span class="n">wait</span><span class="p">,</span>
+	    <span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">,</span> <span class="kt">int</span> <span class="n">reclaim</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">error</span><span class="p">;</span>
+	<span class="n">__be32</span>			<span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_lock(%s/%ld, ty=%d, pi=%d, %Ld-%Ld, bl=%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_id</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">,</span>
+				<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span><span class="p">,</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">,</span>
+				<span class="n">wait</span><span class="p">);</span>
+
+	<span class="cm">/* Lock file against concurrent access */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="cm">/* Get existing block (in case client is busy-waiting)</span>
+<span class="cm">	 * or create new block</span>
+<span class="cm">	 */</span>
+	<span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_lookup_block</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_create_block</span><span class="p">(</span><span class="n">rqstp</span><span class="p">,</span> <span class="n">host</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">,</span> <span class="n">cookie</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_nolocks</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="n">lock</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FL_SLEEP</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_QUEUED</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_lock deferred block %p flags %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+							<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_granted</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_TIMED_OUT</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_drop_reply</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">locks_in_grace</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">reclaim</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_grace_period</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">reclaim</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">locks_in_grace</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_grace_period</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">wait</span><span class="p">)</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FL_SLEEP</span><span class="p">;</span>
+	<span class="n">error</span> <span class="o">=</span> <span class="n">vfs_lock_file</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span> <span class="n">F_SETLK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FL_SLEEP</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: vfs_lock_file returned %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+	<span class="k">switch</span> <span class="p">(</span><span class="n">error</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">case</span> <span class="mi">0</span>:
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_granted</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="n">EAGAIN</span>:
+			<span class="cm">/*</span>
+<span class="cm">			 * If this is a blocking request for an</span>
+<span class="cm">			 * already pending lock request then we need</span>
+<span class="cm">			 * to put it back on lockd&#39;s block list</span>
+<span class="cm">			 */</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="k">case</span> <span class="n">FILE_LOCK_DEFERRED</span>:
+			<span class="k">if</span> <span class="p">(</span><span class="n">wait</span><span class="p">)</span>
+				<span class="k">break</span><span class="p">;</span>
+			<span class="cm">/* Filesystem lock operation is in progress</span>
+<span class="cm">			   Add it to the queue waiting for callback */</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlmsvc_defer_lock_rqst</span><span class="p">(</span><span class="n">rqstp</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="k">case</span> <span class="o">-</span><span class="n">EDEADLK</span>:
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_deadlock</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="nl">default:</span>			<span class="cm">/* includes ENOLCK */</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_nolocks</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_blocked</span><span class="p">;</span>
+
+	<span class="cm">/* Append to list of blocked */</span>
+	<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">NLM_NEVER</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_lock returned %u</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Test for presence of a conflicting lock.</span>
+<span class="cm"> */</span>
+<span class="n">__be32</span>
+<span class="nf">nlmsvc_testlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">svc_rqst</span> <span class="o">*</span><span class="n">rqstp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">nlm_host</span> <span class="o">*</span><span class="n">host</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">conflock</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> 	<span class="o">*</span><span class="n">block</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">error</span><span class="p">;</span>
+	<span class="n">__be32</span>			<span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_testlock(%s/%ld, ty=%d, %Ld-%Ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_id</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">,</span>
+				<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">);</span>
+
+	<span class="cm">/* Get existing block (in case client is busy-waiting) */</span>
+	<span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_lookup_block</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">conf</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">conf</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">conf</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+			<span class="k">return</span> <span class="n">nlm_granted</span><span class="p">;</span>
+		<span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_create_block</span><span class="p">(</span><span class="n">rqstp</span><span class="p">,</span> <span class="n">host</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">,</span> <span class="n">cookie</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">kfree</span><span class="p">(</span><span class="n">conf</span><span class="p">);</span>
+			<span class="k">return</span> <span class="n">nlm_granted</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span> <span class="o">=</span> <span class="n">conf</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_QUEUED</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_testlock deferred block %p flags %d fl %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_TIMED_OUT</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_GOT_CALLBACK</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span> <span class="o">!=</span> <span class="nb">NULL</span>
+					<span class="o">&amp;&amp;</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="o">-&gt;</span><span class="n">fl_type</span> <span class="o">!=</span> <span class="n">F_UNLCK</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span> <span class="o">=</span> <span class="o">*</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="p">;</span>
+				<span class="k">goto</span> <span class="n">conf_lock</span><span class="p">;</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+				<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_granted</span><span class="p">;</span>
+				<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_drop_reply</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">locks_in_grace</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_grace_period</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">error</span> <span class="o">=</span> <span class="n">vfs_test_lock</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">error</span> <span class="o">==</span> <span class="n">FILE_LOCK_DEFERRED</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlmsvc_defer_lock_rqst</span><span class="p">(</span><span class="n">rqstp</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">error</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied_nolocks</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span> <span class="o">==</span> <span class="n">F_UNLCK</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_granted</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">conf_lock:</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: conflicting lock(ty=%d, %Ld-%Ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span><span class="p">,</span> <span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+		<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">);</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">caller</span> <span class="o">=</span> <span class="s">&quot;somehost&quot;</span><span class="p">;</span>	<span class="cm">/* FIXME */</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">len</span> <span class="o">=</span> <span class="n">strlen</span><span class="p">(</span><span class="n">conflock</span><span class="o">-&gt;</span><span class="n">caller</span><span class="p">);</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">oh</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>		<span class="cm">/* don&#39;t return OH info */</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">svid</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">;</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span><span class="p">;</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">;</span>
+	<span class="n">conflock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">;</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">nlm_lck_denied</span><span class="p">;</span>
+<span class="nl">out:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="p">)</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Remove a lock.</span>
+<span class="cm"> * This implies a CANCEL call: We send a GRANT_MSG, the client replies</span>
+<span class="cm"> * with a GRANT_RES call which gets lost, and calls UNLOCK immediately</span>
+<span class="cm"> * afterwards. In this case the block will still be there, and hence</span>
+<span class="cm"> * must be removed.</span>
+<span class="cm"> */</span>
+<span class="n">__be32</span>
+<span class="nf">nlmsvc_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span>	<span class="n">error</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_unlock(%s/%ld, pi=%d, %Ld-%Ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_id</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">,</span>
+				<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">);</span>
+
+	<span class="cm">/* First, cancel any lock that might be there */</span>
+	<span class="n">nlmsvc_cancel_blocked</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_type</span> <span class="o">=</span> <span class="n">F_UNLCK</span><span class="p">;</span>
+	<span class="n">error</span> <span class="o">=</span> <span class="n">vfs_lock_file</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span> <span class="n">F_SETLK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="p">(</span><span class="n">error</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span><span class="o">?</span> <span class="n">nlm_lck_denied_nolocks</span> <span class="o">:</span> <span class="n">nlm_granted</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Cancel a previously blocked request.</span>
+<span class="cm"> *</span>
+<span class="cm"> * A cancel request always overrides any grant that may currently</span>
+<span class="cm"> * be in progress.</span>
+<span class="cm"> * The calling procedure must check whether the file can be closed.</span>
+<span class="cm"> */</span>
+<span class="n">__be32</span>
+<span class="nf">nlmsvc_cancel_blocked</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_file</span> <span class="o">*</span><span class="n">file</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">status</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_cancel(%s/%ld, pi=%d, %Ld-%Ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_sb</span><span class="o">-&gt;</span><span class="n">s_id</span><span class="p">,</span>
+				<span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="o">-&gt;</span><span class="n">f_path</span><span class="p">.</span><span class="n">dentry</span><span class="o">-&gt;</span><span class="n">d_inode</span><span class="o">-&gt;</span><span class="n">i_ino</span><span class="p">,</span>
+				<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_pid</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_start</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">long</span> <span class="kt">long</span><span class="p">)</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_end</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">locks_in_grace</span><span class="p">())</span>
+		<span class="k">return</span> <span class="n">nlm_lck_denied_grace_period</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_lookup_block</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">lock</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mutex</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">vfs_cancel_lock</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span>
+				<span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">);</span>
+		<span class="n">status</span> <span class="o">=</span> <span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">status</span> <span class="o">?</span> <span class="n">nlm_lck_denied</span> <span class="o">:</span> <span class="n">nlm_granted</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a callback from the filesystem for VFS file lock requests.</span>
+<span class="cm"> * It will be used if lm_grant is defined and the filesystem can not</span>
+<span class="cm"> * respond to the request immediately.</span>
+<span class="cm"> * For GETLK request it will copy the reply to the nlm_block.</span>
+<span class="cm"> * For SETLK or SETLKW request it will get the local posix lock.</span>
+<span class="cm"> * In all cases it will move the block to the head of nlm_blocked q where</span>
+<span class="cm"> * nlmsvc_retry_blocked() can send back a reply for SETLKW or revisit the</span>
+<span class="cm"> * deferred rpc for GETLK and SETLK.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">nlmsvc_update_deferred_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">conf</span><span class="p">,</span>
+			     <span class="kt">int</span> <span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">|=</span> <span class="n">B_GOT_CALLBACK</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">|=</span> <span class="n">B_TIMED_OUT</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">conf</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="p">)</span>
+			<span class="n">__locks_copy_lock</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_fl</span><span class="p">,</span> <span class="n">conf</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">nlmsvc_grant_deferred</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">fl</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">conf</span><span class="p">,</span>
+					<span class="kt">int</span> <span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">,</span> <span class="n">b_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">nlm_compare_locks</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">,</span> <span class="n">fl</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: nlmsvc_notify_blocked block %p flags %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+							<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_QUEUED</span><span class="p">)</span> <span class="p">{</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_TIMED_OUT</span><span class="p">)</span> <span class="p">{</span>
+					<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOLCK</span><span class="p">;</span>
+					<span class="k">break</span><span class="p">;</span>
+				<span class="p">}</span>
+				<span class="n">nlmsvc_update_deferred_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">conf</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+			<span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+			<span class="n">nlmsvc_insert_block_locked</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+			<span class="n">svc_wake_up</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_daemon</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">==</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;lockd: grant for unknown block</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Unblock a blocked lock request. This is a callback invoked from the</span>
+<span class="cm"> * VFS layer when a lock on which we blocked is removed.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This function doesn&#39;t grant the blocked lock instantly, but rather moves</span>
+<span class="cm"> * the block to the head of nlm_blocked where it can be picked up by lockd.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">nlmsvc_notify_blocked</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">fl</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: VFS unblock notification for block %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">fl</span><span class="p">);</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">,</span> <span class="n">b_list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">nlm_compare_locks</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">.</span><span class="n">fl</span><span class="p">,</span> <span class="n">fl</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">nlmsvc_insert_block_locked</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+			<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+			<span class="n">svc_wake_up</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_daemon</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;lockd: notification for unknown block!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">nlmsvc_same_owner</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">fl1</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file_lock</span> <span class="o">*</span><span class="n">fl2</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">fl1</span><span class="o">-&gt;</span><span class="n">fl_owner</span> <span class="o">==</span> <span class="n">fl2</span><span class="o">-&gt;</span><span class="n">fl_owner</span> <span class="o">&amp;&amp;</span> <span class="n">fl1</span><span class="o">-&gt;</span><span class="n">fl_pid</span> <span class="o">==</span> <span class="n">fl2</span><span class="o">-&gt;</span><span class="n">fl_pid</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">const</span> <span class="k">struct</span> <span class="n">lock_manager_operations</span> <span class="n">nlmsvc_lock_operations</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">lm_compare_owner</span> <span class="o">=</span> <span class="n">nlmsvc_same_owner</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">lm_notify</span> <span class="o">=</span> <span class="n">nlmsvc_notify_blocked</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">lm_grant</span> <span class="o">=</span> <span class="n">nlmsvc_grant_deferred</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Try to claim a lock that was previously blocked.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Note that we use both the RPC_GRANTED_MSG call _and_ an async</span>
+<span class="cm"> * RPC thread when notifying the client. This seems like overkill...</span>
+<span class="cm"> * Here&#39;s why:</span>
+<span class="cm"> *  -	we don&#39;t want to use a synchronous RPC thread, otherwise</span>
+<span class="cm"> *	we might find ourselves hanging on a dead portmapper.</span>
+<span class="cm"> *  -	Some lockd implementations (e.g. HP) don&#39;t react to</span>
+<span class="cm"> *	RPC_GRANTED calls; they seem to insist on RPC_GRANTED_MSG calls.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">nlmsvc_grant_blocked</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_file</span>		<span class="o">*</span><span class="n">file</span> <span class="o">=</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_file</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">nlm_lock</span>		<span class="o">*</span><span class="n">lock</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="o">-&gt;</span><span class="n">a_args</span><span class="p">.</span><span class="n">lock</span><span class="p">;</span>
+	<span class="kt">int</span>			<span class="n">error</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: grant blocked lock %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">block</span><span class="p">);</span>
+
+	<span class="n">kref_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_count</span><span class="p">);</span>
+
+	<span class="cm">/* Unlink block request from list */</span>
+	<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+
+	<span class="cm">/* If b_granted is true this means we&#39;ve been here before.</span>
+<span class="cm">	 * Just retry the grant callback, possibly refreshing the RPC</span>
+<span class="cm">	 * binding */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">nlm_rebind_host</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_host</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">callback</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Try the lock operation again */</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">|=</span> <span class="n">FL_SLEEP</span><span class="p">;</span>
+	<span class="n">error</span> <span class="o">=</span> <span class="n">vfs_lock_file</span><span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_file</span><span class="p">,</span> <span class="n">F_SETLK</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">fl</span><span class="p">.</span><span class="n">fl_flags</span> <span class="o">&amp;=</span> <span class="o">~</span><span class="n">FL_SLEEP</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">error</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="mi">0</span>:
+		<span class="k">break</span><span class="p">;</span>
+	<span class="k">case</span> <span class="n">FILE_LOCK_DEFERRED</span>:
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: lock still blocked error %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">error</span><span class="p">);</span>
+		<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">NLM_NEVER</span><span class="p">);</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="nl">default:</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="s">&quot;lockd: unexpected error %d in %s!</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="o">-</span><span class="n">error</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+		<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">callback:</span>
+	<span class="cm">/* Lock was granted by VFS. */</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: GRANTing blocked lock.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+	<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/* keep block on the list, but don&#39;t reattempt until the RPC</span>
+<span class="cm">	 * completes or the submission fails</span>
+<span class="cm">	 */</span>
+	<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">NLM_NEVER</span><span class="p">);</span>
+
+	<span class="cm">/* Call the client -- use a soft RPC task since nlmsvc_retry_blocked</span>
+<span class="cm">	 * will queue up a new one if this one times out</span>
+<span class="cm">	 */</span>
+	<span class="n">error</span> <span class="o">=</span> <span class="n">nlm_async_call</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_call</span><span class="p">,</span> <span class="n">NLMPROC_GRANTED_MSG</span><span class="p">,</span>
+				<span class="o">&amp;</span><span class="n">nlmsvc_grant_ops</span><span class="p">);</span>
+
+	<span class="cm">/* RPC submission failed, wait a bit and retry */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">error</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is the callback from the RPC layer when the NLM_GRANTED_MSG</span>
+<span class="cm"> * RPC call has succeeded or timed out.</span>
+<span class="cm"> * Like all RPC callbacks, it is invoked by the rpciod process, so it</span>
+<span class="cm"> * better not sleep. Therefore, we put the blocked lock on the nlm_blocked</span>
+<span class="cm"> * chain once more in order to have it removed by lockd itself (which can</span>
+<span class="cm"> * then sleep on the file semaphore without disrupting e.g. the nfs client).</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_grant_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">rpc_task</span> <span class="o">*</span><span class="n">task</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_rqst</span>		<span class="o">*</span><span class="n">call</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span> <span class="o">=</span> <span class="n">call</span><span class="o">-&gt;</span><span class="n">a_block</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>		<span class="n">timeout</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;lockd: GRANT_MSG RPC callback</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+	<span class="cm">/* if the block is not on a list at this point then it has</span>
+<span class="cm">	 * been invalidated. Don&#39;t try to requeue it.</span>
+<span class="cm">	 *</span>
+<span class="cm">	 * FIXME: it&#39;s possible that the block is removed from the list</span>
+<span class="cm">	 * after this check but before the nlmsvc_insert_block. In that</span>
+<span class="cm">	 * case it will be added back. Perhaps we need better locking</span>
+<span class="cm">	 * for nlm_blocked?</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_list</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="cm">/* Technically, we should down the file semaphore here. Since we</span>
+<span class="cm">	 * move the block towards the head of the queue only, no harm</span>
+<span class="cm">	 * can be done, though. */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">task</span><span class="o">-&gt;</span><span class="n">tk_status</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* RPC error: Re-insert for retransmission */</span>
+		<span class="n">timeout</span> <span class="o">=</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="cm">/* Call was successful, now wait for client callback */</span>
+		<span class="n">timeout</span> <span class="o">=</span> <span class="mi">60</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">nlmsvc_insert_block_locked</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">timeout</span><span class="p">);</span>
+	<span class="n">svc_wake_up</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_daemon</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * FIXME: nlmsvc_release_block() grabs a mutex.  This is not allowed for an</span>
+<span class="cm"> * .rpc_release rpc_call_op</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">nlmsvc_grant_release</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_rqst</span>		<span class="o">*</span><span class="n">call</span> <span class="o">=</span> <span class="n">data</span><span class="p">;</span>
+	<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">call</span><span class="o">-&gt;</span><span class="n">a_block</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">rpc_call_ops</span> <span class="n">nlmsvc_grant_ops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">rpc_call_done</span> <span class="o">=</span> <span class="n">nlmsvc_grant_callback</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">rpc_release</span> <span class="o">=</span> <span class="n">nlmsvc_grant_release</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We received a GRANT_RES callback. Try to find the corresponding</span>
+<span class="cm"> * block.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span>
+<span class="nf">nlmsvc_grant_reply</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_cookie</span> <span class="o">*</span><span class="n">cookie</span><span class="p">,</span> <span class="n">__be32</span> <span class="n">status</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span>	<span class="o">*</span><span class="n">block</span><span class="p">;</span>
+
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;grant_reply: looking for cookie %x, s=%d </span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		<span class="o">*</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">int</span> <span class="o">*</span><span class="p">)(</span><span class="n">cookie</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">),</span> <span class="n">status</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">block</span> <span class="o">=</span> <span class="n">nlmsvc_find_block</span><span class="p">(</span><span class="n">cookie</span><span class="p">)))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">status</span> <span class="o">==</span> <span class="n">nlm_lck_denied_grace_period</span><span class="p">)</span> <span class="p">{</span>
+			<span class="cm">/* Try again in a couple of seconds */</span>
+			<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">HZ</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="cm">/* Lock is now held by client, or has been rejected.</span>
+<span class="cm">			 * In both cases, the block should be removed. */</span>
+			<span class="n">nlmsvc_unlink_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">nlmsvc_release_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Helper function to handle retry of a deferred block.</span>
+<span class="cm"> * If it is a blocking lock, call grant_blocked.</span>
+<span class="cm"> * For a non-blocking lock or test lock, revisit the request.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span>
+<span class="nf">retry_deferred_block</span><span class="p">(</span><span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_GOT_CALLBACK</span><span class="p">))</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">|=</span> <span class="n">B_TIMED_OUT</span><span class="p">;</span>
+	<span class="n">nlmsvc_insert_block</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">NLM_TIMEOUT</span><span class="p">);</span>
+	<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;revisit block %p flags %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>	<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span><span class="o">-&gt;</span><span class="n">revisit</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">block</span><span class="o">-&gt;</span><span class="n">b_deferred_req</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Retry all blocked locks that have been notified. This is where lockd</span>
+<span class="cm"> * picks up locks that can be granted, or grant notifications that must</span>
+<span class="cm"> * be retransmitted.</span>
+<span class="cm"> */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span>
+<span class="nf">nlmsvc_retry_blocked</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>	<span class="n">timeout</span> <span class="o">=</span> <span class="n">MAX_SCHEDULE_TIMEOUT</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">nlm_block</span> <span class="o">*</span><span class="n">block</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">nlm_blocked</span><span class="p">)</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span> <span class="p">{</span>
+		<span class="n">block</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">nlm_blocked</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">nlm_block</span><span class="p">,</span> <span class="n">b_list</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_when</span> <span class="o">==</span> <span class="n">NLM_NEVER</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">time_after</span><span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_when</span><span class="p">,</span> <span class="n">jiffies</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">timeout</span> <span class="o">=</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_when</span> <span class="o">-</span> <span class="n">jiffies</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;nlmsvc_retry_blocked(%p, when=%ld)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_when</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span> <span class="o">&amp;</span> <span class="n">B_QUEUED</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">dprintk</span><span class="p">(</span><span class="s">&quot;nlmsvc_retry_blocked delete block (%p, granted=%d, flags=%d)</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+				<span class="n">block</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_granted</span><span class="p">,</span> <span class="n">block</span><span class="o">-&gt;</span><span class="n">b_flags</span><span class="p">);</span>
+			<span class="n">retry_deferred_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span>
+			<span class="n">nlmsvc_grant_blocked</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">timeout</span><span class="p">;</span>
+<span class="p">}</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › infiniband › core › fmr_pool.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>fmr_pool.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (c) 2004 Topspin Communications.  All rights reserved.</span>
+<span class="cm"> * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This software is available to you under a choice of one of two</span>
+<span class="cm"> * licenses.  You may choose to be licensed under the terms of the GNU</span>
+<span class="cm"> * General Public License (GPL) Version 2, available from the file</span>
+<span class="cm"> * COPYING in the main directory of this source tree, or the</span>
+<span class="cm"> * OpenIB.org BSD license below:</span>
+<span class="cm"> *</span>
+<span class="cm"> *     Redistribution and use in source and binary forms, with or</span>
+<span class="cm"> *     without modification, are permitted provided that the following</span>
+<span class="cm"> *     conditions are met:</span>
+<span class="cm"> *</span>
+<span class="cm"> *      - Redistributions of source code must retain the above</span>
+<span class="cm"> *        copyright notice, this list of conditions and the following</span>
+<span class="cm"> *        disclaimer.</span>
+<span class="cm"> *</span>
+<span class="cm"> *      - Redistributions in binary form must reproduce the above</span>
+<span class="cm"> *        copyright notice, this list of conditions and the following</span>
+<span class="cm"> *        disclaimer in the documentation and/or other materials</span>
+<span class="cm"> *        provided with the distribution.</span>
+<span class="cm"> *</span>
+<span class="cm"> * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND,</span>
+<span class="cm"> * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF</span>
+<span class="cm"> * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND</span>
+<span class="cm"> * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS</span>
+<span class="cm"> * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN</span>
+<span class="cm"> * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN</span>
+<span class="cm"> * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE</span>
+<span class="cm"> * SOFTWARE.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/errno.h&gt;</span>
+<span class="cp">#include &lt;linux/spinlock.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/jhash.h&gt;</span>
+<span class="cp">#include &lt;linux/kthread.h&gt;</span>
+
+<span class="cp">#include &lt;rdma/ib_fmr_pool.h&gt;</span>
+
+<span class="cp">#include &quot;core_priv.h&quot;</span>
+
+<span class="cp">#define PFX &quot;fmr_pool: &quot;</span>
+
+<span class="k">enum</span> <span class="p">{</span>
+	<span class="n">IB_FMR_MAX_REMAPS</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span>
+
+	<span class="n">IB_FMR_HASH_BITS</span>  <span class="o">=</span> <span class="mi">8</span><span class="p">,</span>
+	<span class="n">IB_FMR_HASH_SIZE</span>  <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">IB_FMR_HASH_BITS</span><span class="p">,</span>
+	<span class="n">IB_FMR_HASH_MASK</span>  <span class="o">=</span> <span class="n">IB_FMR_HASH_SIZE</span> <span class="o">-</span> <span class="mi">1</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * If an FMR is not in use, then the list member will point to either</span>
+<span class="cm"> * its pool&#39;s free_list (if the FMR can be mapped again; that is,</span>
+<span class="cm"> * remap_count &lt; pool-&gt;max_remaps) or its pool&#39;s dirty_list (if the</span>
+<span class="cm"> * FMR needs to be unmapped before being remapped).  In either of</span>
+<span class="cm"> * these cases it is a bug if the ref_count is not 0.  In other words,</span>
+<span class="cm"> * if ref_count is &gt; 0, then the list member must not be linked into</span>
+<span class="cm"> * either free_list or dirty_list.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The cache_node member is used to link the FMR into a cache bucket</span>
+<span class="cm"> * (if caching is enabled).  This is independent of the reference</span>
+<span class="cm"> * count of the FMR.  When a valid FMR is released, its ref_count is</span>
+<span class="cm"> * decremented, and if ref_count reaches 0, the FMR is placed in</span>
+<span class="cm"> * either free_list or dirty_list as appropriate.  However, it is not</span>
+<span class="cm"> * removed from the cache and may be &quot;revived&quot; if a call to</span>
+<span class="cm"> * ib_fmr_register_physical() occurs before the FMR is remapped.  In</span>
+<span class="cm"> * this case we just increment the ref_count and remove the FMR from</span>
+<span class="cm"> * free_list/dirty_list.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Before we remap an FMR from free_list, we remove it from the cache</span>
+<span class="cm"> * (to prevent another user from obtaining a stale FMR).  When an FMR</span>
+<span class="cm"> * is released, we add it to the tail of the free list, so that our</span>
+<span class="cm"> * cache eviction policy is &quot;least recently used.&quot;</span>
+<span class="cm"> *</span>
+<span class="cm"> * All manipulation of ref_count, list and cache_node is protected by</span>
+<span class="cm"> * pool_lock to maintain consistency.</span>
+<span class="cm"> */</span>
+
+<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="p">{</span>
+	<span class="n">spinlock_t</span>                <span class="n">pool_lock</span><span class="p">;</span>
+
+	<span class="kt">int</span>                       <span class="n">pool_size</span><span class="p">;</span>
+	<span class="kt">int</span>                       <span class="n">max_pages</span><span class="p">;</span>
+	<span class="kt">int</span>			  <span class="n">max_remaps</span><span class="p">;</span>
+	<span class="kt">int</span>                       <span class="n">dirty_watermark</span><span class="p">;</span>
+	<span class="kt">int</span>                       <span class="n">dirty_len</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>          <span class="n">free_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span>          <span class="n">dirty_list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">hlist_head</span>        <span class="o">*</span><span class="n">cache_bucket</span><span class="p">;</span>
+
+	<span class="kt">void</span>                     <span class="p">(</span><span class="o">*</span><span class="n">flush_function</span><span class="p">)(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span>
+						   <span class="kt">void</span> <span class="o">*</span>              <span class="n">arg</span><span class="p">);</span>
+	<span class="kt">void</span>                     <span class="o">*</span><span class="n">flush_arg</span><span class="p">;</span>
+
+	<span class="k">struct</span> <span class="n">task_struct</span>       <span class="o">*</span><span class="kr">thread</span><span class="p">;</span>
+
+	<span class="n">atomic_t</span>                  <span class="n">req_ser</span><span class="p">;</span>
+	<span class="n">atomic_t</span>                  <span class="n">flush_ser</span><span class="p">;</span>
+
+	<span class="n">wait_queue_head_t</span>         <span class="n">force_wait</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kr">inline</span> <span class="n">u32</span> <span class="nf">ib_fmr_hash</span><span class="p">(</span><span class="n">u64</span> <span class="n">first_page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">jhash_2words</span><span class="p">((</span><span class="n">u32</span><span class="p">)</span> <span class="n">first_page</span><span class="p">,</span> <span class="p">(</span><span class="n">u32</span><span class="p">)</span> <span class="p">(</span><span class="n">first_page</span> <span class="o">&gt;&gt;</span> <span class="mi">32</span><span class="p">),</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&amp;</span>
+		<span class="p">(</span><span class="n">IB_FMR_HASH_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* Caller must hold pool_lock */</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="nf">ib_fmr_cache_lookup</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span>
+						      <span class="n">u64</span> <span class="o">*</span><span class="n">page_list</span><span class="p">,</span>
+						      <span class="kt">int</span>  <span class="n">page_list_len</span><span class="p">,</span>
+						      <span class="n">u64</span>  <span class="n">io_virtual_address</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">hlist_head</span> <span class="o">*</span><span class="n">bucket</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">hlist_node</span> <span class="o">*</span><span class="n">pos</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">)</span>
+		<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">bucket</span> <span class="o">=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span> <span class="o">+</span> <span class="n">ib_fmr_hash</span><span class="p">(</span><span class="o">*</span><span class="n">page_list</span><span class="p">);</span>
+
+	<span class="n">hlist_for_each_entry</span><span class="p">(</span><span class="n">fmr</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">bucket</span><span class="p">,</span> <span class="n">cache_node</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">io_virtual_address</span> <span class="o">==</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">io_virtual_address</span> <span class="o">&amp;&amp;</span>
+		    <span class="n">page_list_len</span>      <span class="o">==</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">page_list_len</span>      <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">memcmp</span><span class="p">(</span><span class="n">page_list</span><span class="p">,</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span>
+			    <span class="n">page_list_len</span> <span class="o">*</span> <span class="k">sizeof</span> <span class="o">*</span><span class="n">page_list</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">fmr</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">ib_fmr_batch_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span>                 <span class="n">ret</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">unmap_list</span><span class="p">);</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">fmr_list</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">fmr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">hlist_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">cache_node</span><span class="p">);</span>
+		<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">fmr_list</span><span class="p">);</span>
+
+<span class="cp">#ifdef DEBUG</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span> <span class="o">!=</span><span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;Unmapping FMR 0x%08x with ref count %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			       <span class="n">fmr</span><span class="p">,</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span><span class="p">);</span>
+		<span class="p">}</span>
+<span class="cp">#endif</span>
+	<span class="p">}</span>
+
+	<span class="n">list_splice_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">unmap_list</span><span class="p">);</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">unmap_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ib_unmap_fmr</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr_list</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;ib_unmap_fmr returned %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+	<span class="n">list_splice</span><span class="p">(</span><span class="o">&amp;</span><span class="n">unmap_list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">ib_fmr_cleanup_thread</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">pool_ptr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="n">pool_ptr</span><span class="p">;</span>
+
+	<span class="k">do</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_ser</span><span class="p">)</span> <span class="o">-</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">req_ser</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ib_fmr_batch_release</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+
+			<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_ser</span><span class="p">);</span>
+			<span class="n">wake_up_interruptible</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">force_wait</span><span class="p">);</span>
+
+			<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_function</span><span class="p">)</span>
+				<span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_function</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_arg</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">set_current_state</span><span class="p">(</span><span class="n">TASK_INTERRUPTIBLE</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_ser</span><span class="p">)</span> <span class="o">-</span> <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">req_ser</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+		    <span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">())</span>
+			<span class="n">schedule</span><span class="p">();</span>
+		<span class="n">__set_current_state</span><span class="p">(</span><span class="n">TASK_RUNNING</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">kthread_should_stop</span><span class="p">());</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * ib_create_fmr_pool - Create an FMR pool</span>
+<span class="cm"> * @pd:Protection domain for FMRs</span>
+<span class="cm"> * @params:FMR pool parameters</span>
+<span class="cm"> *</span>
+<span class="cm"> * Create a pool of FMRs.  Return value is pointer to new pool or</span>
+<span class="cm"> * error code if creation failed.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="nf">ib_create_fmr_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_pd</span>             <span class="o">*</span><span class="n">pd</span><span class="p">,</span>
+				       <span class="k">struct</span> <span class="n">ib_fmr_pool_param</span> <span class="o">*</span><span class="n">params</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ib_device</span>   <span class="o">*</span><span class="n">device</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_device_attr</span> <span class="o">*</span><span class="n">attr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">max_remaps</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">params</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">EINVAL</span><span class="p">);</span>
+
+	<span class="n">device</span> <span class="o">=</span> <span class="n">pd</span><span class="o">-&gt;</span><span class="n">device</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">alloc_fmr</span>    <span class="o">||</span> <span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">dealloc_fmr</span>  <span class="o">||</span>
+	    <span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">map_phys_fmr</span> <span class="o">||</span> <span class="o">!</span><span class="n">device</span><span class="o">-&gt;</span><span class="n">unmap_fmr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_INFO</span> <span class="n">PFX</span> <span class="s">&quot;Device %s does not support FMRs</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">device</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOSYS</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">attr</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span> <span class="o">*</span><span class="n">attr</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">attr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;couldn&#39;t allocate device attr struct</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="n">ib_query_device</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">attr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;couldn&#39;t query device: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">attr</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">attr</span><span class="o">-&gt;</span><span class="n">max_map_per_fmr</span><span class="p">)</span>
+		<span class="n">max_remaps</span> <span class="o">=</span> <span class="n">IB_FMR_MAX_REMAPS</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">max_remaps</span> <span class="o">=</span> <span class="n">attr</span><span class="o">-&gt;</span><span class="n">max_map_per_fmr</span><span class="p">;</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">attr</span><span class="p">);</span>
+
+	<span class="n">pool</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span> <span class="o">*</span><span class="n">pool</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pool</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;couldn&#39;t allocate pool struct</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span>   <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_function</span> <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">flush_function</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_arg</span>      <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">flush_arg</span><span class="p">;</span>
+
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_list</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">params</span><span class="o">-&gt;</span><span class="n">cache</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span> <span class="o">=</span>
+			<span class="n">kmalloc</span><span class="p">(</span><span class="n">IB_FMR_HASH_SIZE</span> <span class="o">*</span> <span class="k">sizeof</span> <span class="o">*</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">,</span>
+				<span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;Failed to allocate cache in pool</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">out_free_pool</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">IB_FMR_HASH_SIZE</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+			<span class="n">INIT_HLIST_HEAD</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span> <span class="o">+</span> <span class="n">i</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_size</span>       <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">max_pages</span>       <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">max_pages_per_fmr</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">max_remaps</span>      <span class="o">=</span> <span class="n">max_remaps</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_watermark</span> <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">dirty_watermark</span><span class="p">;</span>
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_len</span>       <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">req_ser</span><span class="p">,</span>   <span class="mi">0</span><span class="p">);</span>
+	<span class="n">atomic_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_ser</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">init_waitqueue_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">force_wait</span><span class="p">);</span>
+
+	<span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span> <span class="o">=</span> <span class="n">kthread_run</span><span class="p">(</span><span class="n">ib_fmr_cleanup_thread</span><span class="p">,</span>
+				   <span class="n">pool</span><span class="p">,</span>
+				   <span class="s">&quot;ib_fmr(%s)&quot;</span><span class="p">,</span>
+				   <span class="n">device</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;couldn&#39;t start cleanup thread</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out_free_pool</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="p">{</span>
+		<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+		<span class="k">struct</span> <span class="n">ib_fmr_attr</span> <span class="n">fmr_attr</span> <span class="o">=</span> <span class="p">{</span>
+			<span class="p">.</span><span class="n">max_pages</span>  <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">max_pages_per_fmr</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">max_maps</span>   <span class="o">=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">max_remaps</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">page_shift</span> <span class="o">=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">page_shift</span>
+		<span class="p">};</span>
+		<span class="kt">int</span> <span class="n">bytes_per_fmr</span> <span class="o">=</span> <span class="k">sizeof</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">)</span>
+			<span class="n">bytes_per_fmr</span> <span class="o">+=</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">max_pages_per_fmr</span> <span class="o">*</span> <span class="k">sizeof</span> <span class="p">(</span><span class="n">u64</span><span class="p">);</span>
+
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">pool_size</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">fmr</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="n">bytes_per_fmr</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">fmr</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;failed to allocate fmr &quot;</span>
+				       <span class="s">&quot;struct for FMR %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+				<span class="k">goto</span> <span class="n">out_fail</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">pool</span>             <span class="o">=</span> <span class="n">pool</span><span class="p">;</span>
+			<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span>      <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span>        <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">INIT_HLIST_NODE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">cache_node</span><span class="p">);</span>
+
+			<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span> <span class="o">=</span> <span class="n">ib_alloc_fmr</span><span class="p">(</span><span class="n">pd</span><span class="p">,</span> <span class="n">params</span><span class="o">-&gt;</span><span class="n">access</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">fmr_attr</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span><span class="p">))</span> <span class="p">{</span>
+				<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;fmr_create failed &quot;</span>
+				       <span class="s">&quot;for FMR %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">i</span><span class="p">);</span>
+				<span class="n">kfree</span><span class="p">(</span><span class="n">fmr</span><span class="p">);</span>
+				<span class="k">goto</span> <span class="n">out_fail</span><span class="p">;</span>
+			<span class="p">}</span>
+
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+			<span class="o">++</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_size</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">pool</span><span class="p">;</span>
+
+ <span class="nl">out_free_pool:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">ret</span><span class="p">);</span>
+
+ <span class="nl">out_fail:</span>
+	<span class="n">ib_destroy_fmr_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ib_create_fmr_pool</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * ib_destroy_fmr_pool - Free FMR pool</span>
+<span class="cm"> * @pool:FMR pool to free</span>
+<span class="cm"> *</span>
+<span class="cm"> * Destroy an FMR pool and free all associated resources.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">ib_destroy_fmr_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">fmr_list</span><span class="p">);</span>
+	<span class="kt">int</span>                 <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">kthread_stop</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span><span class="p">);</span>
+	<span class="n">ib_fmr_batch_release</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+
+	<span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">fmr</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr_list</span><span class="p">);</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">fmr_list</span><span class="p">);</span>
+			<span class="n">ib_unmap_fmr</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr_list</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">ib_dealloc_fmr</span><span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">fmr</span><span class="p">);</span>
+		<span class="o">++</span><span class="n">i</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">&lt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_size</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;pool still has %d regions registered</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_size</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">);</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ib_destroy_fmr_pool</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * ib_flush_fmr_pool - Invalidate all unmapped FMRs</span>
+<span class="cm"> * @pool:FMR pool to flush</span>
+<span class="cm"> *</span>
+<span class="cm"> * Ensure that all unmapped FMRs are fully invalidated.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">ib_flush_fmr_pool</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">serial</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * The free_list holds FMRs that may have been used</span>
+<span class="cm">	 * but have not been remapped enough times to be dirty.</span>
+<span class="cm">	 * Put them on the dirty list now so that the cleanup</span>
+<span class="cm">	 * thread will reap them too.</span>
+<span class="cm">	 */</span>
+	<span class="n">spin_lock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">fmr</span><span class="p">,</span> <span class="n">next</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">list_move</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_list</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">spin_unlock_irq</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">);</span>
+
+	<span class="n">serial</span> <span class="o">=</span> <span class="n">atomic_inc_return</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">req_ser</span><span class="p">);</span>
+	<span class="n">wake_up_process</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">wait_event_interruptible</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">force_wait</span><span class="p">,</span>
+				     <span class="n">atomic_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">flush_ser</span><span class="p">)</span> <span class="o">-</span> <span class="n">serial</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINTR</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ib_flush_fmr_pool</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * ib_fmr_pool_map_phys -</span>
+<span class="cm"> * @pool:FMR pool to allocate FMR from</span>
+<span class="cm"> * @page_list:List of pages to map</span>
+<span class="cm"> * @list_len:Number of pages in @page_list</span>
+<span class="cm"> * @io_virtual_address:I/O virtual address for new FMR</span>
+<span class="cm"> *</span>
+<span class="cm"> * Map an FMR from an FMR pool.</span>
+<span class="cm"> */</span>
+<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="nf">ib_fmr_pool_map_phys</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool_handle</span><span class="p">,</span>
+					 <span class="n">u64</span>                <span class="o">*</span><span class="n">page_list</span><span class="p">,</span>
+					 <span class="kt">int</span>                 <span class="n">list_len</span><span class="p">,</span>
+					 <span class="n">u64</span>                 <span class="n">io_virtual_address</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span> <span class="o">=</span> <span class="n">pool_handle</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span>       <span class="n">flags</span><span class="p">;</span>
+	<span class="kt">int</span>                 <span class="n">result</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_len</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="o">||</span> <span class="n">list_len</span> <span class="o">&gt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">max_pages</span><span class="p">)</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">EINVAL</span><span class="p">);</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="n">fmr</span> <span class="o">=</span> <span class="n">ib_fmr_cache_lookup</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span>
+				  <span class="n">page_list</span><span class="p">,</span>
+				  <span class="n">list_len</span><span class="p">,</span>
+				  <span class="n">io_virtual_address</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* found in cache */</span>
+		<span class="o">++</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+		<span class="p">}</span>
+
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="n">fmr</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="o">-</span><span class="n">EAGAIN</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">fmr</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span> <span class="k">struct</span> <span class="n">ib_pool_fmr</span><span class="p">,</span> <span class="n">list</span><span class="p">);</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">hlist_del_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">cache_node</span><span class="p">);</span>
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="n">result</span> <span class="o">=</span> <span class="n">ib_map_phys_fmr</span><span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">fmr</span><span class="p">,</span> <span class="n">page_list</span><span class="p">,</span> <span class="n">list_len</span><span class="p">,</span>
+				 <span class="n">io_virtual_address</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">result</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;fmr_map returns %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+
+		<span class="k">return</span> <span class="n">ERR_PTR</span><span class="p">(</span><span class="n">result</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="o">++</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span><span class="p">;</span>
+	<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">io_virtual_address</span> <span class="o">=</span> <span class="n">io_virtual_address</span><span class="p">;</span>
+		<span class="n">fmr</span><span class="o">-&gt;</span><span class="n">page_list_len</span>      <span class="o">=</span> <span class="n">list_len</span><span class="p">;</span>
+		<span class="n">memcpy</span><span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">,</span> <span class="n">page_list</span><span class="p">,</span> <span class="n">list_len</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">page_list</span><span class="p">));</span>
+
+		<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+		<span class="n">hlist_add_head</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">cache_node</span><span class="p">,</span>
+			       <span class="n">pool</span><span class="o">-&gt;</span><span class="n">cache_bucket</span> <span class="o">+</span> <span class="n">ib_fmr_hash</span><span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">page_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]));</span>
+		<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">fmr</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ib_fmr_pool_map_phys</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * ib_fmr_pool_unmap - Unmap FMR</span>
+<span class="cm"> * @fmr:FMR to unmap</span>
+<span class="cm"> *</span>
+<span class="cm"> * Unmap an FMR.  The FMR mapping may remain valid until the FMR is</span>
+<span class="cm"> * reused (or until ib_flush_fmr_pool() is called).</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">ib_fmr_pool_unmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">ib_pool_fmr</span> <span class="o">*</span><span class="n">fmr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ib_fmr_pool</span> <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">flags</span><span class="p">;</span>
+
+	<span class="n">pool</span> <span class="o">=</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">;</span>
+
+	<span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="o">--</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">remap_count</span> <span class="o">&lt;</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">max_remaps</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">free_list</span><span class="p">);</span>
+		<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+			<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_list</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="o">++</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_len</span> <span class="o">&gt;=</span> <span class="n">pool</span><span class="o">-&gt;</span><span class="n">dirty_watermark</span><span class="p">)</span> <span class="p">{</span>
+				<span class="n">atomic_inc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">req_ser</span><span class="p">);</span>
+				<span class="n">wake_up_process</span><span class="p">(</span><span class="n">pool</span><span class="o">-&gt;</span><span class="kr">thread</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+<span class="cp">#ifdef DEBUG</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_WARNING</span> <span class="n">PFX</span> <span class="s">&quot;FMR %p has ref count %d &lt; 0</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+		       <span class="n">fmr</span><span class="p">,</span> <span class="n">fmr</span><span class="o">-&gt;</span><span class="n">ref_count</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+	<span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="o">-&gt;</span><span class="n">pool_lock</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">ib_fmr_pool_unmap</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › xen › gntalloc.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../index.html"></a><h1>gntalloc.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/******************************************************************************</span>
+<span class="cm"> * gntalloc.c</span>
+<span class="cm"> *</span>
+<span class="cm"> * Device for creating grant references (in user-space) that may be shared</span>
+<span class="cm"> * with other domains.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This program is distributed in the hope that it will be useful,</span>
+<span class="cm"> * but WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="cm"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</span>
+<span class="cm"> * GNU General Public License for more details.</span>
+<span class="cm"> *</span>
+<span class="cm"> * You should have received a copy of the GNU General Public License</span>
+<span class="cm"> * along with this program; if not, write to the Free Software</span>
+<span class="cm"> * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This driver exists to allow userspace programs in Linux to allocate kernel</span>
+<span class="cm"> * memory that will later be shared with another domain.  Without this device,</span>
+<span class="cm"> * Linux userspace programs cannot create grant references.</span>
+<span class="cm"> *</span>
+<span class="cm"> * How this stuff works:</span>
+<span class="cm"> *   X -&gt; granting a page to Y</span>
+<span class="cm"> *   Y -&gt; mapping the grant from X</span>
+<span class="cm"> *</span>
+<span class="cm"> *   1. X uses the gntalloc device to allocate a page of kernel memory, P.</span>
+<span class="cm"> *   2. X creates an entry in the grant table that says domid(Y) can access P.</span>
+<span class="cm"> *      This is done without a hypercall unless the grant table needs expansion.</span>
+<span class="cm"> *   3. X gives the grant reference identifier, GREF, to Y.</span>
+<span class="cm"> *   4. Y maps the page, either directly into kernel memory for use in a backend</span>
+<span class="cm"> *      driver, or via a the gntdev device to map into the address space of an</span>
+<span class="cm"> *      application running in Y. This is the first point at which Xen does any</span>
+<span class="cm"> *      tracking of the page.</span>
+<span class="cm"> *   5. A program in X mmap()s a segment of the gntalloc device that corresponds</span>
+<span class="cm"> *      to the shared page, and can now communicate with Y over the shared page.</span>
+<span class="cm"> *</span>
+<span class="cm"> *</span>
+<span class="cm"> * NOTE TO USERSPACE LIBRARIES:</span>
+<span class="cm"> *   The grant allocation and mmap()ing are, naturally, two separate operations.</span>
+<span class="cm"> *   You set up the sharing by calling the create ioctl() and then the mmap().</span>
+<span class="cm"> *   Teardown requires munmap() and either close() or ioctl().</span>
+<span class="cm"> *</span>
+<span class="cm"> * WARNING: Since Xen does not allow a guest to forcibly end the use of a grant</span>
+<span class="cm"> * reference, this device can be used to consume kernel memory by leaving grant</span>
+<span class="cm"> * references mapped by another domain when an application exits. Therefore,</span>
+<span class="cm"> * there is a global limit on the number of pages that can be allocated. When</span>
+<span class="cm"> * all references to the page are unmapped, it will be freed during the next</span>
+<span class="cm"> * grant operation.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/atomic.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/miscdevice.h&gt;</span>
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/init.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/device.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/uaccess.h&gt;</span>
+<span class="cp">#include &lt;linux/types.h&gt;</span>
+<span class="cp">#include &lt;linux/list.h&gt;</span>
+<span class="cp">#include &lt;linux/highmem.h&gt;</span>
+
+<span class="cp">#include &lt;xen/xen.h&gt;</span>
+<span class="cp">#include &lt;xen/page.h&gt;</span>
+<span class="cp">#include &lt;xen/grant_table.h&gt;</span>
+<span class="cp">#include &lt;xen/gntalloc.h&gt;</span>
+<span class="cp">#include &lt;xen/events.h&gt;</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">limit</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">;</span>
+<span class="n">module_param</span><span class="p">(</span><span class="n">limit</span><span class="p">,</span> <span class="kt">int</span><span class="p">,</span> <span class="mo">0644</span><span class="p">);</span>
+<span class="n">MODULE_PARM_DESC</span><span class="p">(</span><span class="n">limit</span><span class="p">,</span> <span class="s">&quot;Maximum number of grants that may be allocated by &quot;</span>
+		<span class="s">&quot;the gntalloc device&quot;</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">gref_list</span><span class="p">);</span>
+<span class="k">static</span> <span class="n">DEFINE_MUTEX</span><span class="p">(</span><span class="n">gref_mutex</span><span class="p">);</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="n">gref_size</span><span class="p">;</span>
+
+<span class="k">struct</span> <span class="n">notify_info</span> <span class="p">{</span>
+	<span class="kt">uint16_t</span> <span class="n">pgoff</span><span class="o">:</span><span class="mi">12</span><span class="p">;</span>    <span class="cm">/* Bits 0-11: Offset of the byte to clear */</span>
+	<span class="kt">uint16_t</span> <span class="n">flags</span><span class="o">:</span><span class="mi">2</span><span class="p">;</span>     <span class="cm">/* Bits 12-13: Unmap notification flags */</span>
+	<span class="kt">int</span> <span class="n">event</span><span class="p">;</span>            <span class="cm">/* Port (event channel) to notify */</span>
+<span class="p">};</span>
+
+<span class="cm">/* Metadata on a grant reference. */</span>
+<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">next_gref</span><span class="p">;</span>  <span class="cm">/* list entry gref_list */</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">next_file</span><span class="p">;</span>  <span class="cm">/* list entry file-&gt;list, if open */</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>	     <span class="cm">/* The shared page */</span>
+	<span class="kt">uint64_t</span> <span class="n">file_index</span><span class="p">;</span>         <span class="cm">/* File offset for mmap() */</span>
+	<span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">users</span><span class="p">;</span>          <span class="cm">/* Use count - when zero, waiting on Xen */</span>
+	<span class="n">grant_ref_t</span> <span class="n">gref_id</span><span class="p">;</span>         <span class="cm">/* The grant reference number */</span>
+	<span class="k">struct</span> <span class="n">notify_info</span> <span class="n">notify</span><span class="p">;</span>   <span class="cm">/* Unmap notification */</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">index</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">gntalloc_vma_private_data</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">users</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__del_gref</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">do_cleanup</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">gref</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gref_list</span><span class="p">,</span> <span class="n">next_gref</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span><span class="p">)</span>
+			<span class="n">__del_gref</span><span class="p">(</span><span class="n">gref</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">add_grefs</span><span class="p">(</span><span class="k">struct</span> <span class="n">ioctl_gntalloc_alloc_gref</span> <span class="o">*</span><span class="n">op</span><span class="p">,</span>
+	<span class="kt">uint32_t</span> <span class="o">*</span><span class="n">gref_ids</span><span class="p">,</span> <span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">rc</span><span class="p">,</span> <span class="n">readonly</span><span class="p">;</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">queue_gref</span><span class="p">);</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">queue_file</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+
+	<span class="n">readonly</span> <span class="o">=</span> <span class="o">!</span><span class="p">(</span><span class="n">op</span><span class="o">-&gt;</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">GNTALLOC_FLAG_WRITABLE</span><span class="p">);</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">op</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gref</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">gref</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gref</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">undo</span><span class="p">;</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_gref</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">queue_gref</span><span class="p">);</span>
+		<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">queue_file</span><span class="p">);</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">file_index</span> <span class="o">=</span> <span class="n">op</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">+</span> <span class="n">i</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span> <span class="o">=</span> <span class="n">alloc_page</span><span class="p">(</span><span class="n">GFP_KERNEL</span><span class="o">|</span><span class="n">__GFP_ZERO</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">undo</span><span class="p">;</span>
+
+		<span class="cm">/* Grant foreign access to the page. */</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span> <span class="o">=</span> <span class="n">gnttab_grant_foreign_access</span><span class="p">(</span><span class="n">op</span><span class="o">-&gt;</span><span class="n">domid</span><span class="p">,</span>
+			<span class="n">pfn_to_mfn</span><span class="p">(</span><span class="n">page_to_pfn</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">)),</span> <span class="n">readonly</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">((</span><span class="kt">int</span><span class="p">)</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">undo</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">gref_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* Add to gref lists. */</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="n">list_splice_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queue_gref</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gref_list</span><span class="p">);</span>
+	<span class="n">list_splice_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queue_file</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">undo:</span>
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="n">gref_size</span> <span class="o">-=</span> <span class="p">(</span><span class="n">op</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">gref</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">queue_file</span><span class="p">,</span> <span class="n">next_file</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* __del_gref does not remove from queue_file */</span>
+		<span class="n">__del_gref</span><span class="p">(</span><span class="n">gref</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* It&#39;s possible for the target domain to map the just-allocated grant</span>
+<span class="cm">	 * references by blindly guessing their IDs; if this is done, then</span>
+<span class="cm">	 * __del_gref will leave them in the queue_gref list. They need to be</span>
+<span class="cm">	 * added to the global list so that we can free them when they are no</span>
+<span class="cm">	 * longer referenced.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queue_gref</span><span class="p">)))</span>
+		<span class="n">list_splice_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">queue_gref</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gref_list</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__del_gref</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UNMAP_NOTIFY_CLEAR_BYTE</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">uint8_t</span> <span class="o">*</span><span class="n">tmp</span> <span class="o">=</span> <span class="n">kmap</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">tmp</span><span class="p">[</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">pgoff</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">kunmap</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UNMAP_NOTIFY_SEND_EVENT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">notify_remote_via_evtchn</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">event</span><span class="p">);</span>
+		<span class="n">evtchn_put</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">event</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gnttab_query_foreign_access</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span><span class="p">))</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gnttab_end_foreign_access_ref</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="n">gnttab_free_grant_reference</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">gref_id</span><span class="p">);</span>
+	<span class="p">}</span>
+
+	<span class="n">gref_size</span><span class="o">--</span><span class="p">;</span>
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_gref</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">)</span>
+		<span class="n">__free_page</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="n">kfree</span><span class="p">(</span><span class="n">gref</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* finds contiguous grant references in a file, returns the first */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="nf">find_grefs</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span>
+		<span class="kt">uint64_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">rv</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+	<span class="n">list_for_each_entry</span><span class="p">(</span><span class="n">gref</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">,</span> <span class="n">next_file</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">file_index</span> <span class="o">==</span> <span class="n">index</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">rv</span><span class="p">)</span>
+			<span class="n">rv</span> <span class="o">=</span> <span class="n">gref</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rv</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">file_index</span> <span class="o">!=</span> <span class="n">index</span><span class="p">)</span>
+				<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+			<span class="n">index</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+			<span class="n">count</span><span class="o">--</span><span class="p">;</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span> <span class="n">rv</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * -------------------------------------</span>
+<span class="cm"> *  File operations.</span>
+<span class="cm"> * -------------------------------------</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gntalloc_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">;</span>
+
+	<span class="n">priv</span> <span class="o">=</span> <span class="n">kzalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">priv</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">priv</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_nomem</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+
+	<span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span> <span class="o">=</span> <span class="n">priv</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: priv %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">priv</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out_nomem:</span>
+	<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gntalloc_release</span><span class="p">(</span><span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: priv %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">priv</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">gref</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">gntalloc_gref</span><span class="p">,</span> <span class="n">next_file</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_file</span><span class="p">);</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">--</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">__del_gref</span><span class="p">(</span><span class="n">gref</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">priv</span><span class="p">);</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">gntalloc_ioctl_alloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">ioctl_gntalloc_alloc_gref</span> <span class="n">__user</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ioctl_gntalloc_alloc_gref</span> <span class="n">op</span><span class="p">;</span>
+	<span class="kt">uint32_t</span> <span class="o">*</span><span class="n">gref_ids</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: priv %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">priv</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="n">arg</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">op</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">gref_ids</span> <span class="o">=</span> <span class="n">kcalloc</span><span class="p">(</span><span class="n">op</span><span class="p">.</span><span class="n">count</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">gref_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="n">GFP_TEMPORARY</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gref_ids</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="cm">/* Clean up pages that were at zero (local) users but were still mapped</span>
+<span class="cm">	 * by remote domains. Since those pages count towards the limit that we</span>
+<span class="cm">	 * are about to enforce, removing them here is a good idea.</span>
+<span class="cm">	 */</span>
+	<span class="n">do_cleanup</span><span class="p">();</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref_size</span> <span class="o">+</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOSPC</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">gref_size</span> <span class="o">+=</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span><span class="p">;</span>
+	<span class="n">op</span><span class="p">.</span><span class="n">index</span> <span class="o">=</span> <span class="n">priv</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">;</span>
+	<span class="n">priv</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">+=</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">add_grefs</span><span class="p">(</span><span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="n">gref_ids</span><span class="p">,</span> <span class="n">priv</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+
+	<span class="cm">/* Once we finish add_grefs, it is unsafe to touch the new reference,</span>
+<span class="cm">	 * since it is possible for a concurrent ioctl to remove it (by guessing</span>
+<span class="cm">	 * its index). If the userspace application doesn&#39;t provide valid memory</span>
+<span class="cm">	 * to write the IDs to, then it will need to close the file in order to</span>
+<span class="cm">	 * release - which it will do by segfaulting when it tries to access the</span>
+<span class="cm">	 * IDs to close them.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">arg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">op</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_to_user</span><span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">gref_ids</span><span class="p">,</span> <span class="n">gref_ids</span><span class="p">,</span>
+			<span class="k">sizeof</span><span class="p">(</span><span class="n">gref_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">out_free</span><span class="p">;</span>
+	<span class="p">}</span>
+
+<span class="nl">out_free:</span>
+	<span class="n">kfree</span><span class="p">(</span><span class="n">gref_ids</span><span class="p">);</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">gntalloc_ioctl_dealloc</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span>
+		<span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">,</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ioctl_gntalloc_dealloc_gref</span> <span class="n">op</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">,</span> <span class="o">*</span><span class="n">n</span><span class="p">;</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: priv %p</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span> <span class="n">priv</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="n">arg</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">op</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">dealloc_grant_out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="n">gref</span> <span class="o">=</span> <span class="n">find_grefs</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">op</span><span class="p">.</span><span class="n">index</span><span class="p">,</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="p">)</span> <span class="p">{</span>
+		<span class="cm">/* Remove from the file list only, and decrease reference count.</span>
+<span class="cm">		 * The later call to do_cleanup() will remove from gref_list and</span>
+<span class="cm">		 * free the memory if the pages aren&#39;t mapped anywhere.</span>
+<span class="cm">		 */</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">op</span><span class="p">.</span><span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">n</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_file</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">gntalloc_gref</span><span class="p">,</span> <span class="n">next_file</span><span class="p">);</span>
+			<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_file</span><span class="p">);</span>
+			<span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">--</span><span class="p">;</span>
+			<span class="n">gref</span> <span class="o">=</span> <span class="n">n</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">do_cleanup</span><span class="p">();</span>
+
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+<span class="nl">dealloc_grant_out:</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">gntalloc_ioctl_unmap_notify</span><span class="p">(</span><span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span><span class="p">,</span>
+		<span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ioctl_gntalloc_unmap_notify</span> <span class="n">op</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+	<span class="kt">uint64_t</span> <span class="n">index</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">pgoff</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">copy_from_user</span><span class="p">(</span><span class="o">&amp;</span><span class="n">op</span><span class="p">,</span> <span class="n">arg</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">op</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EFAULT</span><span class="p">;</span>
+
+	<span class="n">index</span> <span class="o">=</span> <span class="n">op</span><span class="p">.</span><span class="n">index</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="n">pgoff</span> <span class="o">=</span> <span class="n">op</span><span class="p">.</span><span class="n">index</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">PAGE_SIZE</span> <span class="o">-</span> <span class="mi">1</span><span class="p">);</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+
+	<span class="n">gref</span> <span class="o">=</span> <span class="n">find_grefs</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">gref</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">unlock_out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">op</span><span class="p">.</span><span class="n">action</span> <span class="o">&amp;</span> <span class="o">~</span><span class="p">(</span><span class="n">UNMAP_NOTIFY_CLEAR_BYTE</span><span class="o">|</span><span class="n">UNMAP_NOTIFY_SEND_EVENT</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">unlock_out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* We need to grab a reference to the event channel we are going to use</span>
+<span class="cm">	 * to send the notify before releasing the reference we may already have</span>
+<span class="cm">	 * (if someone has called this ioctl twice). This is required so that</span>
+<span class="cm">	 * it is possible to change the clear_byte part of the notification</span>
+<span class="cm">	 * without disturbing the event channel part, which may now be the last</span>
+<span class="cm">	 * reference to that event channel.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">op</span><span class="p">.</span><span class="n">action</span> <span class="o">&amp;</span> <span class="n">UNMAP_NOTIFY_SEND_EVENT</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">evtchn_get</span><span class="p">(</span><span class="n">op</span><span class="p">.</span><span class="n">event_channel_port</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+			<span class="k">goto</span> <span class="n">unlock_out</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">flags</span> <span class="o">&amp;</span> <span class="n">UNMAP_NOTIFY_SEND_EVENT</span><span class="p">)</span>
+		<span class="n">evtchn_put</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">event</span><span class="p">);</span>
+
+	<span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">flags</span> <span class="o">=</span> <span class="n">op</span><span class="p">.</span><span class="n">action</span><span class="p">;</span>
+	<span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">pgoff</span> <span class="o">=</span> <span class="n">pgoff</span><span class="p">;</span>
+	<span class="n">gref</span><span class="o">-&gt;</span><span class="n">notify</span><span class="p">.</span><span class="n">event</span> <span class="o">=</span> <span class="n">op</span><span class="p">.</span><span class="n">event_channel_port</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+ <span class="nl">unlock_out:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">long</span> <span class="nf">gntalloc_ioctl</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">int</span> <span class="n">cmd</span><span class="p">,</span>
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+
+	<span class="k">switch</span> <span class="p">(</span><span class="n">cmd</span><span class="p">)</span> <span class="p">{</span>
+	<span class="k">case</span> <span class="n">IOCTL_GNTALLOC_ALLOC_GREF</span>:
+		<span class="k">return</span> <span class="n">gntalloc_ioctl_alloc</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">);</span>
+
+	<span class="k">case</span> <span class="n">IOCTL_GNTALLOC_DEALLOC_GREF</span>:
+		<span class="k">return</span> <span class="n">gntalloc_ioctl_dealloc</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">);</span>
+
+	<span class="k">case</span> <span class="n">IOCTL_GNTALLOC_SET_UNMAP_NOTIFY</span>:
+		<span class="k">return</span> <span class="n">gntalloc_ioctl_unmap_notify</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="n">__user</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">);</span>
+
+	<span class="nl">default:</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOIOCTLCMD</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gntalloc_vma_open</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_vma_private_data</span> <span class="o">*</span><span class="n">priv</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">priv</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="n">priv</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">++</span><span class="p">;</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">gntalloc_vma_close</span><span class="p">(</span><span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_vma_private_data</span> <span class="o">*</span><span class="n">priv</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">,</span> <span class="o">*</span><span class="n">next</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">priv</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="n">priv</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">--</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">priv</span><span class="o">-&gt;</span><span class="n">users</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gref</span> <span class="o">=</span> <span class="n">priv</span><span class="o">-&gt;</span><span class="n">gref</span><span class="p">;</span>
+		<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">priv</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">--</span><span class="p">;</span>
+			<span class="n">next</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_gref</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+					  <span class="k">struct</span> <span class="n">gntalloc_gref</span><span class="p">,</span> <span class="n">next_gref</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="n">__del_gref</span><span class="p">(</span><span class="n">gref</span><span class="p">);</span>
+			<span class="n">gref</span> <span class="o">=</span> <span class="n">next</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">priv</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">vm_operations_struct</span> <span class="n">gntalloc_vmops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span> <span class="n">gntalloc_vma_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">close</span> <span class="o">=</span> <span class="n">gntalloc_vma_close</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">gntalloc_mmap</span><span class="p">(</span><span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">gntalloc_file_private_data</span> <span class="o">*</span><span class="n">priv</span> <span class="o">=</span> <span class="n">filp</span><span class="o">-&gt;</span><span class="n">private_data</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_vma_private_data</span> <span class="o">*</span><span class="n">vm_priv</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">gntalloc_gref</span> <span class="o">*</span><span class="n">gref</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">count</span> <span class="o">=</span> <span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_end</span> <span class="o">-</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rv</span><span class="p">,</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_flags</span> <span class="o">&amp;</span> <span class="n">VM_SHARED</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;%s: Mapping must be shared.</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">);</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">vm_priv</span> <span class="o">=</span> <span class="n">kmalloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">vm_priv</span><span class="p">),</span> <span class="n">GFP_KERNEL</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">vm_priv</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span>
+
+	<span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: priv %p,%p, page %lu+%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">__func__</span><span class="p">,</span>
+		       <span class="n">priv</span><span class="p">,</span> <span class="n">vm_priv</span><span class="p">,</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_pgoff</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+
+	<span class="n">gref</span> <span class="o">=</span> <span class="n">find_grefs</span><span class="p">(</span><span class="n">priv</span><span class="p">,</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_pgoff</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="n">count</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">gref</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">rv</span> <span class="o">=</span> <span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+		<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;%s: Could not find grant reference&quot;</span><span class="p">,</span>
+				<span class="n">__func__</span><span class="p">);</span>
+		<span class="n">kfree</span><span class="p">(</span><span class="n">vm_priv</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">vm_priv</span><span class="o">-&gt;</span><span class="n">gref</span> <span class="o">=</span> <span class="n">gref</span><span class="p">;</span>
+	<span class="n">vm_priv</span><span class="o">-&gt;</span><span class="n">users</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">vm_priv</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="n">count</span><span class="p">;</span>
+
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_private_data</span> <span class="o">=</span> <span class="n">vm_priv</span><span class="p">;</span>
+
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_flags</span> <span class="o">|=</span> <span class="n">VM_RESERVED</span> <span class="o">|</span> <span class="n">VM_DONTEXPAND</span><span class="p">;</span>
+
+	<span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_ops</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">gntalloc_vmops</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">gref</span><span class="o">-&gt;</span><span class="n">users</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">rv</span> <span class="o">=</span> <span class="n">vm_insert_page</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span> <span class="o">+</span> <span class="n">i</span> <span class="o">*</span> <span class="n">PAGE_SIZE</span><span class="p">,</span>
+				<span class="n">gref</span><span class="o">-&gt;</span><span class="n">page</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">rv</span><span class="p">)</span>
+			<span class="k">goto</span> <span class="n">out_unlock</span><span class="p">;</span>
+
+		<span class="n">gref</span> <span class="o">=</span> <span class="n">list_entry</span><span class="p">(</span><span class="n">gref</span><span class="o">-&gt;</span><span class="n">next_file</span><span class="p">.</span><span class="n">next</span><span class="p">,</span>
+				<span class="k">struct</span> <span class="n">gntalloc_gref</span><span class="p">,</span> <span class="n">next_file</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">rv</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out_unlock:</span>
+	<span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gref_mutex</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rv</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">file_operations</span> <span class="n">gntalloc_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span> <span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span> <span class="o">=</span> <span class="n">gntalloc_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span> <span class="o">=</span> <span class="n">gntalloc_release</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span> <span class="o">=</span> <span class="n">gntalloc_ioctl</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mmap</span> <span class="o">=</span> <span class="n">gntalloc_mmap</span>
+<span class="p">};</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * -------------------------------------</span>
+<span class="cm"> * Module creation/destruction.</span>
+<span class="cm"> * -------------------------------------</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">miscdevice</span> <span class="n">gntalloc_miscdev</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">minor</span>	<span class="o">=</span> <span class="n">MISC_DYNAMIC_MINOR</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">name</span>	<span class="o">=</span> <span class="s">&quot;xen/gntalloc&quot;</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">fops</span>	<span class="o">=</span> <span class="o">&amp;</span><span class="n">gntalloc_fops</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="n">__init</span> <span class="nf">gntalloc_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">xen_domain</span><span class="p">())</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="n">err</span> <span class="o">=</span> <span class="n">misc_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gntalloc_miscdev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span> <span class="s">&quot;Could not register misc gntalloc device</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">err</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">pr_debug</span><span class="p">(</span><span class="s">&quot;Created grant allocation device at %d,%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+			<span class="n">MISC_MAJOR</span><span class="p">,</span> <span class="n">gntalloc_miscdev</span><span class="p">.</span><span class="n">minor</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">__exit</span> <span class="nf">gntalloc_exit</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">misc_deregister</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gntalloc_miscdev</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">module_init</span><span class="p">(</span><span class="n">gntalloc_init</span><span class="p">);</span>
+<span class="n">module_exit</span><span class="p">(</span><span class="n">gntalloc_exit</span><span class="p">);</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Carter Weatherly &lt;carter.weatherly@jhuapl.edu&gt;, &quot;</span>
+		<span class="s">&quot;Daniel De Graaf &lt;dgdegra@tycho.nsa.gov&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;User-space grant reference allocator driver&quot;</span><span class="p">);</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:2}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../javascript/docco.min.js"></script>
+</html>

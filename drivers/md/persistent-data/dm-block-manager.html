@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » drivers › md › persistent-data › dm-block-manager.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../../../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../../../index.html"></a><h1>dm-block-manager.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2011 Red Hat, Inc.</span>
+<span class="cm"> *</span>
+<span class="cm"> * This file is released under the GPL.</span>
+<span class="cm"> */</span>
+<span class="cp">#include &quot;dm-block-manager.h&quot;</span>
+<span class="cp">#include &quot;dm-persistent-data-internal.h&quot;</span>
+<span class="cp">#include &quot;../dm-bufio.h&quot;</span>
+
+<span class="cp">#include &lt;linux/crc32c.h&gt;</span>
+<span class="cp">#include &lt;linux/module.h&gt;</span>
+<span class="cp">#include &lt;linux/slab.h&gt;</span>
+<span class="cp">#include &lt;linux/rwsem.h&gt;</span>
+<span class="cp">#include &lt;linux/device-mapper.h&gt;</span>
+<span class="cp">#include &lt;linux/stacktrace.h&gt;</span>
+
+<span class="cp">#define DM_MSG_PREFIX &quot;block manager&quot;</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * This is a read/write semaphore with a couple of differences.</span>
+<span class="cm"> *</span>
+<span class="cm"> * i) There is a restriction on the number of concurrent read locks that</span>
+<span class="cm"> * may be held at once.  This is just an implementation detail.</span>
+<span class="cm"> *</span>
+<span class="cm"> * ii) Recursive locking attempts are detected and return EINVAL.  A stack</span>
+<span class="cm"> * trace is also emitted for the previous lock aquisition.</span>
+<span class="cm"> *</span>
+<span class="cm"> * iii) Priority is given to write locks.</span>
+<span class="cm"> */</span>
+<span class="cp">#define MAX_HOLDERS 4</span>
+<span class="cp">#define MAX_STACK 10</span>
+
+<span class="k">typedef</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">stack_entries</span><span class="p">[</span><span class="n">MAX_STACK</span><span class="p">];</span>
+
+<span class="k">struct</span> <span class="n">block_lock</span> <span class="p">{</span>
+	<span class="n">spinlock_t</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="n">__s32</span> <span class="n">count</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">waiters</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">holders</span><span class="p">[</span><span class="n">MAX_HOLDERS</span><span class="p">];</span>
+
+<span class="cp">#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING</span>
+	<span class="k">struct</span> <span class="n">stack_trace</span> <span class="n">traces</span><span class="p">[</span><span class="n">MAX_HOLDERS</span><span class="p">];</span>
+	<span class="n">stack_entries</span> <span class="n">entries</span><span class="p">[</span><span class="n">MAX_HOLDERS</span><span class="p">];</span>
+<span class="cp">#endif</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="n">waiter</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">list_head</span> <span class="n">list</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">wants_write</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="nf">__find_holder</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span>
+			      <span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">MAX_HOLDERS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">holders</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">task</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">i</span> <span class="o">==</span> <span class="n">MAX_HOLDERS</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* call this *after* you increment lock-&gt;count */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__add_holder</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">h</span> <span class="o">=</span> <span class="n">__find_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="cp">#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING</span>
+	<span class="k">struct</span> <span class="n">stack_trace</span> <span class="o">*</span><span class="n">t</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="n">get_task_struct</span><span class="p">(</span><span class="n">task</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">holders</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">=</span> <span class="n">task</span><span class="p">;</span>
+
+<span class="cp">#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING</span>
+	<span class="n">t</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">traces</span> <span class="o">+</span> <span class="n">h</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">nr_entries</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">max_entries</span> <span class="o">=</span> <span class="n">MAX_STACK</span><span class="p">;</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">entries</span> <span class="o">=</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">entries</span><span class="p">[</span><span class="n">h</span><span class="p">];</span>
+	<span class="n">t</span><span class="o">-&gt;</span><span class="n">skip</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="n">save_stack_trace</span><span class="p">(</span><span class="n">t</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+
+<span class="cm">/* call this *before* you decrement lock-&gt;count */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__del_holder</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">,</span> <span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">h</span> <span class="o">=</span> <span class="n">__find_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">task</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">holders</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">put_task_struct</span><span class="p">(</span><span class="n">task</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__check_holder</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="n">i</span><span class="p">;</span>
+<span class="cp">#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING</span>
+	<span class="k">static</span> <span class="k">struct</span> <span class="n">stack_trace</span> <span class="n">t</span><span class="p">;</span>
+	<span class="k">static</span> <span class="n">stack_entries</span> <span class="n">entries</span><span class="p">;</span>
+<span class="cp">#endif</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">MAX_HOLDERS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">holders</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">current</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;recursive lock detected in pool metadata&quot;</span><span class="p">);</span>
+<span class="cp">#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;previously held here:&quot;</span><span class="p">);</span>
+			<span class="n">print_stack_trace</span><span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">traces</span> <span class="o">+</span> <span class="n">i</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;subsequent aquisition attempted here:&quot;</span><span class="p">);</span>
+			<span class="n">t</span><span class="p">.</span><span class="n">nr_entries</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+			<span class="n">t</span><span class="p">.</span><span class="n">max_entries</span> <span class="o">=</span> <span class="n">MAX_STACK</span><span class="p">;</span>
+			<span class="n">t</span><span class="p">.</span><span class="n">entries</span> <span class="o">=</span> <span class="n">entries</span><span class="p">;</span>
+			<span class="n">t</span><span class="p">.</span><span class="n">skip</span> <span class="o">=</span> <span class="mi">3</span><span class="p">;</span>
+			<span class="n">save_stack_trace</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="p">);</span>
+			<span class="n">print_stack_trace</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="p">,</span> <span class="mi">4</span><span class="p">);</span>
+<span class="cp">#endif</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__wait</span><span class="p">(</span><span class="k">struct</span> <span class="n">waiter</span> <span class="o">*</span><span class="n">w</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+		<span class="n">set_task_state</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">TASK_UNINTERRUPTIBLE</span><span class="p">);</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">w</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">schedule</span><span class="p">();</span>
+	<span class="p">}</span>
+
+	<span class="n">set_task_state</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">TASK_RUNNING</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__wake_waiter</span><span class="p">(</span><span class="k">struct</span> <span class="n">waiter</span> <span class="o">*</span><span class="n">w</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">task_struct</span> <span class="o">*</span><span class="n">task</span><span class="p">;</span>
+
+	<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="o">-&gt;</span><span class="n">list</span><span class="p">);</span>
+	<span class="n">task</span> <span class="o">=</span> <span class="n">w</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">;</span>
+	<span class="n">smp_mb</span><span class="p">();</span>
+	<span class="n">w</span><span class="o">-&gt;</span><span class="n">task</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">wake_up_process</span><span class="p">(</span><span class="n">task</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * We either wake a few readers or a single writer.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">__wake_many</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">waiter</span> <span class="o">*</span><span class="n">w</span><span class="p">,</span> <span class="o">*</span><span class="n">tmp</span><span class="p">;</span>
+
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">list_for_each_entry_safe</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">,</span> <span class="n">list</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&gt;=</span> <span class="n">MAX_HOLDERS</span><span class="p">)</span>
+			<span class="k">return</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">w</span><span class="o">-&gt;</span><span class="n">wants_write</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">return</span><span class="p">;</span> <span class="cm">/* still read locked */</span>
+
+			<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+			<span class="n">__add_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">w</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+			<span class="n">__wake_waiter</span><span class="p">(</span><span class="n">w</span><span class="p">);</span>
+			<span class="k">return</span><span class="p">;</span>
+		<span class="p">}</span>
+
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">__add_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">w</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+		<span class="n">__wake_waiter</span><span class="p">(</span><span class="n">w</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">bl_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">i</span><span class="p">;</span>
+
+	<span class="n">spin_lock_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">INIT_LIST_HEAD</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">);</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">MAX_HOLDERS</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">holders</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">__available_for_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;</span> <span class="n">MAX_HOLDERS</span> <span class="o">&amp;&amp;</span>
+		<span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">bl_down_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">waiter</span> <span class="n">w</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__check_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">__available_for_read</span><span class="p">(</span><span class="n">lock</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">__add_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">get_task_struct</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+
+	<span class="n">w</span><span class="p">.</span><span class="n">task</span> <span class="o">=</span> <span class="n">current</span><span class="p">;</span>
+	<span class="n">w</span><span class="p">.</span><span class="n">wants_write</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">list_add_tail</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">.</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">__wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
+	<span class="n">put_task_struct</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">bl_down_read_nonblock</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__check_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">__available_for_read</span><span class="p">(</span><span class="n">lock</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span><span class="o">++</span><span class="p">;</span>
+		<span class="n">__add_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="o">-</span><span class="n">EWOULDBLOCK</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">bl_up_read</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">__del_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+	<span class="o">--</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">))</span>
+		<span class="n">__wake_many</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">bl_down_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">waiter</span> <span class="n">w</span><span class="p">;</span>
+
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">__check_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">==</span> <span class="mi">0</span> <span class="o">&amp;&amp;</span> <span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="n">__add_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+		<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">get_task_struct</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+	<span class="n">w</span><span class="p">.</span><span class="n">task</span> <span class="o">=</span> <span class="n">current</span><span class="p">;</span>
+	<span class="n">w</span><span class="p">.</span><span class="n">wants_write</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Writers given priority. We know there&#39;s only one mutator in the</span>
+<span class="cm">	 * system, so ignoring the ordering reversal.</span>
+<span class="cm">	 */</span>
+	<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">.</span><span class="n">list</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">__wait</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
+	<span class="n">put_task_struct</span><span class="p">(</span><span class="n">current</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">bl_up_write</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_lock</span> <span class="o">*</span><span class="n">lock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">__del_holder</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="n">current</span><span class="p">);</span>
+	<span class="n">lock</span><span class="o">-&gt;</span><span class="n">count</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">waiters</span><span class="p">))</span>
+		<span class="n">__wake_many</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+	<span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">lock</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">report_recursive_bug</span><span class="p">(</span><span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span> <span class="kt">int</span> <span class="n">r</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">==</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">)</span>
+		<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;recursive acquisition of block %llu requested.&quot;</span><span class="p">,</span>
+		      <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span> <span class="n">b</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Block manager is currently implemented using dm-bufio.  struct</span>
+<span class="cm"> * dm_block_manager and struct dm_block map directly onto a couple of</span>
+<span class="cm"> * structs in the bufio interface.  I want to retain the freedom to move</span>
+<span class="cm"> * away from bufio in the future.  So these structs are just cast within</span>
+<span class="cm"> * this .c file, rather than making it through to the public interface.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="nf">to_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="p">)</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="nf">to_bufio</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_bufio_client</span> <span class="o">*</span><span class="p">)</span> <span class="n">bm</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">dm_block_t</span> <span class="nf">dm_block_location</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_bufio_get_block_number</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_block_location</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="o">*</span><span class="nf">dm_block_data</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_bufio_get_block_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_block_data</span><span class="p">);</span>
+
+<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="p">{</span>
+	<span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">validator</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">block_lock</span> <span class="n">lock</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">write_locked</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dm_block_manager_alloc_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">buf</span><span class="p">);</span>
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">bl_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">dm_block_manager_write_callback</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">buf</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">buf</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span><span class="o">-&gt;</span><span class="n">prepare_for_write</span><span class="p">(</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="p">)</span> <span class="n">buf</span><span class="p">,</span>
+			 <span class="n">dm_bufio_get_block_size</span><span class="p">(</span><span class="n">dm_bufio_get_client</span><span class="p">(</span><span class="n">buf</span><span class="p">)));</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/*----------------------------------------------------------------</span>
+<span class="cm"> * Public interface</span>
+<span class="cm"> *--------------------------------------------------------------*/</span>
+<span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="nf">dm_block_manager_create</span><span class="p">(</span><span class="k">struct</span> <span class="n">block_device</span> <span class="o">*</span><span class="n">bdev</span><span class="p">,</span>
+						 <span class="kt">unsigned</span> <span class="n">block_size</span><span class="p">,</span>
+						 <span class="kt">unsigned</span> <span class="n">cache_size</span><span class="p">,</span>
+						 <span class="kt">unsigned</span> <span class="n">max_held_per_thread</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="p">)</span>
+		<span class="n">dm_bufio_client_create</span><span class="p">(</span><span class="n">bdev</span><span class="p">,</span> <span class="n">block_size</span><span class="p">,</span> <span class="n">max_held_per_thread</span><span class="p">,</span>
+				       <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">buffer_aux</span><span class="p">),</span>
+				       <span class="n">dm_block_manager_alloc_callback</span><span class="p">,</span>
+				       <span class="n">dm_block_manager_write_callback</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_block_manager_create</span><span class="p">);</span>
+
+<span class="kt">void</span> <span class="nf">dm_block_manager_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_bufio_client_destroy</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_block_manager_destroy</span><span class="p">);</span>
+
+<span class="kt">unsigned</span> <span class="nf">dm_bm_block_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_bufio_get_block_size</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bm_block_size</span><span class="p">);</span>
+
+<span class="n">dm_block_t</span> <span class="nf">dm_bm_nr_blocks</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">dm_bufio_get_device_size</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">dm_bm_validate_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">*</span><span class="n">buf</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span><span class="p">))</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">v</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+		<span class="n">r</span> <span class="o">=</span> <span class="n">v</span><span class="o">-&gt;</span><span class="n">check</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="p">)</span> <span class="n">buf</span><span class="p">,</span> <span class="n">dm_bufio_get_block_size</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">)));</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span>
+			<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+		<span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span> <span class="o">=</span> <span class="n">v</span><span class="p">;</span>
+	<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span> <span class="o">!=</span> <span class="n">v</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">DMERR</span><span class="p">(</span><span class="s">&quot;validator mismatch (old=%s vs new=%s) for block %llu&quot;</span><span class="p">,</span>
+				<span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">,</span> <span class="n">v</span> <span class="o">?</span> <span class="n">v</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">:</span> <span class="s">&quot;NULL&quot;</span><span class="p">,</span>
+				<span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="kt">long</span><span class="p">)</span>
+					<span class="n">dm_bufio_get_block_number</span><span class="p">(</span><span class="n">buf</span><span class="p">));</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="kt">int</span> <span class="nf">dm_bm_read_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+		    <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">**</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">dm_bufio_read</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">),</span> <span class="n">b</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="p">)</span> <span class="n">result</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">bl_down_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="n">report_recursive_bug</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_validate_buffer</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">),</span> <span class="n">aux</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">bl_up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bm_read_lock</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_write_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+		     <span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+		     <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">**</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">dm_bufio_read</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">),</span> <span class="n">b</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="p">)</span> <span class="n">result</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">bl_down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="n">report_recursive_bug</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_validate_buffer</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">),</span> <span class="n">aux</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">bl_up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bm_write_lock</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_read_try_lock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+			<span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+			<span class="k">struct</span> <span class="n">dm_block</span> <span class="o">**</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">dm_bufio_get</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">),</span> <span class="n">b</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="p">)</span> <span class="n">result</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">p</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EWOULDBLOCK</span><span class="p">;</span>
+
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">bl_down_read_nonblock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="n">report_recursive_bug</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">r</span><span class="p">);</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bm_validate_buffer</span><span class="p">(</span><span class="n">bm</span><span class="p">,</span> <span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">),</span> <span class="n">aux</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">bl_up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_write_lock_zero</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+			  <span class="n">dm_block_t</span> <span class="n">b</span><span class="p">,</span> <span class="k">struct</span> <span class="n">dm_block_validator</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span>
+			  <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">**</span><span class="n">result</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+	<span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+
+	<span class="n">p</span> <span class="o">=</span> <span class="n">dm_bufio_new</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">),</span> <span class="n">b</span><span class="p">,</span> <span class="p">(</span><span class="k">struct</span> <span class="n">dm_buffer</span> <span class="o">**</span><span class="p">)</span> <span class="n">result</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">)))</span>
+		<span class="k">return</span> <span class="n">PTR_ERR</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+	<span class="n">memset</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">dm_bm_block_size</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">bl_down_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="o">*</span><span class="n">result</span><span class="p">));</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">aux</span><span class="o">-&gt;</span><span class="n">validator</span> <span class="o">=</span> <span class="n">v</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_mark_buffer_dirty</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+		<span class="n">bl_up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">bl_up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_release</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bm_unlock</span><span class="p">);</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_unlock_move</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">b</span><span class="p">,</span> <span class="n">dm_block_t</span> <span class="n">n</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">buffer_aux</span> <span class="o">*</span><span class="n">aux</span><span class="p">;</span>
+
+	<span class="n">aux</span> <span class="o">=</span> <span class="n">dm_bufio_get_aux_data</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">write_locked</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">dm_bufio_mark_buffer_dirty</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">));</span>
+		<span class="n">bl_up_write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">else</span>
+		<span class="n">bl_up_read</span><span class="p">(</span><span class="o">&amp;</span><span class="n">aux</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">);</span>
+
+	<span class="n">dm_bufio_release_move</span><span class="p">(</span><span class="n">to_buffer</span><span class="p">(</span><span class="n">b</span><span class="p">),</span> <span class="n">n</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">dm_bm_flush_and_unlock</span><span class="p">(</span><span class="k">struct</span> <span class="n">dm_block_manager</span> <span class="o">*</span><span class="n">bm</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">dm_block</span> <span class="o">*</span><span class="n">superblock</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bufio_write_dirty_buffers</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bufio_issue_flush</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="n">dm_bm_unlock</span><span class="p">(</span><span class="n">superblock</span><span class="p">);</span>
+
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bufio_write_dirty_buffers</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+	<span class="n">r</span> <span class="o">=</span> <span class="n">dm_bufio_issue_flush</span><span class="p">(</span><span class="n">to_bufio</span><span class="p">(</span><span class="n">bm</span><span class="p">));</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">r</span><span class="p">))</span>
+		<span class="k">return</span> <span class="n">r</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">u32</span> <span class="nf">dm_bm_checksum</span><span class="p">(</span><span class="k">const</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">len</span><span class="p">,</span> <span class="n">u32</span> <span class="n">init_xor</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">crc32c</span><span class="p">(</span><span class="o">~</span><span class="p">(</span><span class="n">u32</span><span class="p">)</span> <span class="mi">0</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">len</span><span class="p">)</span> <span class="o">^</span> <span class="n">init_xor</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">dm_bm_checksum</span><span class="p">);</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+<span class="n">MODULE_LICENSE</span><span class="p">(</span><span class="s">&quot;GPL&quot;</span><span class="p">);</span>
+<span class="n">MODULE_AUTHOR</span><span class="p">(</span><span class="s">&quot;Joe Thornber &lt;dm-devel@redhat.com&gt;&quot;</span><span class="p">);</span>
+<span class="n">MODULE_DESCRIPTION</span><span class="p">(</span><span class="s">&quot;Immutable metadata library for dm&quot;</span><span class="p">);</span>
+
+<span class="cm">/*----------------------------------------------------------------*/</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:3}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../../../javascript/docco.min.js"></script>
+</html>

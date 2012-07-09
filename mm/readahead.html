@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html><head><title>joekychen/linux » mm › readahead.c
+
+</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="generator" content="Docco">
+<link rel="stylesheet" media="all" href="../stylesheets/docco.min.css" />
+
+
+</head>
+<body>
+<div id="container">
+<div id="background"></div>
+<table cellpadding="0" cellspacing="0">
+<thead><tr><th class="docs"><a id="home" href="../index.html"></a><h1>readahead.c</h1></th><th class="code"></th></tr></thead>
+<tbody>
+
+
+<tr id="section-1"><td class="docs"><div class="pilwrap"><a class="pilcrow" href="#section-1">&#182;</a></div></td><td class="code"><div class="highlight"><pre><span class="cm">/*</span>
+<span class="cm"> * mm/readahead.c - address_space-level file readahead.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Copyright (C) 2002, Linus Torvalds</span>
+<span class="cm"> *</span>
+<span class="cm"> * 09Apr2002	Andrew Morton</span>
+<span class="cm"> *		Initial version.</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include &lt;linux/kernel.h&gt;</span>
+<span class="cp">#include &lt;linux/fs.h&gt;</span>
+<span class="cp">#include &lt;linux/gfp.h&gt;</span>
+<span class="cp">#include &lt;linux/mm.h&gt;</span>
+<span class="cp">#include &lt;linux/export.h&gt;</span>
+<span class="cp">#include &lt;linux/blkdev.h&gt;</span>
+<span class="cp">#include &lt;linux/backing-dev.h&gt;</span>
+<span class="cp">#include &lt;linux/task_io_accounting_ops.h&gt;</span>
+<span class="cp">#include &lt;linux/pagevec.h&gt;</span>
+<span class="cp">#include &lt;linux/pagemap.h&gt;</span>
+<span class="cp">#include &lt;linux/syscalls.h&gt;</span>
+<span class="cp">#include &lt;linux/file.h&gt;</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Initialise a struct file&#39;s readahead state.  Assumes that the caller has</span>
+<span class="cm"> * memset *ra to zero.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span>
+<span class="nf">file_ra_state_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span> <span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">ra_pages</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">backing_dev_info</span><span class="o">-&gt;</span><span class="n">ra_pages</span><span class="p">;</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">prev_pos</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">file_ra_state_init</span><span class="p">);</span>
+
+<span class="cp">#define list_to_page(head) (list_entry((head)-&gt;prev, struct page, lru))</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * see if a page needs releasing upon read_cache_pages() failure</span>
+<span class="cm"> * - the caller of read_cache_pages() may have set PG_private or PG_fscache</span>
+<span class="cm"> *   before calling, such as the NFS fs marking pages that are cached locally</span>
+<span class="cm"> *   on disk, thus we need to give the fs a chance to clean up in the event of</span>
+<span class="cm"> *   an error</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">read_cache_pages_invalidate_page</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+					     <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">page_has_private</span><span class="p">(</span><span class="n">page</span><span class="p">))</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">trylock_page</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+			<span class="n">BUG</span><span class="p">();</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span><span class="p">;</span>
+		<span class="n">do_invalidatepage</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">mapping</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+		<span class="n">unlock_page</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * release a list of pages, invalidating them first if need be</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">void</span> <span class="nf">read_cache_pages_invalidate_pages</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+					      <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">victim</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">victim</span> <span class="o">=</span> <span class="n">list_to_page</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">victim</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">);</span>
+		<span class="n">read_cache_pages_invalidate_page</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">victim</span><span class="p">);</span>
+	<span class="p">}</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * read_cache_pages - populate an address space with some pages &amp; start reads against them</span>
+<span class="cm"> * @mapping: the address_space</span>
+<span class="cm"> * @pages: The address of a list_head which contains the target pages.  These</span>
+<span class="cm"> *   pages have their -&gt;index populated and are otherwise uninitialised.</span>
+<span class="cm"> * @filler: callback routine for filling a single page.</span>
+<span class="cm"> * @data: private data for the callback routine.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Hides the details of the LRU cache etc from the filesystems.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">read_cache_pages</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pages</span><span class="p">,</span>
+			<span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">filler</span><span class="p">)(</span><span class="kt">void</span> <span class="o">*</span><span class="p">,</span> <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="p">),</span> <span class="kt">void</span> <span class="o">*</span><span class="n">data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="n">pages</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">list_to_page</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">add_to_page_cache_lru</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span>
+					<span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">read_cache_pages_invalidate_page</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+			<span class="k">continue</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">filler</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">ret</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">read_cache_pages_invalidate_pages</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">pages</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">task_io_account_read</span><span class="p">(</span><span class="n">PAGE_CACHE_SIZE</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">EXPORT_SYMBOL</span><span class="p">(</span><span class="n">read_cache_pages</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">read_pages</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+		<span class="k">struct</span> <span class="n">list_head</span> <span class="o">*</span><span class="n">pages</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="n">nr_pages</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">blk_plug</span> <span class="n">plug</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="n">page_idx</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span><span class="p">;</span>
+
+	<span class="n">blk_start_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpages</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ret</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpages</span><span class="p">(</span><span class="n">filp</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">nr_pages</span><span class="p">);</span>
+		<span class="cm">/* Clean up the remaining pages */</span>
+		<span class="n">put_pages_list</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">for</span> <span class="p">(</span><span class="n">page_idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">page_idx</span> <span class="o">&lt;</span> <span class="n">nr_pages</span><span class="p">;</span> <span class="n">page_idx</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span> <span class="o">=</span> <span class="n">list_to_page</span><span class="p">(</span><span class="n">pages</span><span class="p">);</span>
+		<span class="n">list_del</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">add_to_page_cache_lru</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span>
+					<span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span><span class="p">,</span> <span class="n">GFP_KERNEL</span><span class="p">))</span> <span class="p">{</span>
+			<span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpage</span><span class="p">(</span><span class="n">filp</span><span class="p">,</span> <span class="n">page</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">page_cache_release</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+<span class="nl">out:</span>
+	<span class="n">blk_finish_plug</span><span class="p">(</span><span class="o">&amp;</span><span class="n">plug</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * __do_page_cache_readahead() actually reads a chunk of disk.  It allocates all</span>
+<span class="cm"> * the pages first, then submits them all for I/O. This avoids the very bad</span>
+<span class="cm"> * behaviour which would occur if page allocations are causing VM writeback.</span>
+<span class="cm"> * We really don&#39;t want to intermingle reads and writes like that.</span>
+<span class="cm"> *</span>
+<span class="cm"> * Returns the number of pages requested, or the maximum amount of I/O allowed.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span>
+<span class="nf">__do_page_cache_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+			<span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_to_read</span><span class="p">,</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">lookahead_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">inode</span> <span class="o">*</span><span class="n">inode</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">-&gt;</span><span class="n">host</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">end_index</span><span class="p">;</span>	<span class="cm">/* The last page we want to read */</span>
+	<span class="n">LIST_HEAD</span><span class="p">(</span><span class="n">page_pool</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">page_idx</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">loff_t</span> <span class="n">isize</span> <span class="o">=</span> <span class="n">i_size_read</span><span class="p">(</span><span class="n">inode</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">isize</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">out</span><span class="p">;</span>
+
+	<span class="n">end_index</span> <span class="o">=</span> <span class="p">((</span><span class="n">isize</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Preallocate as many pages as we will need.</span>
+<span class="cm">	 */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">page_idx</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">page_idx</span> <span class="o">&lt;</span> <span class="n">nr_to_read</span><span class="p">;</span> <span class="n">page_idx</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pgoff_t</span> <span class="n">page_offset</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">+</span> <span class="n">page_idx</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">page_offset</span> <span class="o">&gt;</span> <span class="n">end_index</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="n">rcu_read_lock</span><span class="p">();</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">radix_tree_lookup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">page_tree</span><span class="p">,</span> <span class="n">page_offset</span><span class="p">);</span>
+		<span class="n">rcu_read_unlock</span><span class="p">();</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">page</span><span class="p">)</span>
+			<span class="k">continue</span><span class="p">;</span>
+
+		<span class="n">page</span> <span class="o">=</span> <span class="n">page_cache_alloc_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">page</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="n">page</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">=</span> <span class="n">page_offset</span><span class="p">;</span>
+		<span class="n">list_add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page</span><span class="o">-&gt;</span><span class="n">lru</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">page_pool</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">page_idx</span> <span class="o">==</span> <span class="n">nr_to_read</span> <span class="o">-</span> <span class="n">lookahead_size</span><span class="p">)</span>
+			<span class="n">SetPageReadahead</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+		<span class="n">ret</span><span class="o">++</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Now start the IO.  We ignore I/O errors - if the page is not</span>
+<span class="cm">	 * uptodate then the caller will launch readpage again, and</span>
+<span class="cm">	 * will then handle the error.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ret</span><span class="p">)</span>
+		<span class="n">read_pages</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">page_pool</span><span class="p">,</span> <span class="n">ret</span><span class="p">);</span>
+	<span class="n">BUG_ON</span><span class="p">(</span><span class="o">!</span><span class="n">list_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">page_pool</span><span class="p">));</span>
+<span class="nl">out:</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Chunk the readahead into 2 megabyte units, so that we don&#39;t pin too much</span>
+<span class="cm"> * memory at once.</span>
+<span class="cm"> */</span>
+<span class="kt">int</span> <span class="nf">force_page_cache_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+		<span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr_to_read</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">ret</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="o">!</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpage</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpages</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">nr_to_read</span> <span class="o">=</span> <span class="n">max_sane_readahead</span><span class="p">(</span><span class="n">nr_to_read</span><span class="p">);</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">nr_to_read</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">int</span> <span class="n">err</span><span class="p">;</span>
+
+		<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">this_chunk</span> <span class="o">=</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span> <span class="o">/</span> <span class="n">PAGE_CACHE_SIZE</span><span class="p">;</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="n">this_chunk</span> <span class="o">&gt;</span> <span class="n">nr_to_read</span><span class="p">)</span>
+			<span class="n">this_chunk</span> <span class="o">=</span> <span class="n">nr_to_read</span><span class="p">;</span>
+		<span class="n">err</span> <span class="o">=</span> <span class="n">__do_page_cache_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span>
+						<span class="n">offset</span><span class="p">,</span> <span class="n">this_chunk</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">err</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">err</span><span class="p">;</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="n">ret</span> <span class="o">+=</span> <span class="n">err</span><span class="p">;</span>
+		<span class="n">offset</span> <span class="o">+=</span> <span class="n">this_chunk</span><span class="p">;</span>
+		<span class="n">nr_to_read</span> <span class="o">-=</span> <span class="n">this_chunk</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Given a desired number of PAGE_CACHE_SIZE readahead pages, return a</span>
+<span class="cm"> * sensible upper limit.</span>
+<span class="cm"> */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">max_sane_readahead</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">min</span><span class="p">(</span><span class="n">nr</span><span class="p">,</span> <span class="p">(</span><span class="n">node_page_state</span><span class="p">(</span><span class="n">numa_node_id</span><span class="p">(),</span> <span class="n">NR_INACTIVE_FILE</span><span class="p">)</span>
+		<span class="o">+</span> <span class="n">node_page_state</span><span class="p">(</span><span class="n">numa_node_id</span><span class="p">(),</span> <span class="n">NR_FREE_PAGES</span><span class="p">))</span> <span class="o">/</span> <span class="mi">2</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Submit IO for the read-ahead request in file_ra_state.</span>
+<span class="cm"> */</span>
+<span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">ra_submit</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span>
+		       <span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">actual</span><span class="p">;</span>
+
+	<span class="n">actual</span> <span class="o">=</span> <span class="n">__do_page_cache_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span>
+					<span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span><span class="p">,</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">,</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span><span class="p">);</span>
+
+	<span class="k">return</span> <span class="n">actual</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Set the initial window size, round to next power of 2 and square</span>
+<span class="cm"> * for small size, x 4 for medium, and x 2 for large</span>
+<span class="cm"> * for 128k (32 page) max ra</span>
+<span class="cm"> * 1-8 page = 32k initial, &gt; 8 page = 128k initial</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">get_init_ra_size</span><span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">size</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">newsize</span> <span class="o">=</span> <span class="n">roundup_pow_of_two</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">newsize</span> <span class="o">&lt;=</span> <span class="n">max</span> <span class="o">/</span> <span class="mi">32</span><span class="p">)</span>
+		<span class="n">newsize</span> <span class="o">=</span> <span class="n">newsize</span> <span class="o">*</span> <span class="mi">4</span><span class="p">;</span>
+	<span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">newsize</span> <span class="o">&lt;=</span> <span class="n">max</span> <span class="o">/</span> <span class="mi">4</span><span class="p">)</span>
+		<span class="n">newsize</span> <span class="o">=</span> <span class="n">newsize</span> <span class="o">*</span> <span class="mi">2</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">newsize</span> <span class="o">=</span> <span class="n">max</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">newsize</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> *  Get the previous window size, ramp it up, and</span>
+<span class="cm"> *  return it as the new window size.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="nf">get_next_ra_size</span><span class="p">(</span><span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span>
+						<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">cur</span> <span class="o">=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">newsize</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">cur</span> <span class="o">&lt;</span> <span class="n">max</span> <span class="o">/</span> <span class="mi">16</span><span class="p">)</span>
+		<span class="n">newsize</span> <span class="o">=</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">cur</span><span class="p">;</span>
+	<span class="k">else</span>
+		<span class="n">newsize</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">cur</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="n">min</span><span class="p">(</span><span class="n">newsize</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * On-demand readahead design.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The fields in struct file_ra_state represent the most-recently-executed</span>
+<span class="cm"> * readahead attempt:</span>
+<span class="cm"> *</span>
+<span class="cm"> *                        |&lt;----- async_size ---------|</span>
+<span class="cm"> *     |------------------- size --------------------&gt;|</span>
+<span class="cm"> *     |==================#===========================|</span>
+<span class="cm"> *     ^start             ^page marked with PG_readahead</span>
+<span class="cm"> *</span>
+<span class="cm"> * To overlap application thinking time and disk I/O time, we do</span>
+<span class="cm"> * `readahead pipelining&#39;: Do not wait until the application consumed all</span>
+<span class="cm"> * readahead pages and stalled on the missing page at readahead_index;</span>
+<span class="cm"> * Instead, submit an asynchronous readahead I/O as soon as there are</span>
+<span class="cm"> * only async_size pages left in the readahead window. Normally async_size</span>
+<span class="cm"> * will be equal to size, for maximum pipelining.</span>
+<span class="cm"> *</span>
+<span class="cm"> * In interleaved sequential reads, concurrent streams on the same fd can</span>
+<span class="cm"> * be invalidating each other&#39;s readahead state. So we flag the new readahead</span>
+<span class="cm"> * page at (start+size-async_size) with PG_readahead, and use it as readahead</span>
+<span class="cm"> * indicator. The flag won&#39;t be set on already cached pages, to avoid the</span>
+<span class="cm"> * readahead-for-nothing fuss, saving pointless page cache lookups.</span>
+<span class="cm"> *</span>
+<span class="cm"> * prev_pos tracks the last visited byte in the _previous_ read request.</span>
+<span class="cm"> * It should be maintained by the caller, and will be used for detecting</span>
+<span class="cm"> * small random reads. Note that the readahead algorithm checks loosely</span>
+<span class="cm"> * for sequential patterns. Hence interleaved reads might be served as</span>
+<span class="cm"> * sequential ones.</span>
+<span class="cm"> *</span>
+<span class="cm"> * There is a special-case: if the first page which the application tries to</span>
+<span class="cm"> * read happens to be the first page of the file, it is assumed that a linear</span>
+<span class="cm"> * read is about to happen and the window is immediately set to the initial size</span>
+<span class="cm"> * based on I/O request size and the max_readahead.</span>
+<span class="cm"> *</span>
+<span class="cm"> * The code ramps up the readahead size aggressively at first, but slow down as</span>
+<span class="cm"> * it approaches max_readhead.</span>
+<span class="cm"> */</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Count contiguously cached pages from @offset-1 to @offset-@max,</span>
+<span class="cm"> * this count is a conservative estimation of</span>
+<span class="cm"> * 	- length of the sequential read sequence, or</span>
+<span class="cm"> * 	- thrashing threshold in memory tight systems</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="n">pgoff_t</span> <span class="nf">count_history_pages</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+				   <span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span>
+				   <span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pgoff_t</span> <span class="n">head</span><span class="p">;</span>
+
+	<span class="n">rcu_read_lock</span><span class="p">();</span>
+	<span class="n">head</span> <span class="o">=</span> <span class="n">radix_tree_prev_hole</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">page_tree</span><span class="p">,</span> <span class="n">offset</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+	<span class="n">rcu_read_unlock</span><span class="p">();</span>
+
+	<span class="k">return</span> <span class="n">offset</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">head</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * page cache context based read-ahead</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">try_context_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+				 <span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span>
+				 <span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span>
+				 <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">req_size</span><span class="p">,</span>
+				 <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="n">pgoff_t</span> <span class="n">size</span><span class="p">;</span>
+
+	<span class="n">size</span> <span class="o">=</span> <span class="n">count_history_pages</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ra</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * no history pages:</span>
+<span class="cm">	 * it could be a random read</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">size</span><span class="p">)</span>
+		<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * starts from beginning of file:</span>
+<span class="cm">	 * it is a strong indication of long-run stream (or whole-file-read)</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;=</span> <span class="n">offset</span><span class="p">)</span>
+		<span class="n">size</span> <span class="o">*=</span> <span class="mi">2</span><span class="p">;</span>
+
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">get_init_ra_size</span><span class="p">(</span><span class="n">size</span> <span class="o">+</span> <span class="n">req_size</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span> <span class="o">=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+
+	<span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * A minimal readahead algorithm for trivial sequential/random reads.</span>
+<span class="cm"> */</span>
+<span class="k">static</span> <span class="kt">unsigned</span> <span class="kt">long</span>
+<span class="nf">ondemand_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+		   <span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+		   <span class="n">bool</span> <span class="n">hit_readahead_marker</span><span class="p">,</span> <span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span>
+		   <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">req_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">max</span> <span class="o">=</span> <span class="n">max_sane_readahead</span><span class="p">(</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">ra_pages</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * start of file</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">offset</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">initial_readahead</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * It&#39;s the expected callback offset, assume sequential access.</span>
+<span class="cm">	 * Ramp up sizes, and push forward the readahead window.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">((</span><span class="n">offset</span> <span class="o">==</span> <span class="p">(</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">+</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">-</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span><span class="p">)</span> <span class="o">||</span>
+	     <span class="n">offset</span> <span class="o">==</span> <span class="p">(</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">+</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">)))</span> <span class="p">{</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">+=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">get_next_ra_size</span><span class="p">(</span><span class="n">ra</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span> <span class="o">=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">readit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Hit a marked page without valid readahead state.</span>
+<span class="cm">	 * E.g. interleaved reads.</span>
+<span class="cm">	 * Query the pagecache for async_size, which normally equals to</span>
+<span class="cm">	 * readahead size. Ramp it up and use it as the new readahead size.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">hit_readahead_marker</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">pgoff_t</span> <span class="n">start</span><span class="p">;</span>
+
+		<span class="n">rcu_read_lock</span><span class="p">();</span>
+		<span class="n">start</span> <span class="o">=</span> <span class="n">radix_tree_next_hole</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">page_tree</span><span class="p">,</span> <span class="n">offset</span><span class="o">+</span><span class="mi">1</span><span class="p">,</span><span class="n">max</span><span class="p">);</span>
+		<span class="n">rcu_read_unlock</span><span class="p">();</span>
+
+		<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">start</span> <span class="o">||</span> <span class="n">start</span> <span class="o">-</span> <span class="n">offset</span> <span class="o">&gt;</span> <span class="n">max</span><span class="p">)</span>
+			<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">=</span> <span class="n">start</span><span class="p">;</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">start</span> <span class="o">-</span> <span class="n">offset</span><span class="p">;</span>	<span class="cm">/* old async_size */</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">+=</span> <span class="n">req_size</span><span class="p">;</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">get_next_ra_size</span><span class="p">(</span><span class="n">ra</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span> <span class="o">=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">readit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * oversize read</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">req_size</span> <span class="o">&gt;</span> <span class="n">max</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">initial_readahead</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * sequential cache miss</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">-</span> <span class="p">(</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">prev_pos</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">1UL</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">initial_readahead</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Query the page cache and look for the traces(cached history pages)</span>
+<span class="cm">	 * that a sequential stream would leave behind.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">try_context_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ra</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">req_size</span><span class="p">,</span> <span class="n">max</span><span class="p">))</span>
+		<span class="k">goto</span> <span class="n">readit</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * standalone, small random read</span>
+<span class="cm">	 * Read as is, and do not pollute the readahead state.</span>
+<span class="cm">	 */</span>
+	<span class="k">return</span> <span class="n">__do_page_cache_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">req_size</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+<span class="nl">initial_readahead:</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">=</span> <span class="n">offset</span><span class="p">;</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">=</span> <span class="n">get_init_ra_size</span><span class="p">(</span><span class="n">req_size</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+	<span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span> <span class="o">=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">req_size</span> <span class="o">?</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">-</span> <span class="n">req_size</span> <span class="o">:</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span><span class="p">;</span>
+
+<span class="nl">readit:</span>
+	<span class="cm">/*</span>
+<span class="cm">	 * Will this read hit the readahead marker made by itself?</span>
+<span class="cm">	 * If so, trigger the readahead marker hit now, and merge</span>
+<span class="cm">	 * the resulted next readahead window into the current one.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">offset</span> <span class="o">==</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">start</span> <span class="o">&amp;&amp;</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">==</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span> <span class="o">=</span> <span class="n">get_next_ra_size</span><span class="p">(</span><span class="n">ra</span><span class="p">,</span> <span class="n">max</span><span class="p">);</span>
+		<span class="n">ra</span><span class="o">-&gt;</span><span class="n">size</span> <span class="o">+=</span> <span class="n">ra</span><span class="o">-&gt;</span><span class="n">async_size</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="n">ra_submit</span><span class="p">(</span><span class="n">ra</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * page_cache_sync_readahead - generic file readahead</span>
+<span class="cm"> * @mapping: address_space which holds the pagecache and I/O vectors</span>
+<span class="cm"> * @ra: file_ra_state which holds the readahead state</span>
+<span class="cm"> * @filp: passed on to -&gt;readpage() and -&gt;readpages()</span>
+<span class="cm"> * @offset: start offset into @mapping, in pagecache page-sized units</span>
+<span class="cm"> * @req_size: hint: total size of the read which the caller is performing in</span>
+<span class="cm"> *            pagecache pages</span>
+<span class="cm"> *</span>
+<span class="cm"> * page_cache_sync_readahead() should be called when a cache miss happened:</span>
+<span class="cm"> * it will submit the read.  The readahead logic may decide to piggyback more</span>
+<span class="cm"> * pages onto the read request if access patterns suggest it will improve</span>
+<span class="cm"> * performance.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span> <span class="nf">page_cache_sync_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+			       <span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+			       <span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">req_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* no read-ahead */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">ra_pages</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* be dumb */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">filp</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">filp</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_RANDOM</span><span class="p">))</span> <span class="p">{</span>
+		<span class="n">force_page_cache_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">req_size</span><span class="p">);</span>
+		<span class="k">return</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* do read-ahead */</span>
+	<span class="n">ondemand_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ra</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="nb">false</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">req_size</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">page_cache_sync_readahead</span><span class="p">);</span>
+
+<span class="cm">/**</span>
+<span class="cm"> * page_cache_async_readahead - file readahead for marked pages</span>
+<span class="cm"> * @mapping: address_space which holds the pagecache and I/O vectors</span>
+<span class="cm"> * @ra: file_ra_state which holds the readahead state</span>
+<span class="cm"> * @filp: passed on to -&gt;readpage() and -&gt;readpages()</span>
+<span class="cm"> * @page: the page at @offset which has the PG_readahead flag set</span>
+<span class="cm"> * @offset: start offset into @mapping, in pagecache page-sized units</span>
+<span class="cm"> * @req_size: hint: total size of the read which the caller is performing in</span>
+<span class="cm"> *            pagecache pages</span>
+<span class="cm"> *</span>
+<span class="cm"> * page_cache_async_readahead() should be called when a page is used which</span>
+<span class="cm"> * has the PG_readahead flag; this is a marker to suggest that the application</span>
+<span class="cm"> * has used up enough of the readahead window that we should start pulling in</span>
+<span class="cm"> * more pages.</span>
+<span class="cm"> */</span>
+<span class="kt">void</span>
+<span class="nf">page_cache_async_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">file_ra_state</span> <span class="o">*</span><span class="n">ra</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+			   <span class="k">struct</span> <span class="n">page</span> <span class="o">*</span><span class="n">page</span><span class="p">,</span> <span class="n">pgoff_t</span> <span class="n">offset</span><span class="p">,</span>
+			   <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">req_size</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* no read-ahead */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ra</span><span class="o">-&gt;</span><span class="n">ra_pages</span><span class="p">)</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Same bit is used for PG_readahead and PG_reclaim.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">PageWriteback</span><span class="p">(</span><span class="n">page</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="n">ClearPageReadahead</span><span class="p">(</span><span class="n">page</span><span class="p">);</span>
+
+	<span class="cm">/*</span>
+<span class="cm">	 * Defer asynchronous read-ahead on IO congestion.</span>
+<span class="cm">	 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">bdi_read_congested</span><span class="p">(</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">backing_dev_info</span><span class="p">))</span>
+		<span class="k">return</span><span class="p">;</span>
+
+	<span class="cm">/* do read-ahead */</span>
+	<span class="n">ondemand_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ra</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="nb">true</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">req_size</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">EXPORT_SYMBOL_GPL</span><span class="p">(</span><span class="n">page_cache_async_readahead</span><span class="p">);</span>
+
+<span class="k">static</span> <span class="kt">ssize_t</span>
+<span class="nf">do_readahead</span><span class="p">(</span><span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span><span class="p">,</span> <span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">filp</span><span class="p">,</span>
+	     <span class="n">pgoff_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">nr</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">mapping</span> <span class="o">||</span> <span class="o">!</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span> <span class="o">||</span> <span class="o">!</span><span class="n">mapping</span><span class="o">-&gt;</span><span class="n">a_ops</span><span class="o">-&gt;</span><span class="n">readpage</span><span class="p">)</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">force_page_cache_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">filp</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">nr</span><span class="p">);</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">SYSCALL_DEFINE</span><span class="p">(</span><span class="n">readahead</span><span class="p">)(</span><span class="kt">int</span> <span class="n">fd</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">ssize_t</span> <span class="n">ret</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">file</span> <span class="o">*</span><span class="n">file</span><span class="p">;</span>
+
+	<span class="n">ret</span> <span class="o">=</span> <span class="o">-</span><span class="n">EBADF</span><span class="p">;</span>
+	<span class="n">file</span> <span class="o">=</span> <span class="n">fget</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mode</span> <span class="o">&amp;</span> <span class="n">FMODE_READ</span><span class="p">)</span> <span class="p">{</span>
+			<span class="k">struct</span> <span class="n">address_space</span> <span class="o">*</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">file</span><span class="o">-&gt;</span><span class="n">f_mapping</span><span class="p">;</span>
+			<span class="n">pgoff_t</span> <span class="n">start</span> <span class="o">=</span> <span class="n">offset</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+			<span class="n">pgoff_t</span> <span class="n">end</span> <span class="o">=</span> <span class="p">(</span><span class="n">offset</span> <span class="o">+</span> <span class="n">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_CACHE_SHIFT</span><span class="p">;</span>
+			<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">len</span> <span class="o">=</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+			<span class="n">ret</span> <span class="o">=</span> <span class="n">do_readahead</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">file</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+		<span class="p">}</span>
+		<span class="n">fput</span><span class="p">(</span><span class="n">file</span><span class="p">);</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">ret</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cp">#ifdef CONFIG_HAVE_SYSCALL_WRAPPERS</span>
+<span class="n">asmlinkage</span> <span class="kt">long</span> <span class="n">SyS_readahead</span><span class="p">(</span><span class="kt">long</span> <span class="n">fd</span><span class="p">,</span> <span class="n">loff_t</span> <span class="n">offset</span><span class="p">,</span> <span class="kt">long</span> <span class="n">count</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">return</span> <span class="n">SYSC_readahead</span><span class="p">((</span><span class="kt">int</span><span class="p">)</span> <span class="n">fd</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="p">(</span><span class="kt">size_t</span><span class="p">)</span> <span class="n">count</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">SYSCALL_ALIAS</span><span class="p">(</span><span class="n">sys_readahead</span><span class="p">,</span> <span class="n">SyS_readahead</span><span class="p">);</span>
+<span class="cp">#endif</span>
+
+</pre></div></td></tr>
+
+</tbody>
+</table>
+</div>
+
+</body>
+<script>docas={repo:"joekychen/linux",depth:1}</script>
+<script>document.write('<script src=' + ('__proto__' in {} ? 'http://cdnjs.cloudflare.com/ajax/libs/zepto/1.0rc1/zepto.min.js' : 'https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js')+'><\\/script>')</script>
+<script src="http://baoshan.github.com/moment/min/moment.min.js"></script>
+<script src="../javascript/docco.min.js"></script>
+</html>
